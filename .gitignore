@@ -1,0 +1,38 @@
+# Byte-compiled / cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Virtualenvs
+.venv/
+venv/
+~/.mlx-env/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+
+# Local models / huge artifacts (never commit)
+*.safetensors
+models/
+mlx-models/
+bench/memory_results/
+*.gguf
+
+# Secrets
+.env
+.env.*
+!.env.example
+*.pem
+credentials.json

@@ -1,0 +1,4 @@
+numpy>=1.26
+huggingface_hub>=0.24
+mlx>=0.32; sys_platform == "darwin"
+mlx-lm>=0.31.3; sys_platform == "darwin"

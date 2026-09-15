@@ -1,0 +1,31 @@
+cff-version: 1.2.0
+title: "PagedMoE"
+message: "If you use this software, please cite it as below."
+type: software
+authors:
+  - family-names: Clark
+    given-names: Noah
+    email: noah@qwertycode.org
+repository-code: "https://github.com/noahclark556/paged-moe"
+url: "https://github.com/noahclark556/paged-moe"
+abstract: >
+  PagedMoE pages Mixture-of-Experts weights from disk on Apple Silicon (MLX)
+  so MoE checkpoints larger than unified memory can run for local agent
+  workloads.
+keywords:
+  - mixture-of-experts
+  - mlx
+  - apple-silicon
+  - llm
+  - paged-moe
+  - expert-paging
+  - model-offloading
+  - large-language-model
+  - mac
+  - qwen3
+  - deepseek
+  - glm
+  - inference
+license: AGPL-3.0-or-later
+version: 0.2.0
+date-released: "2026-09-15"

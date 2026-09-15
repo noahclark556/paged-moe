@@ -1,0 +1,14 @@
+include LICENSE
+include NOTICE
+include LICENSING.md
+include COMMERCIAL_LICENSE.md
+include CLA.md
+include DCO.md
+include README.md
+include CITATION.cff
+include CHANGELOG.md
+include SECURITY.md
+include CODE_OF_CONDUCT.md
+include run.py
+graft expert_stream
+global-exclude *.py[cod] __pycache__ .DS_Store

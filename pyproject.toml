@@ -1,0 +1,49 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "paged-moe"
+version = "0.2.0"
+description = "PagedMoE: offload MoE experts to disk and stream them on demand through mlx-lm on Apple Silicon"
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "AGPL-3.0-or-later OR LicenseRef-PagedMoE-Commercial" }
+authors = [{ name = "Noah Clark" }]
+keywords = ["mlx", "moe", "apple-silicon", "inference", "paged-experts", "offloading", "qwen3", "deepseek"]
+dependencies = [
+  "numpy>=1.26",
+  "huggingface_hub>=0.24",
+  "mlx>=0.32; sys_platform == 'darwin'",
+  "mlx-lm>=0.31.3; sys_platform == 'darwin'",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/noahclark556/paged-moe"
+Documentation = "https://github.com/noahclark556/paged-moe#readme"
+Issues = "https://github.com/noahclark556/paged-moe/issues"
+License = "https://github.com/noahclark556/paged-moe/blob/main/LICENSING.md"
+
+[project.scripts]
+paged-moe = "expert_stream.mlx_hook:main"
+paged-moe-server = "expert_stream.server:main"
+paged-moe-pretrain = "expert_stream.pretrain_sidecar:main"
+
+[tool.setuptools.packages.find]
+include = ["expert_stream*"]
+
+[tool.setuptools.package-data]
+expert_stream = ["pretrained_sidecar/*"]
+
+[tool.setuptools]
+license-files = ["LICENSE", "NOTICE", "LICENSING.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"

@@ -1,0 +1,38 @@
+PagedMoE
+Copyright (C) 2026 Noah Clark
+
+This product is dual-licensed. See LICENSING.md.
+
+Unless you have a separate commercial license from the copyright holder,
+this software is licensed under the GNU Affero General Public License
+version 3 (see LICENSE).
+
+The public project name is PagedMoE (PyPI / GitHub: paged-moe). The Python
+import package remains `expert_stream`.
+
+Python sources in this package carry a short SPDX header:
+
+  # Copyright (C) 2026 Noah Clark
+  # SPDX-License-Identifier: AGPL-3.0-or-later
+
+That marks Noah Clark authorship of those files under the AGPL grant (or a
+separate commercial license). It does not relicense mlx, mlx-lm, or other
+dependencies. `expert_stream/server.py` additionally notes portions adapted
+from mlx-lm's MIT-licensed HTTP server.
+
+---------------------------------------------------------------------------
+Third-party dependencies (not relicensed by this project)
+
+This software depends on separately maintained packages, including:
+
+  - mlx             -  MIT License (Copyright © Apple Inc. / MLX Contributors)
+  - mlx-lm          -  MIT License (Copyright © MLX Contributors)
+  - huggingface_hub  -  Apache License 2.0
+
+Those components remain under their original licenses. MIT and Apache-2.0
+are compatible with distribution alongside an AGPL-3.0 work; using them as
+dependencies does not place mlx / mlx-lm / huggingface_hub under AGPL.
+
+Preserve their copyright and permission notices when you redistribute those
+components.
+---------------------------------------------------------------------------

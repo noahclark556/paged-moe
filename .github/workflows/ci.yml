@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+
+jobs:
+  test:
+    name: unit tests (macOS)
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install package + pytest
+        run: |
+          python -m pip install -U pip setuptools wheel
+          python -m pip install -e ".[dev]"
+
+      - name: Run unit tests (no large checkpoints)
+        env:
+          PAGED_MOE_HOOK: "0"
+        run: |
+          pytest tests/ \
+            --ignore=tests/test_real_model.py \
+            --ignore=tests/test_stream.py
