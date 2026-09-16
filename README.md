@@ -23,10 +23,10 @@ usable speed; experts stay on disk until the router asks.
 
 | Model | Full resident (no PagedMoE) | Peak RAM here | Decode |
 | --- | ---: | ---: | ---: |
-| **Qwen3-Coder-Next** 6-bit | ~65 GB (OOM) | ~30 GB | ~__ tok/s |
-| **Qwen3-235B-A22B** 4-bit | ~132 GB (OOM) | ~34 GB | ~6 tok/s |
-| **GLM-4.7** 4-bit | ~199 GB (OOM) | ~35 GB | ~__ tok/s |
-| **Qwen3-Coder-480B** 4-bit | ~270 GB (OOM) | ~34 GB | ~__ tok/s |
+| **Qwen3-Coder-Next** 6-bit | ~65 GB (OOM) | ~30 GB | ~27 tok/s |
+| **Qwen3-235B-A22B** 4-bit | ~132 GB (OOM) | ~33 GB | ~8 tok/s |
+| **GLM-4.7** 4-bit | ~199 GB (OOM) | ~34 GB | ~2 tok/s |
+| **Qwen3-Coder-480B** 4-bit | ~270 GB (OOM) | ~34 GB | ~2 tok/s |
 
 The RAM gap looks wrong until you remember MoEs are sparse: most experts are
 idle on any given token, so you do not need the whole library in RAM.
@@ -194,8 +194,8 @@ M5 Pro).
 | Model | Normally (full resident) | With PagedMoE |
 | --- | ---: | ---: |
 | **Qwen3-Coder-Next** (6-bit) | ~65 GB (will not load) | ~30 GB peak |
-| **Qwen3-235B-A22B** (4-bit) | ~132 GB (will not load) | ~34 GB peak |
-| **GLM-4.7** (4-bit) | ~199 GB (will not load) | ~35 GB peak |
+| **Qwen3-235B-A22B** (4-bit) | ~132 GB (will not load) | ~33 GB peak |
+| **GLM-4.7** (4-bit) | ~199 GB (will not load) | ~34 GB peak |
 
 Only the always-on backbone stays in RAM. Routed experts live on disk until
 needed. MoE size is mostly experts that almost never fire on a given token.
