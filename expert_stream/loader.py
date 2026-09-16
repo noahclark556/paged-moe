@@ -390,6 +390,15 @@ def load(
 
     info["load_s"] = round(time.perf_counter() - t0, 2)
 
+    # Decouple the attention chunk from the expert-streaming chunk, so a long
+    # prompt reads the expert mass once instead of once per attention chunk.
+    try:
+        from . import prefill_fused as _prefill_fused
+
+        info["fused_prefill"] = bool(_prefill_fused.install(model))
+    except Exception as e:
+        info["fused_prefill"] = f"skip:{e!r}"
+
     # Stash handles for stats/introspection (underscore = not a model param).
     model._expert_stream_cache = cache
     model._expert_stream_ring = ring

@@ -45,7 +45,6 @@ from .safetensors_index import (
     ExpertLocator,
     FilePool,
     StackedLocator,
-    read_tensor_numpy,
 )
 
 # safetensors dtype string -> numpy dtype for viewing pooled read buffers.
@@ -72,6 +71,11 @@ _CLEAR_THRESHOLD = 2 << 30
 # but on a saturated pipe (big-expert decode) every slice is a Future plus a
 # GIL window, and the scheduling overhead competes with the GPU thread.
 _SLICE_BYTES = int(_env("EXPERT_STREAM_SLICE_MB", 2, float) * (1 << 20))
+
+# Prefill reads whole layers, so it has no latency to minimize and plenty of
+# parallelism already (many spans, many components, two groups in flight). Its
+# scarce resource is bytes per syscall / per GIL window, so it slices coarsely.
+_PREFILL_SLICE_BYTES = config.PREFILL_SLICE_BYTES
 
 # Slot reads only fan a component to the slice pool at or above this size;
 # smaller ones read inline on the expert worker. See _read_slab_inner.
@@ -403,6 +407,10 @@ class ExpertCache:
         # measured against: it says how disk-bound this model actually is, and
         # therefore how much idle bandwidth (if any) there is to spend.
         self.demand_miss_bytes = 0
+        # MoE layers that ran a prefill (whole-layer) fetch. Divided by the
+        # model's MoE layer count this is the number of passes the prompt made
+        # over the expert mass - the quantity prefill time is proportional to.
+        self.prefill_layers = 0
         self.disk_wait_s = 0.0
         # Route-prediction accounting (see PrefetchRing): how much speculative
         # I/O was actually used, and how much of the real demand it covered.
@@ -849,11 +857,15 @@ class ExpertCache:
         """Read several *consecutive* experts of one layer.
 
         For stacked checkpoints, experts first..last of each component tensor
-        are one contiguous byte range, so the whole run costs one pread per
-        component (a few large sequential reads) instead of len(ids) × the
-        component count of small scattered reads. This is what lets prefill -
-        which wants nearly every expert of every layer - run at the SSD's
-        sequential bandwidth.
+        are one contiguous byte range, so the whole run costs a few large
+        sequential reads instead of len(ids) x the component count of small
+        scattered ones. This is what lets prefill - which wants nearly every
+        expert of every layer - run at the SSD's sequential bandwidth.
+
+        Every component's slices are submitted before anything is waited on.
+        Draining them component by component instead left only one component's
+        worth of reads (a few MB) in flight at a time and idled the drive at
+        each of the ~9 barriers per run.
         """
         if len(ids) == 1:
             # Single-expert "runs" are the common decode case; use the pooled,
@@ -863,10 +875,11 @@ class ExpertCache:
         first, count = ids[0], len(ids)
         out: dict[int, dict] = {eid: {} for eid in ids}
         per_expert_bytes: dict[int, int] = {eid: 0 for eid in ids}
+        jobs = []
         for name, locator in comps.items():
             if isinstance(locator, StackedLocator):
                 span = locator.span(first, count)
-                arr = self._read_span_sliced(span)
+                arr = self._submit_span(span, jobs)
                 stride = span.nbytes // count
                 for i, eid in enumerate(ids):
                     out[eid][name] = (arr[i], span.is_bf16)
@@ -874,30 +887,33 @@ class ExpertCache:
             else:
                 for eid in ids:
                     loc = locator.loc(eid)
-                    out[eid][name] = (read_tensor_numpy(self.pool, loc), loc.is_bf16)
+                    out[eid][name] = (self._submit_span(loc, jobs), loc.is_bf16)
                     per_expert_bytes[eid] += loc.nbytes
+        for j in jobs:
+            j.result()
         for eid in ids:
             out[eid]["__nbytes__"] = per_expert_bytes[eid]
         return out
 
-    def _read_span_sliced(self, span) -> np.ndarray:
-        """Read a multi-expert contiguous span with parallel 2 MB slices.
+    def _submit_span(self, span, jobs: list) -> np.ndarray:
+        """Start reads for one contiguous range; return its (unfilled) view.
+
+        Appends the slice futures to `jobs` for the caller to drain once. The
+        returned numpy view is only valid after that drain.
 
         Not buffer-pooled: span buffers are shared by several experts' raw
         entries (each views one row), so their lifetime isn't per-expert.
         Span sizes also vary with run length, which would fragment the pool.
         """
         buf = np.empty(span.nbytes, dtype=np.uint8)
-        jobs = []
-        for start in range(0, span.nbytes, _SLICE_BYTES):
-            end = min(start + _SLICE_BYTES, span.nbytes)
+        step = _PREFILL_SLICE_BYTES
+        for start in range(0, span.nbytes, step):
+            end = min(start + step, span.nbytes)
             jobs.append(
                 self._slice_executor.submit(
                     self.pool.read_into, span.file, span.offset + start, buf[start:end]
                 )
             )
-        for j in jobs:
-            j.result()
         return buf.view(_LOC_DTYPES[span.dtype]).reshape(span.shape)
 
     def _submit_run(self, layer_key: str, ids: list[int]) -> list[tuple[int, Future]]:
@@ -924,10 +940,19 @@ class ExpertCache:
         run_fut.add_done_callback(_split)
         return list(futs.items())
 
-    def _max_run_bytes(self, layer_key: str) -> int:
-        """Split big runs so reads still spread across the reader threads."""
+    def _max_run_bytes(self, layer_key: str, prefill: bool = False) -> int:
+        """Split big runs so reads still spread across the reader threads.
+
+        Decode keeps runs short: it misses a handful of experts and wants each
+        one back as soon as possible. Prefill is the opposite - it wants the
+        whole layer and cares only about aggregate bandwidth, so the cap is
+        raised until a run covers tens of experts. At the decode cap a single
+        DeepSeek expert (~25 MB) already fills a run, which silently disabled
+        coalescing for exactly the workload it was written for.
+        """
         per = max(1, self.expert_nbytes(layer_key))
-        return max(per, 32 << 20)
+        floor = config.PREFILL_RUN_BYTES if prefill else (32 << 20)
+        return max(per, floor)
 
     # ------------------------------------------------------------- memory
 
@@ -1288,7 +1313,13 @@ class ExpertCache:
 
     # ------------------------------------------------------------- fetch
 
-    def _begin(self, layer_key: str, expert_ids, use_slab: bool = False) -> _Begun:
+    def _begin(
+        self,
+        layer_key: str,
+        expert_ids,
+        use_slab: bool = False,
+        prefill: bool = False,
+    ) -> _Begun:
         """Classify each id as LRU hit / prefetched raw / disk read (async).
 
         Consecutive missing ids are coalesced into run reads (one large
@@ -1355,7 +1386,7 @@ class ExpertCache:
 
             if misses:
                 per = max(1, self.expert_nbytes(layer_key))
-                max_run = max(1, self._max_run_bytes(layer_key) // per)
+                max_run = max(1, self._max_run_bytes(layer_key, prefill) // per)
                 run: list[int] = [misses[0]]
                 for eid in misses[1:]:
                     if eid == run[-1] + 1 and len(run) < max_run:
@@ -1444,6 +1475,10 @@ class ExpertCache:
         Used for prefill, where one layer can want hundreds of experts (more
         than fits in memory at once).  While group i computes on the GPU, the
         reads for group i+1 are already in flight on the worker threads.
+
+        `expert_ids` arrives sorted, so a group is a near-contiguous id range
+        and its reads coalesce into a few long sequential spans - which is why
+        the group wants to be large (see config.PREFILL_RUN_BYTES).
         """
         per = max(1, self.expert_nbytes(layer_key))
         per_group = max(1, group_bytes // per)
@@ -1451,11 +1486,11 @@ class ExpertCache:
             expert_ids[i : i + per_group]
             for i in range(0, len(expert_ids), per_group)
         ]
-        pending = self._begin(layer_key, groups[0])
+        pending = self._begin(layer_key, groups[0], prefill=True)
         for i, ids in enumerate(groups):
             current = pending
             if i + 1 < len(groups):
-                pending = self._begin(layer_key, groups[i + 1])
+                pending = self._begin(layer_key, groups[i + 1], prefill=True)
             yield ids, self._finish(layer_key, current, install)
 
     # ------------------------------------------------------------- prefetch
@@ -1657,6 +1692,10 @@ class ExpertCache:
             "slab_free": len(self._free_slots),
             "slot_starved": self.slot_starved,
             "read_gb": round(self.bytes_read / 1e9, 3),
+            # Whole-layer prefill fetches. Divide by the model's MoE layer
+            # count for the number of passes the prompt made over the expert
+            # mass - prefill time is proportional to that.
+            "prefill_layers": self.prefill_layers,
             # Of those bytes, the ones a layer was blocked on. The gap between
             # this and read_gb is what speculation bought or wasted.
             "demand_gb": round(self.demand_miss_bytes / 1e9, 3),

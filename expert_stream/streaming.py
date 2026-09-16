@@ -549,6 +549,7 @@ class StreamedSwitchGLU(nn.Module):
                 install="soft",
             )
             out = self._run(x_flat, inds, groups, eval_groups=True)
+            self.cache.prefill_layers += 1
             # Seed decode prefetch with the last prompt token's routing.
             self.last_ids = [int(e) for e in np.unique(inds[-1])]
             self.predicted.clear()  # stale across a prefill (accounting only)

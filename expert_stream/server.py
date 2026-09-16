@@ -18,9 +18,10 @@ This is mlx-lm's production server with a few changes:
   5. user-segment prompt-cache snapshots for thinking models (see
      _snapshot_user_segment): without them, any client that does not replay
      reasoning verbatim (the host app does not) breaks the cached prefix at
-     the generation prompt's `<think>` tail every turn, and hybrid-attention
-     models (qwen3-next) cannot trim their cache - so every agent turn would
-     re-prefill the whole 30k-token conversation from zero.
+     the generation prompt's `<think>` tail every turn. Trimmable caches
+     (DeepSeek / Qwen3-MoE / GLM) prefill once then fork prefixes via
+     deepcopy+trim; hybrid-attention models (qwen3-next) still stop mid-prefill
+     because they cannot trim backwards.
   6. speculative decoding via EXPERT_STREAM_DRAFT_MODEL (path to a small
      same-tokenizer model) + EXPERT_STREAM_DRAFT_TOKENS. On a streamed MoE
      this is a *disk* optimization as much as a compute one: verifying k
@@ -39,19 +40,415 @@ Run:
 from __future__ import annotations
 
 import copy
+import json
 import os
+import re
 import sys
 import threading
+import time
 from collections import deque
+from typing import Any, Optional
 
 import mlx.core as mx
 import mlx_lm.server as _mlx_server
 from mlx_lm.generate import generation_stream
-from mlx_lm.models.cache import LRUPromptCache
+from mlx_lm.models.cache import (
+    LRUPromptCache,
+    can_trim_prompt_cache,
+    trim_prompt_cache,
+)
 
-from . import config, kvmem
+from . import adaptive_prefill, config, kvmem, prefill_fused
 from .loader import load as _streamed_load
 from .loader import relieve_pressure
+
+# mlx-lm's DeepSeek-V3.2 chat template takes `thinking_mode` ("thinking"|"chat"),
+# but TokenizerWrapper always injects `enable_thinking`, and ga historically
+# sends that too. Without this map, every chat request dies with:
+#   encode_messages() got an unexpected keyword argument 'enable_thinking'
+def _compat_deepseek_v32_chat_template() -> None:
+    try:
+        import mlx_lm.chat_templates.deepseek_v32 as mod
+    except ImportError:
+        return
+    _orig = mod.apply_chat_template
+
+    def apply_chat_template(
+        messages,
+        continue_final_message=False,
+        add_generation_prompt=False,
+        **kwargs,
+    ):
+        if "thinking_mode" not in kwargs and "enable_thinking" in kwargs:
+            kwargs["thinking_mode"] = (
+                "thinking" if kwargs["enable_thinking"] else "chat"
+            )
+        kwargs.pop("enable_thinking", None)
+        # ga/mlx pass these for Jinja templates; this Python template does not.
+        if "preserve_thinking" in kwargs:
+            # drop_thinking=True is the template default (strip prior reasoning).
+            kwargs.setdefault(
+                "drop_thinking", not bool(kwargs.pop("preserve_thinking"))
+            )
+        else:
+            kwargs.pop("preserve_thinking", None)
+        kwargs.pop("reasoning_effort", None)
+
+        # Thinking mode asserts that every assistant turn *after* the last user
+        # has reasoning_content or tool_calls. Host apps often park a bare ACK
+        # there (ga task_state). Give those a stub so the request does not 404.
+        thinking_mode = kwargs.get("thinking_mode", "thinking")
+        if thinking_mode == "thinking" and isinstance(messages, list):
+            last_user = -1
+            for i in range(len(messages) - 1, -1, -1):
+                if isinstance(messages[i], dict) and messages[i].get("role") == "user":
+                    last_user = i
+                    break
+            fixed = []
+            for i, msg in enumerate(messages):
+                if (
+                    i > last_user
+                    and isinstance(msg, dict)
+                    and msg.get("role") == "assistant"
+                    and not msg.get("tool_calls")
+                    and not msg.get("reasoning_content")
+                ):
+                    msg = {**msg, "reasoning_content": "\n"}
+                fixed.append(msg)
+            messages = fixed
+
+        return _orig(
+            messages,
+            continue_final_message=continue_final_message,
+            add_generation_prompt=add_generation_prompt,
+            **kwargs,
+        )
+
+    mod.apply_chat_template = apply_chat_template
+
+
+_compat_deepseek_v32_chat_template()
+
+# mlx-lm has no deepseek_v32 tool_parser yet, so has_tool_calling stays false
+# and the server only warns + skips structured tool_calls. The chat template
+# still renders tool schemas; wire DSML parsing so act-mode tools work.
+_DSML_TOKEN = "｜DSML｜"
+_DSML_TOOL_CALL_START = f"<{_DSML_TOKEN}function_calls>"
+_DSML_TOOL_CALL_END = f"</{_DSML_TOKEN}function_calls>"
+_DSML_INVOKE_RE = re.compile(
+    rf"<{re.escape(_DSML_TOKEN)}invoke\s+name=\"([^\"]+)\">(.*?)"
+    rf"</{re.escape(_DSML_TOKEN)}invoke>",
+    re.DOTALL,
+)
+_DSML_PARAM_RE = re.compile(
+    rf"<{re.escape(_DSML_TOKEN)}parameter\s+name=\"([^\"]+)\""
+    rf"(?:\s+string=\"(true|false)\")?\s*>(.*?)"
+    rf"</{re.escape(_DSML_TOKEN)}parameter>",
+    re.DOTALL,
+)
+
+
+def _parse_deepseek_dsml_tool_call(
+    text: str, tools: Optional[list[Any]] = None
+) -> list[dict]:
+    del tools  # schema-guided casting not required; JSON/literal decode below
+    body = text
+    if _DSML_TOOL_CALL_START in body:
+        start = body.find(_DSML_TOOL_CALL_START) + len(_DSML_TOOL_CALL_START)
+        end = body.find(_DSML_TOOL_CALL_END, start)
+        body = body[start : end if end >= 0 else None]
+    out: list[dict] = []
+    for match in _DSML_INVOKE_RE.finditer(body):
+        name = match.group(1).strip()
+        args: dict[str, Any] = {}
+        for pm in _DSML_PARAM_RE.finditer(match.group(2)):
+            key = pm.group(1).strip()
+            is_str = (pm.group(2) or "true") == "true"
+            raw = pm.group(3).strip()
+            if is_str:
+                args[key] = raw
+            else:
+                try:
+                    args[key] = json.loads(raw)
+                except json.JSONDecodeError:
+                    args[key] = raw
+        out.append({"name": name, "arguments": args})
+    if not out:
+        raise ValueError("no DSML invoke blocks found")
+    return out
+
+
+def _install_deepseek_tool_parser(tokenizer) -> None:
+    if getattr(tokenizer, "has_tool_calling", False):
+        return
+    # TokenizerWrapper stores these privately; mirror mlx_lm.tokenizer_utils.load.
+    tokenizer._tool_parser = _parse_deepseek_dsml_tool_call
+    tokenizer._tool_call_start = _DSML_TOOL_CALL_START
+    tokenizer._tool_call_end = _DSML_TOOL_CALL_END
+    try:
+        tokenizer._tool_call_start_tokens = tuple(
+            tokenizer.encode(_DSML_TOOL_CALL_START, add_special_tokens=False)
+        )
+        tokenizer._tool_call_end_tokens = tuple(
+            tokenizer.encode(_DSML_TOOL_CALL_END, add_special_tokens=False)
+        )
+    except Exception as e:
+        print(f"[paged-moe] deepseek DSML tool tokens skipped: {e!r}", flush=True)
+        return
+    print(
+        "[paged-moe] deepseek_v32: installed DSML tool parser "
+        f"(start={_DSML_TOOL_CALL_START!r})",
+        flush=True,
+    )
+
+
+def _clamp_prefill_step(provider, model) -> None:
+    """Bound --prefill-step-size to what this model can actually run.
+
+    The value is a *ceiling*: our generate_step wrapper resizes per step, and
+    stock mlx-lm paths that still read the raw int must not exceed it. Fused
+    prefill makes the ceiling an activation bound for every architecture;
+    without it, a DSA model is capped by its dense score matrix instead.
+    """
+    cap = adaptive_prefill.default_cli_prefill_step(model)
+    cur = int(getattr(provider.cli_args, "prefill_step_size", 0) or 0)
+    if 0 < cur <= cap:
+        return
+    provider.cli_args.prefill_step_size = cap
+    why = (
+        "activation bound; attention sub-chunked per layer"
+        if prefill_fused.active()
+        else "score matrix under Metal max"
+    )
+    print(
+        f"[paged-moe] prefill-step-size {cur or 'unset'} -> {cap} ({why})",
+        flush=True,
+    )
+
+
+def _install_adaptive_prefill_generate() -> None:
+    """Recompute n_to_process each prefill step (mlx-lm uses a fixed int)."""
+    global _adaptive_generate_installed
+    if _adaptive_generate_installed:
+        return
+    _adaptive_generate_installed = True
+
+    import functools
+    import importlib
+
+    _mlx_gen = importlib.import_module("mlx_lm.generate")
+    from mlx_lm.models import cache as _mlx_cache
+
+    _orig_gs = _mlx_gen.generate_step
+    _orig_sgs = _mlx_gen.speculative_generate_step
+
+    def _quantize_fn(kv_bits, kv_group_size, quantized_kv_start):
+        return functools.partial(
+            _mlx_gen.maybe_quantize_kv_cache,
+            quantized_kv_start=quantized_kv_start,
+            kv_group_size=kv_group_size,
+            kv_bits=kv_bits,
+        )
+
+    def generate_step(
+        prompt,
+        model,
+        *,
+        max_tokens: int = 256,
+        sampler=None,
+        logits_processors=None,
+        max_kv_size=None,
+        prompt_cache=None,
+        prefill_step_size: int = 2048,
+        kv_bits=None,
+        kv_group_size: int = 64,
+        quantized_kv_start: int = 0,
+        prompt_progress_callback=None,
+        input_embeddings=None,
+    ):
+        if not adaptive_prefill.enabled():
+            yield from _orig_gs(
+                prompt,
+                model,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                logits_processors=logits_processors,
+                max_kv_size=max_kv_size,
+                prompt_cache=prompt_cache,
+                prefill_step_size=prefill_step_size,
+                kv_bits=kv_bits,
+                kv_group_size=kv_group_size,
+                quantized_kv_start=quantized_kv_start,
+                prompt_progress_callback=prompt_progress_callback,
+                input_embeddings=input_embeddings,
+            )
+            return
+
+        if input_embeddings is not None:
+            # Keep mlx-lm's embedding path untouched - rare for our servers.
+            yield from _orig_gs(
+                prompt,
+                model,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                logits_processors=logits_processors,
+                max_kv_size=max_kv_size,
+                prompt_cache=prompt_cache,
+                prefill_step_size=prefill_step_size,
+                kv_bits=kv_bits,
+                kv_group_size=kv_group_size,
+                quantized_kv_start=quantized_kv_start,
+                prompt_progress_callback=prompt_progress_callback,
+                input_embeddings=input_embeddings,
+            )
+            return
+
+        if prompt_cache is None:
+            prompt_cache = _mlx_cache.make_prompt_cache(
+                model, max_kv_size=max_kv_size
+            )
+
+        progress = prompt_progress_callback or (lambda *_: None)
+        quantize_cache_fn = _quantize_fn(kv_bits, kv_group_size, quantized_kv_start)
+
+        # Mirror mlx-lm: leave one token for the decode _step.
+        if not isinstance(prompt, mx.array):
+            prompt = mx.array(prompt)
+        total = int(prompt.size)
+        processed = 0
+        progress(processed, total)
+        mode = adaptive_prefill.resolve_mode(model)
+        cap = int(prefill_step_size or config.ADAPTIVE_PREFILL_MAX)
+
+        with mx.stream(_mlx_gen.generation_stream):
+            while total - processed > 1:
+                remaining = (total - processed) - 1
+                kv_len = adaptive_prefill.cache_offset(prompt_cache)
+                n = adaptive_prefill.next_chunk(
+                    kv_len, remaining, model, prefill_cap=cap
+                )
+                if config.ADAPTIVE_PREFILL_DEBUG:
+                    print(
+                        f"[paged-moe] adaptive-prefill mode={mode} "
+                        f"chunk={n} kv={kv_len} rem={remaining} cap={cap}",
+                        flush=True,
+                    )
+                chunk = prompt[:n]
+                model(chunk[None], cache=prompt_cache)
+                quantize_cache_fn(prompt_cache)
+                mx.eval([c.state for c in prompt_cache])
+                processed += n
+                progress(processed, total)
+                prompt = prompt[n:]
+                mx.clear_cache()
+
+        yield from _orig_gs(
+            prompt,
+            model,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            logits_processors=logits_processors,
+            max_kv_size=max_kv_size,
+            prompt_cache=prompt_cache,
+            # Exactly one token is left (loop condition above), so this only
+            # has to be >= 1; keep it at the model's ceiling regardless.
+            prefill_step_size=cap,
+            kv_bits=kv_bits,
+            kv_group_size=kv_group_size,
+            quantized_kv_start=quantized_kv_start,
+            # Prefill is already reported complete above. Forwarding `progress`
+            # would let mlx-lm re-report the 1-token remainder as (0, 1) and
+            # (1, 1), so any TTFT / percent readout jumps backwards at the end.
+            prompt_progress_callback=lambda *_: None,
+            input_embeddings=None,
+        )
+
+    def speculative_generate_step(
+        prompt,
+        model,
+        draft_model,
+        *,
+        num_draft_tokens: int = 2,
+        max_tokens: int = 256,
+        sampler=None,
+        logits_processors=None,
+        prompt_cache=None,
+        prefill_step_size: int = 512,
+        kv_bits=None,
+        kv_group_size: int = 64,
+        quantized_kv_start: int = 0,
+    ):
+        if not adaptive_prefill.enabled():
+            yield from _orig_sgs(
+                prompt,
+                model,
+                draft_model,
+                num_draft_tokens=num_draft_tokens,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                logits_processors=logits_processors,
+                prompt_cache=prompt_cache,
+                prefill_step_size=prefill_step_size,
+                kv_bits=kv_bits,
+                kv_group_size=kv_group_size,
+                quantized_kv_start=quantized_kv_start,
+            )
+            return
+
+        # Prefill both caches with adaptive chunks, then hand the remainder
+        # (one token) to stock speculative_generate_step.
+        y = prompt.astype(mx.uint32) if isinstance(prompt, mx.array) else mx.array(
+            prompt, dtype=mx.uint32
+        )
+        if prompt_cache is None:
+            model_cache = _mlx_cache.make_prompt_cache(model)
+            draft_cache = _mlx_cache.make_prompt_cache(draft_model)
+            prompt_cache = model_cache + draft_cache
+        else:
+            model_cache = prompt_cache[: len(model.layers)]
+            draft_cache = prompt_cache[len(model.layers) :]
+
+        quantize_cache_fn = _quantize_fn(kv_bits, kv_group_size, quantized_kv_start)
+        cap = int(prefill_step_size or config.ADAPTIVE_PREFILL_MAX)
+
+        def _prefill_one(m, c, tokens):
+            with mx.stream(_mlx_gen.generation_stream):
+                while tokens.size > 1:
+                    remaining = int(tokens.size) - 1
+                    kv_len = adaptive_prefill.cache_offset(c)
+                    n = adaptive_prefill.next_chunk(
+                        kv_len, remaining, m, prefill_cap=cap
+                    )
+                    m(tokens[:n][None], cache=c)
+                    quantize_cache_fn(c)
+                    mx.eval([e.state for e in c])
+                    tokens = tokens[n:]
+                    mx.clear_cache()
+            return tokens
+
+        # Both loops stop at one token, so the two caches land at the same
+        # offset and the remainder below is the same for either model.
+        _prefill_one(draft_model, draft_cache, y)
+        y = _prefill_one(model, model_cache, y)
+
+        yield from _orig_sgs(
+            y,
+            model,
+            draft_model,
+            num_draft_tokens=num_draft_tokens,
+            max_tokens=max_tokens,
+            sampler=sampler,
+            logits_processors=logits_processors,
+            prompt_cache=prompt_cache,
+            prefill_step_size=max(cap, int(y.size) + 1),
+            kv_bits=kv_bits,
+            kv_group_size=kv_group_size,
+            quantized_kv_start=quantized_kv_start,
+        )
+
+    _mlx_gen.generate_step = generate_step
+    _mlx_gen.speculative_generate_step = speculative_generate_step
+
 
 # Injected only when the user didn't pass the flag themselves.
 _DEFAULT_ARGS = {
@@ -108,6 +505,7 @@ _MAX_SNAPSHOTS = 2
 # its own history (the difference between a 1 s and a 60 s agent turn).
 _PREFIX_DEBUG = bool(int(os.environ.get("EXPERT_STREAM_PREFIX_DEBUG", "0") or 0))
 _recent_prompts: deque = deque(maxlen=6)
+_adaptive_generate_installed = False
 
 
 def _log_prefix_diagnostics(tokenizer, tokens: list, cached: int) -> None:
@@ -265,15 +663,155 @@ def _dequantize_kv_cache(cache: list, model=None) -> None:
     kvmem.unquantize(cache)
 
 
-def _snapshot_user_segment(model, kwargs) -> None:
-    """Prefill up to each snapshot boundary, store the cache there, and hand
-    only the remainder to stream_generate.
+def _materialize_trimmed_prefix(cache: list) -> None:
+    """After ``trim_prompt_cache``, physically drop the unused suffix arrays.
 
-    Storing the cache keyed by a prefix the *next* request will repeat is what
-    turns a 30k-token agent turn from a full re-prefill into a few seconds.
-    Hybrid-attention models (qwen3-next) can't trim their cache backwards, so
-    a stored sequence is useless unless it is an exact prefix - hence storing
-    at boundaries rather than relying on trimming.
+    ``KVCache.trim`` only decrements ``offset``; the underlying keys/values keep
+    their full length, so a deepcopy-then-trim snapshot of a 14k prefill would
+    still cost 14k of KV bytes in the prompt store. Round-tripping ``.state``
+    rebinds each layer to the sliced ``[..., :offset, :]`` view.
+    """
+    for c in cache:
+        try:
+            c.state = c.state
+        except Exception:
+            continue
+
+
+def _fork_prefix_snapshots(
+    store,
+    model_key: str,
+    ctx_tokens: list,
+    cache: list,
+    bounds: list[int],
+    *,
+    cached: int,
+    processed: int,
+    budget: int,
+) -> int:
+    """Insert deepcopy+trim snapshots at each absolute ``bound``. Returns count."""
+    abs_off = cached + processed
+    stored = 0
+    # Longest first. ``insert_cache`` of a trimmable entry pops its own
+    # prefixes, so short-then-long would leave only the latest bound; long-
+    # then-short keeps both extremes (robust early + max-reuse late).
+    for bound in sorted(bounds, reverse=True):
+        if bound > abs_off or bound < max(cached, 1):
+            continue
+        to_trim = abs_off - bound
+        snap = copy.deepcopy(cache)
+        if to_trim > 0:
+            trim_prompt_cache(snap, to_trim)
+            _materialize_trimmed_prefix(snap)
+        nbytes = sum(c.nbytes for c in snap)
+        if nbytes * 2 > budget:
+            if _PREFIX_DEBUG:
+                print(
+                    f"[prefix]   snapshot skipped: {nbytes / 1e9:.2f} GB vs budget",
+                    flush=True,
+                )
+            continue
+        store.insert_cache(
+            model_key,
+            list(ctx_tokens[:bound]),
+            snap,
+            cache_type="user",
+        )
+        stored += 1
+        mx.clear_cache()
+    return stored
+
+
+def _prefill_remainder(
+    model,
+    prompt,
+    cache,
+    *,
+    n_model_layers: int,
+    draft_model,
+    draft_cache,
+    step_cap: int,
+    progress,
+    total: int,
+    processed: int,
+    target: int,
+) -> int:
+    """Drive ``model`` (and optional draft) from ``processed`` up to ``target``."""
+    start, t0 = processed, time.perf_counter()
+    expert_cache = getattr(model, "_expert_stream_cache", None)
+    if expert_cache is not None:
+        base = (
+            expert_cache.bytes_read,
+            expert_cache.disk_wait_s,
+            expert_cache.prefill_layers,
+        )
+    while processed < target:
+        remaining = target - processed
+        kv_len = adaptive_prefill.cache_offset(cache[:n_model_layers])
+        if adaptive_prefill.enabled():
+            n = adaptive_prefill.next_chunk(
+                kv_len, remaining, model, prefill_cap=step_cap
+            )
+        else:
+            n = min(step_cap, remaining)
+        # mlx-lm only reports progress after a chunk finishes; fused prefill
+        # is one chunk, so announce up front or it looks hung.
+        print(
+            f"[prefill] chunk {n} tok at kv={kv_len} ({processed}/{target} done)"
+            " - one pass over the expert mass",
+            flush=True,
+        )
+        chunk = mx.array(prompt[processed : processed + n])
+        # Same (thread-local) stream speculative_generate_step runs on.
+        # Touching the draft model on the default stream here and on
+        # generation_stream inside sgs reliably ended in a Metal
+        # "GPU Timeout Error" on the draft's first decode step.
+        with mx.stream(generation_stream):
+            model(chunk[None], cache=cache)
+            mx.eval([c.state for c in cache[:n_model_layers]])
+            if draft_model is not None:
+                # Tiny + resident: this costs milliseconds. Bounded evals,
+                # separate from the main model's command buffers.
+                for i in range(0, n, 2048):
+                    draft_model(chunk[i : i + 2048][None], cache=draft_cache)
+                    mx.eval([c.state for c in draft_cache])
+        processed += n
+        progress(processed, total)
+        mx.clear_cache()
+    _log_prefill_cost(model, expert_cache, base if expert_cache else None,
+                      t0, processed - start)
+    return processed
+
+
+def _log_prefill_cost(model, expert_cache, base, t0, tokens: int) -> None:
+    """One line per prefill: disk wait vs compute.
+
+    disk_wait_s is time a layer blocked on a read; elapsed - blocked is the
+    compute floor. Without the split, I/O-bound and GPU-bound prefills look
+    the same from the progress ticks.
+    """
+    elapsed = time.perf_counter() - t0
+    if expert_cache is None or base is None or tokens <= 0 or elapsed < 1.0:
+        return
+    read_gb = (expert_cache.bytes_read - base[0]) / 1e9
+    blocked = expert_cache.disk_wait_s - base[1]
+    moe_layers = int(getattr(model, "_expert_stream_info", {}).get("moe_layers") or 0)
+    layers = expert_cache.prefill_layers - base[2]
+    passes = f"{layers / moe_layers:.1f} pass" if moe_layers else f"{layers} layer"
+    print(
+        f"[prefill] {tokens} tok in {elapsed:.1f}s | {read_gb:.0f} GB experts "
+        f"({passes}es over the mass, {read_gb / elapsed:.1f} GB/s effective) | "
+        f"{blocked:.0f}s blocked on disk, {elapsed - blocked:.0f}s compute",
+        flush=True,
+    )
+
+
+def _snapshot_user_segment(model, kwargs) -> None:
+    """Prefill + store prefix KV snapshots for next-turn reuse.
+
+    Trimmable caches (DeepSeek / Qwen3-MoE / GLM, ...): one fused prefill,
+    then fork each boundary with deepcopy+trim. Non-trimmable (qwen3-next
+    hybrid): still stop mid-prefill at each boundary.
     """
     ctx_tokens = getattr(_req_ctx, "tokens", None)
     _req_ctx.tokens = None  # single-shot; never reuse across requests
@@ -285,12 +823,8 @@ def _snapshot_user_segment(model, kwargs) -> None:
     if tokenizer is None or prompt is None or cache is None:
         return
 
-    # With speculative decoding the cache list is model layers + draft layers,
-    # and a stored snapshot is only useful if BOTH advanced over the same
-    # tokens: speculative_generate_step prefills each model with whatever
-    # prompt remainder it gets, so a draft cache that skipped the snapshotted
-    # span would be conditioned on a hole (correctness is unaffected - the
-    # target validates every token - but acceptance, and thus speed, craters).
+    # Speculative decode: model + draft caches must advance over the same
+    # tokens or acceptance crater (target still validates every token).
     draft_model = kwargs.get("draft_model")
     n_model_layers = len(model.layers)
     draft_cache = cache[n_model_layers:] if draft_model is not None else []
@@ -305,50 +839,74 @@ def _snapshot_user_segment(model, kwargs) -> None:
     if not bounds:
         return
 
-    step = kwargs.get("prefill_step_size") or 2048
+    step_cap = int(kwargs.get("prefill_step_size") or config.ADAPTIVE_PREFILL_MAX or 2048)
     progress = kwargs.get("prompt_progress_callback") or (lambda *_: None)
     total = len(prompt)
     store = _req_ctx.store
     budget = getattr(store, "max_bytes", 1 << 62)
+    trimmable = can_trim_prompt_cache(cache)
 
-    processed = 0
-    for bound in bounds:
-        target = bound - cached
-        while processed < target:
-            n = min(step, target - processed)
-            chunk = mx.array(prompt[processed : processed + n])
-            # Same (thread-local) stream speculative_generate_step runs on.
-            # Touching the draft model on the default stream here and on
-            # generation_stream inside sgs reliably ended in a Metal
-            # "GPU Timeout Error" on the draft's first decode step.
-            with mx.stream(generation_stream):
-                model(chunk[None], cache=cache)
-                mx.eval([c.state for c in cache[:n_model_layers]])
-                if draft_model is not None:
-                    # Tiny + resident: this costs milliseconds. Bounded evals,
-                    # separate from the main model's command buffers.
-                    for i in range(0, n, 2048):
-                        draft_model(chunk[i : i + 2048][None], cache=draft_cache)
-                        mx.eval([c.state for c in draft_cache])
-            processed += n
-            progress(processed, total)
-            mx.clear_cache()
-
-        # A snapshot costs its own KV bytes. Skip (rather than thrash the
-        # prompt cache) when one copy would eat over half the byte budget -
-        # full-attention models at long context land here.
-        nbytes = sum(c.nbytes for c in cache)
-        if nbytes * 2 > budget:
-            if _PREFIX_DEBUG:
-                print(f"[prefix]   snapshot skipped: {nbytes/1e9:.2f} GB vs budget", flush=True)
-            continue
-        store.insert_cache(
-            _req_ctx.model_key,
-            list(ctx_tokens[:bound]),
-            copy.deepcopy(cache),
-            cache_type="user",
+    if trimmable:
+        # One fused pass over the whole remainder (leave 1 token for decode,
+        # same as generate_step), then fork prefixes. No mid-stop = no second
+        # expert-mass read on a cold agent prompt.
+        target = max(0, total - 1)
+        processed = _prefill_remainder(
+            model,
+            prompt,
+            cache,
+            n_model_layers=n_model_layers,
+            draft_model=draft_model,
+            draft_cache=draft_cache,
+            step_cap=step_cap,
+            progress=progress,
+            total=total,
+            processed=0,
+            target=target,
         )
-        mx.clear_cache()
+        n_snap = _fork_prefix_snapshots(
+            store,
+            _req_ctx.model_key,
+            ctx_tokens,
+            cache,
+            bounds,
+            cached=cached,
+            processed=processed,
+            budget=budget,
+        )
+        if _PREFIX_DEBUG or n_snap:
+            print(
+                f"[prefix]   single-pass prefill {processed}/{total}; "
+                f"forked {n_snap} prefix snapshot(s)",
+                flush=True,
+            )
+    else:
+        processed = 0
+        for bound in bounds:
+            target = bound - cached
+            processed = _prefill_remainder(
+                model,
+                prompt,
+                cache,
+                n_model_layers=n_model_layers,
+                draft_model=draft_model,
+                draft_cache=draft_cache,
+                step_cap=step_cap,
+                progress=progress,
+                total=total,
+                processed=processed,
+                target=target,
+            )
+            _fork_prefix_snapshots(
+                store,
+                _req_ctx.model_key,
+                ctx_tokens,
+                cache,
+                [bound],
+                cached=cached,
+                processed=processed,
+                budget=budget,
+            )
 
     kwargs["prompt"] = prompt[processed:]
     if _PREFIX_DEBUG:
@@ -378,6 +936,8 @@ def install_patches(model=None):
     if model is not None:
         _model = model
 
+    _install_adaptive_prefill_generate()
+
     # Streamed models must use the single-request path: the batch engine
     # bypasses stream_generate (so no KV quantization, no relieve_pressure)
     # and would prefill multiple prompts concurrently - each of which streams
@@ -387,9 +947,17 @@ def install_patches(model=None):
     def _provider_load(self, *args, **kwargs):
         global _model
         result = _orig_provider_load(self, *args, **kwargs)
-        if getattr(self.model, "_expert_stream_cache", None) is not None:
+        model = self.model
+        mt = getattr(getattr(model, "args", None), "model_type", None)
+        if mt == "deepseek_v32":
+            _install_deepseek_tool_parser(self.tokenizer)
+        # Idempotent: the PagedMoE loader already did this, but a model that
+        # arrived through mlx-lm's own loader still needs it.
+        prefill_fused.install(model)
+        _clamp_prefill_step(self, model)
+        if getattr(model, "_expert_stream_cache", None) is not None:
             self.is_batchable = False
-            _model = self.model
+            _model = model
         return result
 
     _mlx_server.ModelProvider.load = _provider_load
@@ -437,9 +1005,10 @@ def install_patches(model=None):
     # to a slab the decode path has just rebuilt.
     # generate_step re-resolves this global into a functools.partial on every
     # call, so replacing it here covers the speculative path too.
-    import mlx_lm.generate as _mlx_generate
+    import importlib
 
-    _mlx_generate.maybe_quantize_kv_cache = kvmem.requantize
+    _mlx_gen = importlib.import_module("mlx_lm.generate")
+    _mlx_gen.maybe_quantize_kv_cache = kvmem.requantize
 
     # Wrap stream_generate so every HTTP completion (a) uses a quantized KV
     # cache when the model is streamed, (b) snapshots the user segment for

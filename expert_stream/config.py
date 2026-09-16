@@ -173,7 +173,12 @@ Env vars:
                                 only Qwen3-MoE-style plain-logits routers.
   EXPERT_STREAM_GROUP_MB        max bytes of expert weights materialized per
                                 prefill group (bounds transient memory while
-                                whole layers stream through). Default 384.
+                                whole layers stream through). Default 1024.
+  EXPERT_STREAM_PREFILL_RUN_MB / _SLICE_MB
+                                prefill read shape: longest contiguous
+                                multi-expert span, and the pread granularity
+                                inside it. Defaults 512 / 8. The run cap must
+                                exceed one expert or coalescing cannot happen.
   EXPERT_STREAM_PREFILL_CACHE_GB
                                 expert-cache budget while a big prefill chunk is
                                 being processed. Default 4. A prefill pass reads
@@ -185,6 +190,22 @@ Env vars:
                                 default for the server and CLI. Default 32768:
                                 a 32k-token agent prompt then streams the expert
                                 mass exactly once instead of four times.
+                                With adaptive prefill on, this is the *max*
+                                chunk (per-step size shrinks with KV length).
+  EXPERT_STREAM_FUSED_PREFILL   1 (default) = sub-chunk attention inside each
+                                decoder layer and run the MoE once per chunk,
+                                so a long prompt streams the expert mass once
+                                instead of once per attention chunk.
+  EXPERT_STREAM_ADAPTIVE_PREFILL
+                                1 = resize the prefill step each pass instead
+                                of using one fixed PREFILL_CHUNK.
+  EXPERT_STREAM_ADAPTIVE_PREFILL_MODE
+                                auto|dsa|fused|off. auto picks dsa when the
+                                model has an indexer / deepseek_v32-class
+                                attention, else fused.
+  EXPERT_STREAM_ADAPTIVE_PREFILL_MAX / _SAFETY
+                                chunk ceiling and Metal-buffer safety factor
+                                (default PREFILL_CHUNK / 0.75).
   EXPERT_STREAM_RESERVE_CTX     context length (tokens) to hold back KV memory
                                 for when sizing the expert cache. The host app sets this
                                 from the model's numCtx. Full-attention models
@@ -866,13 +887,57 @@ def clear_bytes_auto(cache_budget_bytes: int) -> int:
 
 # Prefill processes each layer's experts in groups of at most this many bytes,
 # so a 512-expert layer never sits in memory all at once.
-GROUP_BYTES: int = _env("EXPERT_STREAM_GROUP_MB", 384, int) * (1 << 20)
+GROUP_BYTES: int = _env("EXPERT_STREAM_GROUP_MB", 1024, int) * (1 << 20)
+
+# Prefill read shape. A prefill group is a *sorted, near-contiguous* run of
+# expert ids, so with a large enough run cap each component of the group is one
+# contiguous byte range on disk and the whole group costs a handful of big
+# sequential reads. The old 32 MB run cap was smaller than a single DeepSeek
+# expert (~25 MB), which defeated coalescing entirely and turned every prefill
+# pass into ~15k independent per-expert reads.
+#
+# RUN_MB bounds one sequential span (and hence one reader thread's share of the
+# group); SLICE_MB is the pread granularity inside a span - large, because
+# prefill already has abundant parallelism and what it needs is *bytes per
+# syscall*, not more concurrent small reads.
+PREFILL_RUN_BYTES: int = _env("EXPERT_STREAM_PREFILL_RUN_MB", 512, int) * (1 << 20)
+PREFILL_SLICE_BYTES: int = _env("EXPERT_STREAM_PREFILL_SLICE_MB", 8, int) * (1 << 20)
+
+# Query rows per attention call during fused prefill. Performance target;
+# Metal's score-matrix bound still applies on top (attention_sub_chunk takes
+# the min). Smaller C = less score work on a materialized causal mask
+# (overhead ~C/T). Floor is GEMM efficiency (~1k rows). Safe on DSA: the
+# indexer applies the causal mask before argpartition, so C changes cost
+# only, not which keys a query attends.
+ATTN_SUB_CHUNK: int = _env("EXPERT_STREAM_ATTN_SUB_CHUNK", 2048, int)
 
 # Residency budget while a large prefill chunk runs (see ExpertCache.enter_prefill).
 PREFILL_CACHE_GB: float = _env("EXPERT_STREAM_PREFILL_CACHE_GB", 4.0, float)
 
-# Prompt tokens per prefill pass (server/CLI default).
+# Prompt tokens per prefill pass (server/CLI default). With adaptive prefill
+# this is the per-step *ceiling*; DSA models shrink below it as KV grows.
 PREFILL_CHUNK: int = _env("EXPERT_STREAM_PREFILL_CHUNK", 32768, int)
+
+# Adaptive prefill: recompute chunk size each step from current KV length.
+# Quality-neutral vs a fixed schedule of the same sizes; unlocks large early
+# chunks on DSA models without blowing Metal's max single buffer.
+ADAPTIVE_PREFILL: bool = bool(_env("EXPERT_STREAM_ADAPTIVE_PREFILL", 0, int))
+ADAPTIVE_PREFILL_MODE: str = _env("EXPERT_STREAM_ADAPTIVE_PREFILL_MODE", "auto", str)
+ADAPTIVE_PREFILL_MAX: int = _env(
+    "EXPERT_STREAM_ADAPTIVE_PREFILL_MAX", PREFILL_CHUNK, int
+)
+ADAPTIVE_PREFILL_SAFETY: float = _env(
+    "EXPERT_STREAM_ADAPTIVE_PREFILL_SAFETY", 0.75, float
+)
+ADAPTIVE_PREFILL_DEBUG: bool = bool(
+    _env("EXPERT_STREAM_ADAPTIVE_PREFILL_DEBUG", 0, int)
+)
+
+# Layer-fused prefill: sub-chunk attention *inside* each decoder layer so the
+# model-level chunk (and therefore the number of expert-mass passes) is bounded
+# by activation memory instead of by the attention score matrix. See
+# prefill_fused. Off makes every architecture behave as it did before.
+FUSED_PREFILL: bool = bool(_env("EXPERT_STREAM_FUSED_PREFILL", 1, int))
 
 # Contexts below this many tokens keep an fp16 KV cache; past it, the cache is
 # quantized to 8-bit (kv_bits=8) as before. fp16 KV measured +8% decode
@@ -912,7 +977,7 @@ KV_STORE_SLACK: float = _env("EXPERT_STREAM_KV_STORE_SLACK", 1.25, float)
 # (see kvmem.take_nearest_cache). 0 restores mlx-lm's copying.
 PROMPT_CACHE_MOVE: bool = bool(_env("EXPERT_STREAM_PROMPT_CACHE_MOVE", 1, int))
 
-# Only chunks at least this big switch the cache to the shrunk budget.
+# Only chunks *larger* than this switch the cache to the shrunk budget.
 #
 # Reading the expert mass costs ~the same for a 500-token chunk as for a
 # 32k-token one (either way, essentially every expert of every layer gets
@@ -920,7 +985,7 @@ PROMPT_CACHE_MOVE: bool = bool(_env("EXPERT_STREAM_PROMPT_CACHE_MOVE", 1, int))
 # for a big cold prompt, yes; for the few-hundred-token delta of an agent turn
 # that hits the prompt cache, shrinking would just evict the warm experts that
 # make the delta cheap. 8192 is the largest chunk that still fits alongside a
-# full cache, which makes it the natural break-even point.
+# full cache; at or above it the slab is released (streaming.py).
 PREFILL_SHRINK_TOKENS: int = _env("EXPERT_STREAM_PREFILL_SHRINK_TOKENS", 8192, int)
 
 

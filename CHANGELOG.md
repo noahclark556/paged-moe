@@ -8,6 +8,32 @@ Format loosely follows Keep a Changelog. Versioning aims for SemVer.
 
 <!-- Nothing yet. -->
 
+## [0.2.3] - 2026-09-16
+
+### Added
+
+- Layer-fused prefill: attention sub-chunks inside each decoder layer; MoE
+  streams once per prompt chunk (`EXPERT_STREAM_FUSED_PREFILL`, default on)
+- `EXPERT_STREAM_ATTN_SUB_CHUNK` (default 2048): attention size target under
+  the Metal score-matrix bound
+- Adaptive prefill helpers / modes (`EXPERT_STREAM_ADAPTIVE_PREFILL*`) for
+  DSA-aware step sizing
+- Single-pass prefix snapshots on trimmable KV: one prefill, then deepcopy+trim
+  forks (no mid-prefill expert-mass stop)
+- `[prefill]` cost lines: tokens, expert GB, passes over the mass, disk-blocked
+  vs compute
+
+### Changed
+
+- Prefill read shape sized for bandwidth (larger runs/slices vs decode)
+- Default model-level prefill chunk ceiling raised so a long agent prompt can
+  be one expert pass when fused is on
+
+### Fixed
+
+- Adaptive sizing broken on DeepSeek `CacheList` (offset always looked like 0)
+- Prefill coalescing defeated when the run cap was smaller than one expert
+
 ## [0.2.2] - 2026-09-16
 
 ### Added
@@ -38,6 +64,7 @@ Format loosely follows Keep a Changelog. Versioning aims for SemVer.
 - Initial public engine snapshot (import name `expert_stream`)
 - Sample `~/paged-moe-config.yaml` seeding; sidecar data under `~/.paged_moe/`
 
-[Unreleased]: https://github.com/noahclark556/paged-moe/compare/v0.2.2...HEAD
+[Unreleased]: https://github.com/noahclark556/paged-moe/compare/v0.2.3...HEAD
+[0.2.3]: https://github.com/noahclark556/paged-moe/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/noahclark556/paged-moe/compare/v0.2.0...v0.2.2
 [0.2.0]: https://github.com/noahclark556/paged-moe/releases/tag/v0.2.0

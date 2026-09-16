@@ -14,9 +14,9 @@ off.
 > and pages them into Metal on demand - no CUDA, no NVIDIA, no separate
 > server or quantization pass required.
 
-**Jump:** [Quick start](#quick-start) · [Requirements](#requirements) ·
-[Why it fits](#why-it-fits) · [Compatible models](#compatible-models) ·
-[Extras](#extras) · [License](#license-dual) · [Citation](#citation) ·
+**Jump:** [Quick start](#quick-start) | [Requirements](#requirements) |
+[Why it fits](#why-it-fits) | [Compatible models](#compatible-models) |
+[Extras](#extras) | [License](#license-dual) | [Citation](#citation) |
 [Contact](#contact)
 
 Measured on an Apple M5 Pro, **48 GB**. Without this, none of these load.
@@ -37,7 +37,7 @@ idle on any given token, so you do not need the whole library in RAM.
 the router picks them. LRU cache + route prediction (and an optional
 governed sidecar) keep agent turns warm.
 
-> **Status:** `v0.2.2` pre-release. The engine is in this repo and installs
+> **Status:** `v0.2.3` pre-release. The engine is in this repo and installs
 > from a clone. Not on PyPI yet. APIs may change before `v1.0`.
 >
 > **Naming:** product / repo / PyPI / CLI = **PagedMoE** (`paged-moe`).
@@ -138,7 +138,7 @@ PAGED_MOE_DEBUG=1 # stderr: [paged-moe] stream via ... / passthrough ...
 ### Who this is for
 
 - Qwen / GLM / DeepSeek-class MoEs on Apple Silicon without a 128-512 GB box
- (can be tuned outside that range; capability extends by a wide margin)
+ (tunable outside that range too)
 - Agent loops (tools, multi-turn, long prompts), not just one-shot chat
 - Plain mlx-community (or converted) checkpoints, not a special "streaming
  edition" of two curated models
@@ -156,11 +156,12 @@ PAGED_MOE_DEBUG=1 # stderr: [paged-moe] stream via ... / passthrough ...
 1. Drop-in for `mlx_lm.load` on SwitchGLU MoEs - checkpoint can be 2x or 5x RAM
 2. An OpenAI-compatible server your agent already knows how to talk to
 3. Bit-identical output to a fully resident run when expert pruning is off
-4. Agent-session hardening: prompt-prefix reuse, KV rules that do not corrupt
- the next turn, memory that yields to long prefills instead of OOMing Metal
+4. Agent-session hardening: prompt-prefix reuse (one prefill, then fork
+ snapshots on trimmable KV), memory that yields to long prefills instead of
+ OOMing Metal
 
 Under the hood, mlx-lm routes MoE expert compute through `SwitchGLU`. This
-swaps that seam for a disk-backed version and keeps attention, KV cache,
+replaces that with a disk-backed version and keeps attention, KV cache,
 templates, and sampling. LRU + route prediction + optional slabs hide as much
 disk latency as the SSD allows.
 
@@ -225,8 +226,19 @@ expert cache mid-session.
 Long prefills can temporarily shrink the expert footprint so Metal does not
 OOM, then warm back up for decode.
 
+Prefill is priced in expert bytes, not FLOPs. A chunk that routes widely
+streams essentially the whole expert mass once. Layer-fused prefill (on by
+default) sub-chunks attention inside each decoder layer and runs the MoE once
+per prompt chunk, so a long agent prompt can be one pass over the experts
+instead of one pass per attention-sized step. Attention sub-chunk size is
+`EXPERT_STREAM_ATTN_SUB_CHUNK` (default 2048); the Metal score-matrix bound
+still caps it. Watch stderr for `[prefill] ... passes over the mass ...
+blocked on disk ... compute`.
+
 Agent turns reuse the prompt prefix instead of redoing the whole history each
-tool round.
+tool round. On trimmable KV caches (DeepSeek / Qwen3-MoE / GLM and friends)
+the cold path prefills once, then forks prefix snapshots with deepcopy+trim.
+Hybrid / non-trimmable stacks still stop mid-prefill at snapshot boundaries.
 
 If the model already fits, it can run fully resident. Streaming is the escape
 hatch for oversized MoEs. Same API either way.
@@ -251,7 +263,7 @@ No custom checkpoint format. Plain MLX safetensors.
 
 ## Extras
 
-Things beyond install → yaml → chat. Optional; the Quick start path works
+Things beyond install -> yaml -> chat. Optional; the Quick start path works
 without them.
 
 ### Sidecar offline pretrain
@@ -297,7 +309,7 @@ for a release.
 
 ```bash
 paged-moe-server --model ~/mlx-models/qwen3-235-4bit --port 8080
-# or: python -m expert_stream.server --model … --port 8080
+# or: python -m expert_stream.server --model <path> --port 8080
 ```
 
 Same streaming load path as `mlx_lm.load`. Point any OpenAI-compatible client
@@ -313,6 +325,11 @@ process environment). Common ones:
 | `EXPERT_STREAM_SIDECAR` | `1` = online sidecar; `0` = paging only |
 | `EXPERT_STREAM_SIDECAR_GOVERNOR` | `1` (default) = only actuate while decode is faster |
 | `EXPERT_STREAM_PREDICT` | `auto` / `1` / `0` - route-prediction prefetch |
+| `EXPERT_STREAM_FUSED_PREFILL` | `1` (default) = attention sub-chunks; MoE once per prompt chunk |
+| `EXPERT_STREAM_ATTN_SUB_CHUNK` | Query rows per attention call in fused prefill (default 2048) |
+| `EXPERT_STREAM_ADAPTIVE_PREFILL` | `1` = resize the model-level step each pass |
+| `EXPERT_STREAM_ADAPTIVE_PREFILL_MODE` | `auto` / `dsa` / `fused` / `off` |
+| `EXPERT_STREAM_PREFILL_CHUNK` | Model-level step ceiling (default 32768) |
 | `EXPERT_STREAM_READ_POOL_THREADS` | Decode slot-read queue depth (`0` = auto, `-1` = old executor path) |
 | `EXPERT_STREAM_PRUNE` | Drop weak routed experts (speed vs fidelity) |
 | `EXPERT_STREAM_WAIT_ABOVE` | Only stall on high-weight disk misses |
@@ -330,9 +347,9 @@ unless you turn them on.
 | `paged-moe status` | Hook + config paths |
 | `paged-moe which <model>` | Will this path stream? |
 | `paged-moe install` / `uninstall` | Auto-hook for `mlx_lm.load` |
-| `paged-moe-pretrain …` | Sidecar corpus warm-start / fit / unlock |
-| `paged-moe-server …` | Local OpenAI-compatible HTTP |
-| `python run.py --model … --chat` | Quick interactive REPL (clone only) |
+| `paged-moe-pretrain ...` | Sidecar corpus warm-start / fit / unlock |
+| `paged-moe-server ...` | Local OpenAI-compatible HTTP |
+| `python run.py --model ... --chat` | Quick interactive REPL (clone only) |
 
 ---
 
