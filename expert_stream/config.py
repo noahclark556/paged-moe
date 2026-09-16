@@ -29,6 +29,10 @@ Env vars:
                                 page-cache the checkpoint (can balloon tens of
                                 GB during prefill and freeze a 48 GB machine).
   EXPERT_STREAM_READ_THREADS    parallel disk readers. Default 16.
+  EXPERT_STREAM_READ_POOL_THREADS
+                                decode slot-read pool queue depth.
+                                0 = auto (2x READ_THREADS), -1 = old executor
+                                path. Default 0.
   EXPERT_STREAM_PREFETCH_DEPTH  speculative prefetch lookahead in layers. Default 8.
   EXPERT_STREAM_PREDICT         "auto" (default), "1" (always) or "0" (never):
                                 during decode, run the *next* layers' routers on
@@ -81,6 +85,21 @@ Env vars:
                                 spans several agent turns; re-probing keeps half
                                 the previous evidence so a settled result is not
                                 relitigated from scratch.
+  EXPERT_STREAM_PREDICT_FAR_LEAD
+                                add ONE prediction per layer at this distance,
+                                for source layers past FAR_FROM of the stack.
+                                Default 0 (off). The window above is uniform
+                                over depth; bench/router_matrix.py shows that
+                                is wrong - agreement decays with source depth,
+                                not distance, so the early layers that justify
+                                a short window are not the deep ones that could
+                                run 16-32 ahead at 0.6-0.8 miss-precision. One
+                                target (not a wider window) because a wide
+                                burst queues ahead of real demand misses.
+  EXPERT_STREAM_PREDICT_FAR_FROM
+                                fraction of the stack before FAR_LEAD engages.
+                                Default 0.17 (~n/6), where the measured
+                                early-layer collapse ends.
   EXPERT_STREAM_PREDICT_DEPTH   how many layers ahead to route-predict.
                                 Default 3. Prediction accuracy is nearly flat
                                 with distance (87-89% at depth 1-8 measured),
@@ -273,7 +292,55 @@ Env vars:
   EXPERT_STREAM_SIDECAR_RESIDENCY_MAX_PROTECT
                                 cap on the share of scanned eviction candidates
                                 that may be protected, so a uniformly hot cache
-                                still makes progress. Default 0.33.
+                                still makes progress. Default 0.10 - at 0.33 the
+                                head stopped selecting and merely perturbed
+                                LRU's victim order, measured +55% misses.
+  EXPERT_STREAM_SIDECAR_RESIDENCY_MIN_HITS
+                                separate demands on a key before its reuse rate
+                                may override LRU. Default 8: 88% of just-used
+                                experts are reused inside the horizon, so a rate
+                                from one or two observations is noise.
+  EXPERT_STREAM_SIDECAR_GOVERNOR
+                                1 (default) = actuation is A/B'd against itself
+                                on measured decode rate and only stays on while
+                                it wins. This is what makes "the sidecar cannot
+                                make decode slower" a property rather than a
+                                hope; recall-style metrics cannot deliver it
+                                because they have no cost term. 0 = actuate
+                                unconditionally (A/B rigs only).
+  EXPERT_STREAM_SIDECAR_GOV_WINDOW / _MIN_TOKENS
+                                tokens per A/B window, and tokens per arm before
+                                a verdict. Default 16 / 256. The error bar
+                                shrinks with the number of *windows*, so small
+                                windows and a high token floor is the cheap way
+                                to resolve a small effect.
+  EXPERT_STREAM_SIDECAR_GOV_MARGIN / _Z
+                                how much faster actuation must measure (ratio,
+                                default 1.03) and how many error bars the gap
+                                must clear (default 3.0) to switch ON. Switching
+                                OFF needs only half the Z: stopping a
+                                speculation is cheap to get wrong, starting one
+                                is not.
+  EXPERT_STREAM_SIDECAR_GOV_HOLD / _PROBE_DUTY / _MAX_PROBE
+                                tokens a verdict holds (512), how often re-probes
+                                sample the losing side (1 window in 8, widening
+                                as the verdict is confirmed), and how far past
+                                the minimum sample an inconclusive round runs
+                                before calling a tie (24x). Ties settle OFF.
+  EXPERT_STREAM_SIDECAR_MIN_PROB
+                                minimum calibrated probability for a speculative
+                                read. Default 0.35. Volume tracks confidence
+                                rather than a fixed top-k, so an unsure head
+                                ships nothing instead of k reads per layer.
+  EXPERT_STREAM_SIDECAR_SPEC_BYTE_FRAC
+                                speculative bytes per token as a share of the
+                                demand-miss bytes the same token paid for.
+                                Default 0.25. Bounds the worst case before any
+                                learning has happened, and scales itself across
+                                models whose experts differ by 6x in size.
+  EXPERT_STREAM_SIDECAR_TARGET_PRECISION
+                                precision the issue threshold servos toward.
+                                Default 0.5.
   EXPERT_STREAM_SIDECAR_HEAD_PRUNE
                                 0 (default) = off. 1 = adaptive prune/wait
                                 (quality-affecting; shadow->promote).
@@ -346,6 +413,25 @@ NOCACHE: bool = bool(_env("EXPERT_STREAM_NOCACHE", 1, int))
 
 READ_THREADS: int = _env("EXPERT_STREAM_READ_THREADS", 16, int)
 
+# Slot-read pool workers (ExpertCache._ReadPool): decode miss queue depth.
+# Miss threads push reads here directly. disk_ceiling.py saturates ~qd16 on
+# 3 MB requests and still gains at qd64 on 0.2 MB scales, so default wants
+# deeper than READ_THREADS.
+# 0 = auto (2x READ_THREADS); -1 disables and restores the ThreadPoolExecutor path.
+READ_POOL_THREADS: int = _env("EXPERT_STREAM_READ_POOL_THREADS", 0, int)
+
+# Speculative inflight cap as a multiple of READ_THREADS. Too low leaves the
+# drive idle (drive_idle.py: ~19% idle while speculation skips ~200x/token).
+# 0 = auto.
+SPEC_INFLIGHT_MULT: float = _env("EXPERT_STREAM_SPEC_INFLIGHT_MULT", 3.0, float)
+
+# Slab slots held back from residency so in-flight reads and unclaimed
+# guesses have somewhere to land. Same pool as the cache, so this trades hit
+# rate for prefetch runway. Raising STAGING_GB alone does not buy runway:
+# staging past the reserve starves reads of slots (Qwen3-235B: drive
+# occupancy 80% -> 66%).
+SLAB_RESERVE_FRAC: float = _env("EXPERT_STREAM_SLAB_RESERVE_FRAC", 0.1, float)
+
 # Deep enough to hide NVMe latency behind a few layers of attention+MoE
 # on big models (GLM-4.5-Air has 46 MoE layers).
 PREFETCH_DEPTH: int = _env("EXPERT_STREAM_PREFETCH_DEPTH", 8, int)
@@ -373,6 +459,15 @@ PREDICT_DEPTH: int = _env("EXPERT_STREAM_PREDICT_DEPTH", 3, int)
 # layers i+lead+1 .. i+lead+depth). Lead time and burst size are separate
 # knobs: see PrefetchRing.__init__.
 PREDICT_LEAD: int = _env("EXPERT_STREAM_PREDICT_LEAD", 0, int)
+# One extra prediction per layer, aimed this many layers ahead, for source
+# layers past PREDICT_FAR_FROM of the stack. bench/router_matrix.py shows
+# router agreement decays with SOURCE DEPTH rather than distance: on
+# Qwen3-235B, precision among cache misses from layer 0 dies by distance 4
+# (0.28) while from layer 24 it holds 0.73 at distance 32, against a net-win
+# bar of 0.5. 0 (default) keeps the shipped uniform-window behaviour; try
+# 16-32 on a disk-bound model, and let the prediction governor confirm it.
+PREDICT_FAR_LEAD: int = _env("EXPERT_STREAM_PREDICT_FAR_LEAD", 0, int)
+PREDICT_FAR_FROM: float = _env("EXPERT_STREAM_PREDICT_FAR_FROM", 0.17, float)
 PREDICT_SLACK: int = _env("EXPERT_STREAM_PREDICT_SLACK", 2, int)
 PREDICT_RENORM: bool = bool(_env("EXPERT_STREAM_PREDICT_RENORM", 0, int))
 # When decode pruning is on, prediction prunes its guesses with the same
@@ -513,6 +608,64 @@ SIDECAR_PREFILL_TOPK: int = _env("EXPERT_STREAM_SIDECAR_PREFILL_TOPK", 0, int)
 SIDECAR_PREFILL_HOT_FRAC: float = _env(
     "EXPERT_STREAM_SIDECAR_PREFILL_HOT_FRAC", 0.5, float
 )
+# --- net-time governor -----------------------------------------------------
+# The sidecar's only unconditional promise is "not slower". Recall-style
+# metrics cannot deliver it: a head can hold high recall while most of its
+# speculative reads go unused, and on a disk-bandwidth-bound decode those
+# unused reads come straight out of the demand path. Both benched models
+# shipped in exactly that state (-24% and -13% tok/s at positive `gain`).
+# So actuation is decided by an interleaved A/B on measured token time
+# instead, and the heads only get to spend bandwidth while it is winning.
+SIDECAR_GOVERNOR: bool = bool(_env("EXPERT_STREAM_SIDECAR_GOVERNOR", 1, int))
+# Tokens per A/B window. Small, because the error bar on the comparison
+# shrinks with the number of *windows*, not the number of tokens - and short
+# windows also interleave the two states finely enough that both see the same
+# mix of work. Matches the route-prediction governor's window for the same
+# reason.
+SIDECAR_GOV_WINDOW: int = _env("EXPERT_STREAM_SIDECAR_GOV_WINDOW", 16, int)
+# Tokens per arm before a verdict is even considered. At the window above this
+# is 16 windows per arm, enough for the error bar to resolve a ~20% effect,
+# which is the size of the regressions actually measured here.
+SIDECAR_GOV_MIN_TOKENS: int = _env("EXPERT_STREAM_SIDECAR_GOV_MIN_TOKENS", 256, int)
+# How much faster actuation must measure before it is allowed to stay on, as a
+# ratio (1.03 = 3%). Same convention as EXPERT_STREAM_PREDICT_MARGIN. Not 1.0:
+# at 1.0, noise alone turns actuation on about half the time.
+SIDECAR_GOV_MARGIN: float = _env("EXPERT_STREAM_SIDECAR_GOV_MARGIN", 1.03, float)
+# Error bars the gap must clear to switch actuation ON. Switching OFF needs
+# only half of this - stopping a speculation that may be costing throughput is
+# cheap to get wrong, starting one is not.
+SIDECAR_GOV_Z: float = _env("EXPERT_STREAM_SIDECAR_GOV_Z", 3.0, float)
+# How far past the minimum sample an inconclusive A/B keeps probing before it
+# is called a tie (a multiple of SIDECAR_GOV_MIN_TOKENS). Ties settle OFF: if
+# the effect is still inside the noise after this much evidence, there is
+# little to win and the configuration that spends no disk is the safe one.
+SIDECAR_GOV_MAX_PROBE: float = _env("EXPERT_STREAM_SIDECAR_GOV_MAX_PROBE", 24.0, float)
+# Tokens a verdict holds before the next probe round. Bounds the cost of being
+# wrong after conditions change, and the cost of probing when they have not.
+SIDECAR_GOV_HOLD: int = _env("EXPERT_STREAM_SIDECAR_GOV_HOLD", 512, int)
+# After the first verdict, re-probes sample the losing configuration only one
+# window in this many. An even re-probe would spend a quarter of all tokens in
+# a state already measured slower, which is most of the regression this is
+# supposed to remove.
+SIDECAR_GOV_PROBE_DUTY: int = _env("EXPERT_STREAM_SIDECAR_GOV_PROBE_DUTY", 8, int)
+
+# --- wrap issuance ---------------------------------------------------------
+# Minimum calibrated probability for a speculative read. Volume tracks
+# confidence rather than a fixed top-k, so an uncertain token issues little or
+# nothing instead of always issuing k per layer.
+SIDECAR_MIN_PROB: float = _env("EXPERT_STREAM_SIDECAR_MIN_PROB", 0.35, float)
+# Speculative bytes per token as a share of the demand misses the same token
+# paid for. Keeps speculation a bounded fraction of a cost we were already
+# incurring, on the model's own current working set, at any cache size.
+SIDECAR_SPEC_BYTE_FRAC: float = _env(
+    "EXPERT_STREAM_SIDECAR_SPEC_BYTE_FRAC", 0.25, float
+)
+# Precision the issue threshold servos toward. At 1/2, a speculative read is
+# expected to save more demand-path time than it costs.
+SIDECAR_TARGET_PRECISION: float = _env(
+    "EXPERT_STREAM_SIDECAR_TARGET_PRECISION", 0.5, float
+)
+
 SIDECAR_RESIDENCY_HORIZON: int = _env(
     "EXPERT_STREAM_SIDECAR_RESIDENCY_HORIZON", 32, int
 )
@@ -520,9 +673,19 @@ SIDECAR_RESIDENCY_MIN_SCORE: float = _env(
     "EXPERT_STREAM_SIDECAR_RESIDENCY_MIN_SCORE", 0.35, float
 )
 # Never protect more than this share of scanned eviction candidates - a cache
-# of uniformly "hot" keys must still make progress.
+# of uniformly "hot" keys must still make progress. Also sets the top slice of
+# the observed score distribution the protect bar tracks. Lowered from 0.33:
+# at a third of candidates the head stopped selecting and merely perturbed
+# LRU's victim order, which measured +55% misses against leaving LRU alone.
 SIDECAR_RESIDENCY_MAX_PROTECT: float = _env(
-    "EXPERT_STREAM_SIDECAR_RESIDENCY_MAX_PROTECT", 0.33, float
+    "EXPERT_STREAM_SIDECAR_RESIDENCY_MAX_PROTECT", 0.10, float
+)
+# Minimum separate demands on a key before its reuse rate is allowed to
+# override LRU. 88% of just-used experts are reused within the horizon, so a
+# rate computed from one or two observations is noise, and LRU's recency
+# ordering beats noise.
+SIDECAR_RESIDENCY_MIN_HITS: int = _env(
+    "EXPERT_STREAM_SIDECAR_RESIDENCY_MIN_HITS", 8, int
 )
 SIDECAR_PRUNE_MAX: float = _env("EXPERT_STREAM_SIDECAR_PRUNE_MAX", 0.95, float)
 # Adaptive prune only goes live once the shadow policy retains at least this

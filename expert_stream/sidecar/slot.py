@@ -180,6 +180,49 @@ class ExpertHeadSlot:
             out[i] = [int(e) for e in order[i][keepmask[i]]]
         return out
 
+    def predict_scored(
+        self,
+        features: np.ndarray,
+        k: int,
+        *,
+        use_shadow: bool = False,
+        min_score: float = 0.0,
+        max_heads: int | None = None,
+    ) -> tuple[dict[int, list[int]], dict[int, list[tuple[int, float]]]]:
+        """``predict_topk`` plus the probability behind each id.
+
+        Actuation needs the scores, not just the ranking. A top-k alone cannot
+        distinguish "the model is confident about three experts" from "the
+        model is flat and these three won by a rounding error", and issuing
+        reads for the second case is how the head came to waste 85% of its
+        bandwidth on GLM-4.7. One extra pass over an (H, k) slice.
+        """
+        k = max(1, min(int(k), self.n_experts))
+        limit = self.n_heads if max_heads is None else min(self.n_heads, int(max_heads))
+        if limit <= 0:
+            return {}, {}
+        probs = self._scores(features, use_shadow=use_shadow)[:limit]
+        if k >= self.n_experts:
+            order = np.argsort(-probs, axis=1)
+        else:
+            part = np.argpartition(-probs, k - 1, axis=1)[:, :k]
+            rows = np.arange(part.shape[0])[:, None]
+            order = part[rows, np.argsort(-probs[rows, part], axis=1)]
+        rows = np.arange(order.shape[0])[:, None]
+        picked = probs[rows, order]
+        keepmask = picked >= float(min_score)
+        keepmask[:, 0] = True  # always keep the head's single best guess
+        ids: dict[int, list[int]] = {}
+        scored: dict[int, list[tuple[int, float]]] = {}
+        for i in range(order.shape[0]):
+            row = order[i][keepmask[i]]
+            ids[i] = [int(e) for e in row]
+            scored[i] = [
+                (int(e), float(p))
+                for e, p in zip(row, picked[i][keepmask[i]])
+            ]
+        return ids, scored
+
     # ---------------------------------------------------------------- training
 
     def train_shadow(

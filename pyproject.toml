@@ -4,13 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "paged-moe"
-version = "0.2.0"
-description = "PagedMoE: offload MoE experts to disk and stream them on demand through mlx-lm on Apple Silicon"
+version = "0.2.2"
+description = "PagedMoE: stream MoE experts from disk through mlx-lm on Apple silicon"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "AGPL-3.0-or-later OR LicenseRef-PagedMoE-Commercial" }
 authors = [{ name = "Noah Clark" }]
-keywords = ["mlx", "moe", "apple-silicon", "inference", "paged-experts", "offloading", "qwen3", "deepseek"]
+keywords = ["mlx", "moe", "apple-silicon", "inference", "paged-experts"]
 dependencies = [
   "numpy>=1.26",
   "huggingface_hub>=0.24",

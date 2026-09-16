@@ -403,6 +403,16 @@ def main(argv: list[str] | None = None) -> int:
     )
     ap.add_argument("--max-prompts", type=int, default=0)
     ap.add_argument(
+        "--chunk-prompts",
+        type=int,
+        default=0,
+        help=(
+            "process at most N prompts from the resume point, then stop and "
+            "keep progress so the next run continues further in the corpus "
+            "(full corpus; does not slice like --max-prompts)"
+        ),
+    )
+    ap.add_argument(
         "--epochs",
         type=int,
         default=-1,
@@ -613,11 +623,18 @@ def main(argv: list[str] | None = None) -> int:
                 flush=True,
             )
 
+    chunk = max(0, int(getattr(args, "chunk_prompts", 0) or 0))
+    end = len(items)
+    if chunk > 0:
+        end = min(len(items), start + chunk)
+
     print(
-        f"[sidecar-pretrain] {len(items)} prompts (from {start + 1}), "
+        f"[sidecar-pretrain] {len(items)} prompts (from {start + 1}"
+        f"{f' to {end}' if chunk > 0 else ''}), "
         f"max_prompt_tokens={args.max_prompt_tokens}, "
         f"decode={args.max_tokens}, epochs={args.epochs}"
-        f"{' [quick]' if args.quick else ''} "
+        f"{' [quick]' if args.quick else ''}"
+        f"{f' [chunk={chunk}]' if chunk > 0 else ''} "
         f"(sliding-window expand + mix across token positions)",
         flush=True,
     )
@@ -644,7 +661,7 @@ def main(argv: list[str] | None = None) -> int:
     signal.signal(signal.SIGINT, _on_signal)
     signal.signal(signal.SIGTERM, _on_signal)
 
-    for idx in range(start, len(items)):
+    for idx in range(start, end):
         if stop["flag"]:
             break
         item = items[idx]
@@ -711,23 +728,31 @@ def main(argv: list[str] | None = None) -> int:
     report = sidecar.fit_pretrain(epochs=args.epochs)
     report["stats"] = get_stats(model).get("sidecar", {})
     report["interrupted"] = bool(stop["flag"])
-    # Clear progress only when the corpus slice fully completed.
-    prog = _load_progress(
+    # Only clear progress when the full corpus (or --max-prompts slice) is
+    # finished. Chunk stops keep progress so the next visit continues further.
+    final_next = _load_progress(
         sidecar.slot_id,
         corpus_path,
         max_prompt_tokens=args.max_prompt_tokens,
         max_prompts=args.max_prompts,
     )
-    # After loop, progress next_index is in the file; if >= len and not interrupted, done.
-    if not stop["flag"]:
+    corpus_complete = (not stop["flag"]) and final_next >= len(items)
+    if corpus_complete:
         _clear_progress(sidecar.slot_id)
         report["corpus_complete"] = True
     else:
         report["corpus_complete"] = False
-        report["resume_at"] = prog + 1
+        report["resume_at"] = final_next + 1
+        report["chunk_end"] = end
+        if chunk > 0 and not stop["flag"]:
+            print(
+                f"[sidecar-pretrain] chunk done - next run resumes at "
+                f"prompt {final_next + 1}/{len(items)}",
+                flush=True,
+            )
     print(json.dumps(report, indent=2), flush=True)
     sidecar.close()
-    return 0
+    return 130 if stop["flag"] else 0
 
 
 if __name__ == "__main__":

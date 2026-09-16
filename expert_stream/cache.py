@@ -25,6 +25,8 @@ Install modes
 
 from __future__ import annotations
 
+import os
+import queue
 import threading
 import time
 from collections import OrderedDict, defaultdict
@@ -70,6 +72,123 @@ _CLEAR_THRESHOLD = 2 << 30
 # but on a saturated pipe (big-expert decode) every slice is a Future plus a
 # GIL window, and the scheduling overhead competes with the GPU thread.
 _SLICE_BYTES = int(_env("EXPERT_STREAM_SLICE_MB", 2, float) * (1 << 20))
+
+# Slot reads only fan a component to the slice pool at or above this size;
+# smaller ones read inline on the expert worker. See _read_slab_inner.
+# 0 = fan everything; a huge value = fully inline. Both kept for A/B.
+_FANOUT_BYTES = int(_env("EXPERT_STREAM_FANOUT_MB", 1.0, float) * (1 << 20))
+
+
+class _SlotLatch:
+    """Completion counter for the component reads of one expert.
+
+    A Future per component shipped first and was too expensive: nine
+    components x ~250 misses/token is ~2300 Futures, each with a work item,
+    queue put, and lock. bench/mainthread_profile.py counted ~10700 lock
+    acquisitions/token; bench/gil_probe.py shows main-thread python costing
+    up to 74% of read bandwidth.
+
+    Nine reads share one counter; the single Future is the one `_inflight` /
+    `add_done_callback` already need. First exception wins; later components
+    still count down so a failed read cannot wedge a fetch.
+    """
+
+    __slots__ = ("_entry", "_exc", "_fut", "_left", "_lock", "_on_done")
+
+    def __init__(self, n: int, fut: Future, entry: dict, on_done=None):
+        self._left = n
+        self._lock = threading.Lock()
+        self._fut = fut
+        self._entry = entry
+        self._exc: BaseException | None = None
+        self._on_done = on_done
+
+    def done(self, exc: BaseException | None = None) -> None:
+        with self._lock:
+            if exc is not None and self._exc is None:
+                self._exc = exc
+            self._left -= 1
+            if self._left > 0:
+                return
+            failure = self._exc
+        if self._on_done is not None:
+            self._on_done()
+        # Outside the lock: resolves the expert Future; its callback takes
+        # the cache lock (_attach_staging).
+        if failure is not None:
+            self._fut.set_exception(failure)
+        else:
+            self._fut.set_result(self._entry)
+
+
+class _ReadPool:
+    """Persistent pread workers fed by a plain queue.
+
+    Not a ThreadPoolExecutor: submitting one allocates a Future and work
+    item per job, and decode submits thousands per token (see _SlotLatch).
+    A job here is a 4-tuple on a SimpleQueue (C-level, no python lock).
+
+    Sized independently of the expert-level reader count because this *is*
+    the queue depth: miss threads push reads straight in. disk_ceiling.py
+    needs ~qd16 to saturate on 3 MB requests and still gains at qd64 on
+    0.2 MB ones, so the default is deeper than the old 16.
+    """
+
+    def __init__(self, threads: int):
+        self._q: queue.SimpleQueue = queue.SimpleQueue()
+        self.threads = max(1, int(threads))
+        # Per-worker busy flag around the pread. An observer samples these
+        # to tell "drive saturated" from "drive idle waiting on python"
+        # (bench/drive_idle.py). Only worker i writes busy[i], so no lock.
+        self.busy = bytearray(self.threads)
+        for i in range(self.threads):
+            threading.Thread(
+                target=self._run, args=(i,), name=f"expert-read-{i}", daemon=True
+            ).start()
+
+    def _run(self, idx: int) -> None:
+        get = self._q.get
+        busy = self.busy
+        while True:
+            job = get()
+            if job is None:
+                return
+            fd, offset, mv, latch = job
+            busy[idx] = 1
+            try:
+                _pread_full(fd, offset, mv)
+            except BaseException as e:  # noqa: BLE001 - forwarded to the Future
+                busy[idx] = 0
+                latch.done(e)
+            else:
+                busy[idx] = 0
+                latch.done()
+
+    def submit(self, fd: int, offset: int, mv: memoryview, latch: _SlotLatch) -> None:
+        self._q.put((fd, offset, mv, latch))
+
+    def shutdown(self) -> None:
+        """Stop the workers. Unused in production (`ga` owns one process per
+        model), but tests that build caches in a loop need it to avoid leaks."""
+        for _ in range(self.threads):
+            self._q.put(None)
+
+
+def _pread_full(fd: int, offset: int, mv: memoryview) -> None:
+    """pread `mv`'s full length at `offset`. One syscall in the normal case.
+
+    Separate from FilePool.read_into, which resolves path->fd and rebuilds a
+    memoryview each call. The miss path already has both from the read plan,
+    and this runs thousands of times per token.
+    """
+    while True:
+        n = os.preadv(fd, [mv], offset)
+        if n <= 0:
+            raise OSError(f"short read at {offset} (fd {fd})")
+        if n >= len(mv):
+            return
+        mv = mv[n:]
+        offset += n
 
 
 # Left free when sizing a slab rebuild: the next token's activations, the KV
@@ -202,6 +321,10 @@ class ExpertCache:
         )
 
         self._layouts: dict[str, dict[str, ExpertLocator]] = {}
+        # layer_key -> ((fd, base_offset, stride), ...) in slab.names order.
+        # Empty until slabs are on, or for layouts that are not
+        # base + expert*stride (see _build_read_plans).
+        self._read_plan: dict[str, tuple[tuple[int, int, int], ...]] = {}
         self._expert_nbytes: dict[str, int] = {}
         self._lru: "OrderedDict[tuple, dict]" = OrderedDict()
         self._entry_bytes: dict[tuple, int] = {}
@@ -225,12 +348,19 @@ class ExpertCache:
         self._slice_executor = ThreadPoolExecutor(
             max_workers=read_threads, thread_name_prefix="expert-slice"
         )
-        # NOTE: a dedicated speculative executor lane (own thread pool,
-        # whole-component preads) was tried and measured 6-9% *slower*: the
-        # drive is shared regardless, large unsliced preads monopolize it at
-        # the block level, and the shared FIFO queue's implicit
-        # demand-before-spec ordering was doing useful work. See
-        # docs/improvements.md.
+        # Decode slot reads go here once slabs + a read plan exist. None
+        # disables the path so the executor lanes above stay A/B-able.
+        self._reads: _ReadPool | None = None
+        want_pool = config.READ_POOL_THREADS
+        self._read_pool_threads = (
+            0 if want_pool < 0
+            else want_pool if want_pool > 0
+            else max(16, read_threads * 2)
+        )
+        # A dedicated speculative executor lane was tried and measured 6-9%
+        # slower: shared drive, large unsliced preads monopolize it, and the
+        # shared FIFO's demand-before-spec ordering was doing useful work.
+        # See docs/improvements.md.
         self._buffers = BufferPool()
         # Slot-addressed slab storage, when the model's experts are uniformly
         # shaped (see enable_slabs). None => the per-expert mx.array path.
@@ -268,6 +398,11 @@ class ExpertCache:
         self.resident_bytes = 0
         self.peak_resident_bytes = 0
         self.bytes_read = 0
+        # Bytes read to satisfy a *blocking* demand fetch, as opposed to
+        # speculation. This is the quantity a prefetch head's budget has to be
+        # measured against: it says how disk-bound this model actually is, and
+        # therefore how much idle bandwidth (if any) there is to spend.
+        self.demand_miss_bytes = 0
         self.disk_wait_s = 0.0
         # Route-prediction accounting (see PrefetchRing): how much speculative
         # I/O was actually used, and how much of the real demand it covered.
@@ -291,16 +426,12 @@ class ExpertCache:
         # cost side of prediction: it wins whenever it saves more disk_wait_s
         # than it spends here, which is a property of how fast the disk is.
         self.spec_s = 0.0
-        # Speculation may only use read capacity that demand traffic isn't
-        # using. Past this many reads in flight, prefetch is a no-op: adding
-        # queue depth would delay the blocking read some layer is waiting on,
-        # which is exactly the trade that makes prefetching lose. x3 rather
-        # than x2: with prune-aware prediction the speculative stream is ~77%
-        # precise (it mostly *is* demand, three layers early), and on a
-        # big-expert model a demand burst alone holds ~30 reads in flight -
-        # a cap of 2x threads skipped hundreds of correct predictions per
-        # token right when prefetch was needed most.
-        self._spec_inflight_cap = max(4, read_threads * 3)
+        # Speculation may only use spare read capacity. Past this many reads
+        # in flight, prefetch is a no-op (would delay a blocking demand read).
+        # Default mult is 3x: prune-aware prediction is ~77% precise, and a
+        # big-expert demand burst alone holds ~30 reads - a 2x cap skipped
+        # hundreds of correct predictions/token when prefetch mattered most.
+        self._spec_inflight_cap = max(4, int(read_threads * config.SPEC_INFLIGHT_MULT))
 
     def register_layer(self, layer_key: str, components: dict[str, ExpertLocator]):
         self._layouts[layer_key] = components
@@ -317,7 +448,7 @@ class ExpertCache:
     def enable_slabs(
         self,
         slab_bytes: int | None = None,
-        reserve_frac: float = 0.1,
+        reserve_frac: float | None = None,
         ram_budget_bytes: int = 0,
     ):
         """Switch expert residency to slot-addressed slabs. Returns True if on.
@@ -384,16 +515,18 @@ class ExpertCache:
             return False
 
         self.slab = store
+        self._build_read_plans()
         self._ram_budget_bytes = int(ram_budget_bytes)
         self._slab_per_expert = per_expert
         # Highest slot first so early allocations walk up from 0 (nicer to
         # read in traces); order is otherwise irrelevant.
         self._free_slots = list(range(slots - 1, -1, -1))
-        # Residency has to stop short of the slab so reads in flight and
-        # unclaimed prefetch guesses always have somewhere to land. Unlike the
-        # per-expert path - where staging is numpy *outside* the cache budget -
-        # staged guesses occupy slots, so the reserve and the staging cap have
-        # to be the same pool or prefetch starves reads of slots.
+        # Hold back slots so in-flight reads and unclaimed prefetch guesses
+        # have somewhere to land. Unlike the per-expert path (staging is
+        # numpy outside the cache budget), staged guesses occupy slots, so
+        # reserve and staging cap share one pool or prefetch starves reads.
+        if reserve_frac is None:
+            reserve_frac = config.SLAB_RESERVE_FRAC
         reserve = max(4, int(slots * reserve_frac))
         if config.STAGING_BYTES is None:  # an explicit setting still wins
             inflight = min(reserve // 2, self._spec_inflight_cap)
@@ -403,6 +536,50 @@ class ExpertCache:
         self._slab_pending = None
         self._decode_budget = None
         return True
+
+    def _build_read_plans(self) -> None:
+        """Resolve every (layer, component) to (fd, base offset, stride) once.
+
+        The miss path used to rebuild this per read: nine locator.loc() calls
+        and nine slab.dest() slices. At ~250 misses/token that is ~2000
+        dataclasses and numpy slices of GIL-held python (gil_probe.py: busy
+        main thread costs up to 74% of read bandwidth).
+
+        Ordered to match slab.names so a read zips this against
+        slab.slot_dests[slot] with no name lookups. Stride/layout checks that
+        used to run per-read happen here so mismatches fail at load.
+        """
+        plans: dict[str, tuple[tuple[int, int, int], ...]] = {}
+        for layer_key, comps in self._layouts.items():
+            entries = []
+            for i, name in enumerate(self.slab.names):
+                locator = comps[name]
+                loc = locator.loc(0)
+                stride = self.slab.strides[i]
+                if loc.nbytes != stride:
+                    raise RuntimeError(
+                        f"{layer_key}.{name}: {loc.nbytes} B on disk, "
+                        f"{stride} B slot"
+                    )
+                if isinstance(locator, StackedLocator):
+                    base = locator.stacked.offset
+                    per = locator.stacked.nbytes // locator.stacked.shape[0]
+                    if per != stride:
+                        raise RuntimeError(
+                            f"{layer_key}.{name}: stacked stride {per} != "
+                            f"slot stride {stride}"
+                        )
+                    entries.append((self.pool._fd(loc.file), base, stride))
+                else:
+                    # Per-expert tensors have no arithmetic stride between
+                    # experts; leave the plan absent and use the locator path.
+                    entries = []
+                    break
+            if entries:
+                plans[layer_key] = tuple(entries)
+        self._read_plan = plans if len(plans) == len(self._layouts) else {}
+        if self._read_plan and self._reads is None and self._read_pool_threads > 0:
+            self._reads = _ReadPool(self._read_pool_threads)
 
     def _evict_key(self, key: tuple) -> None:
         """Assumes lock held. Drop one resident entry, freeing its slot."""
@@ -523,6 +700,34 @@ class ExpertCache:
                     )
 
     def _read_slab_inner(self, layer_key: str, expert_id: int, slot: int) -> dict:
+        plan = self._read_plan.get(layer_key)
+        if plan is None:
+            return self._read_slab_legacy(layer_key, expert_id, slot)
+        dests = self.slab.slot_dests[slot]
+
+        # Fan only the big weight tensors; scales/biases stay inline.
+        # Qwen3-235B: three ~3 MB weights + six ~0.2 MB scales - fanning all
+        # nine bought queue depth at ~12 Futures/expert (~2950 Futures and
+        # ~10700 lock acqs/token in mainthread_profile.py). Big requests
+        # need ~qd16 to saturate (disk_ceiling.py); 0.2 MB ones never do.
+        jobs = None
+        fan = _FANOUT_BYTES
+        for (fd, base, stride), mv in zip(plan, dests):
+            off = base + expert_id * stride
+            if stride >= fan:
+                if jobs is None:
+                    jobs = []
+                jobs.append(self._slice_executor.submit(_pread_full, fd, off, mv))
+            else:
+                _pread_full(fd, off, mv)
+        if jobs is not None:
+            for j in jobs:
+                j.result()
+        return {"__nbytes__": self.slab.expert_bytes, "__slot__": slot}
+
+    def _read_slab_legacy(self, layer_key: str, expert_id: int, slot: int) -> dict:
+        """Locator-driven slot read, for layouts `_build_read_plans` declined
+        (per-expert tensors, where expert e's offset is not base + e*stride)."""
         comps = self._layouts[layer_key]
         jobs = []
         nbytes = 0
@@ -563,7 +768,32 @@ class ExpertCache:
         key = (layer_key, expert_id)
         self._slot_of[key] = slot
         self._pinned.add(slot)
-        fut = self._executor.submit(self._read_expert_slab, layer_key, expert_id, slot)
+        plan = self._read_plan.get(layer_key) if self._reads is not None else None
+        if plan is None:
+            fut = self._executor.submit(
+                self._read_expert_slab, layer_key, expert_id, slot
+            )
+            self._inflight[key] = fut
+            return fut
+
+        # Planned path: push component reads straight onto the read pool.
+        # No expert-level worker in between - it would only submit and block.
+        fut: Future = Future()
+        fut.set_running_or_notify_cancel()
+        entry = {"__nbytes__": self.slab.expert_bytes, "__slot__": slot}
+        on_done = None
+        if self._verify:
+            self._writing[slot] = self._writing.get(slot, 0) + 1
+
+            def on_done(slot=slot):
+                with self._lock:
+                    self._writing[slot] -= 1
+
+        latch = _SlotLatch(len(plan), fut, entry, on_done)
+        dests = self.slab.slot_dests[slot]
+        submit = self._reads.submit
+        for (fd, base, stride), mv in zip(plan, dests):
+            submit(fd, base + expert_id * stride, mv, latch)
         self._inflight[key] = fut
         return fut
 
@@ -1184,6 +1414,8 @@ class ExpertCache:
                     # counted and installed by its arrival callback.
                     if not entry.pop("__counted__", False):
                         self.bytes_read += entry["__nbytes__"]
+                        if install == "lru":
+                            self.demand_miss_bytes += entry["__nbytes__"]
                     self._install((layer_key, eid), entry, install)
                     result[eid] = entry
             self._flush_metal_if_needed()
@@ -1246,6 +1478,22 @@ class ExpertCache:
             self.spec_skipped += 1
             return True
         return False
+
+    def read_slack(self) -> int:
+        """How many more reads may be started without delaying a demand miss.
+
+        Prefetching is only free while the drive has capacity nobody is blocked
+        on. Past that it is a transfer, not a gain: the speculative read sits in
+        the queue ahead of the blocking read some layer is waiting for. A decode
+        token on a big-expert model reads hundreds of MB, so a drive that is
+        already busy has nothing to lend.
+
+        Returned as a read count rather than a bool so a caller can size its
+        batch to the capacity that exists instead of issuing a fixed top-k and
+        hoping. Zero means stand down entirely.
+        """
+        with self._lock:
+            return max(0, self._spec_inflight_cap - len(self._inflight))
 
     def _prefetch_locked(self, layer_key: str, expert_ids, submitted: list) -> None:
         """Assumes lock held. Queue reads for ids not already known.
@@ -1409,6 +1657,9 @@ class ExpertCache:
             "slab_free": len(self._free_slots),
             "slot_starved": self.slot_starved,
             "read_gb": round(self.bytes_read / 1e9, 3),
+            # Of those bytes, the ones a layer was blocked on. The gap between
+            # this and read_gb is what speculation bought or wasted.
+            "demand_gb": round(self.demand_miss_bytes / 1e9, 3),
             "disk_wait_s": round(self.disk_wait_s, 3),
             "prefetch_pending": len(self._raw_ready),
             "staging_gb": round(self._raw_bytes / 1e9, 3),

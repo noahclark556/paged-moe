@@ -128,6 +128,22 @@ class SlabStore:
         self.names = tuple(specs)
         self.specs = dict(specs)  # kept so the store can be rebuilt verbatim
         self.expert_bytes = sum(self._stride.values())
+        # Per-slot pread destinations in names order, built once.
+        # Hot path used to call dest() nine times/expert (~2000 numpy slices
+        # per token on 235B, GIL-held; gil_probe.py). Indexing here instead.
+        # memoryview so os.preadv takes it directly; a short-read slice
+        # allocates nothing.
+        self.slot_dests: tuple[tuple[memoryview, ...], ...] = tuple(
+            tuple(
+                memoryview(
+                    self._bytes[name][slot * self._stride[name]
+                                      : (slot + 1) * self._stride[name]]
+                )
+                for name in self.names
+            )
+            for slot in range(self.slots)
+        )
+        self.strides = tuple(self._stride[name] for name in self.names)
 
     def release(self) -> None:
         """Drop every slab so Metal can hand the memory back.
@@ -136,6 +152,9 @@ class SlabStore:
         still read a slab). Used when a big prefill needs the memory for
         activations - see `ExpertCache.enter_prefill`.
         """
+        # Destination views alias slab memory - clear first so a surviving
+        # memoryview cannot keep the buffer alive or receive a post-free pread.
+        self.slot_dests = ()
         self._storage.clear()
         self._compute.clear()
         self._bytes.clear()

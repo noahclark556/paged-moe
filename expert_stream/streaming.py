@@ -840,6 +840,41 @@ class PrefetchRing:
         self._ratios[key] = ratio
         return ratio
 
+    def _distances(self, src: int, n: int) -> tuple[int, ...]:
+        """Which layer distances to predict from `src`.
+
+        The near band is the shipped behaviour. The far entry is the payoff
+        from bench/router_matrix.py, which mapped router agreement over every
+        (source, target) pair and found the decay is NOT a function of
+        distance but of SOURCE DEPTH: on Qwen3-235B, precision among cache
+        misses from layer 0 is gone by distance 4 (0.28), while from layer 24
+        it is still 0.73 at distance 32 - against a net-win bar of 0.5. Early
+        layers rewrite the residual stream wholesale, later layers refine it,
+        so a router's view of a deep hidden state stops going stale.
+
+        The far band is deliberately ONE target per source, not a widened
+        window. Widening uniformly was already measured slower (see the
+        cap-4/slack-2 note below: 22.6 GB/token of speculative waste), because
+        a wide burst sits in the disk queue ahead of real demand misses. One
+        far target per source costs the same order of bytes as a single extra
+        depth step while buying FAR_LEAD layers of cover instead of one, and
+        every layer still gets predicted once at long lead as src walks down.
+        """
+        if self.predict_depth <= 0:
+            # Prediction off (the governor's OFF phase sets depth 0). The far
+            # target must not sneak a read in behind that.
+            return ()
+        near = range(2 + self.lead, self.predict_depth + self.lead + 2)
+        far = config.PREDICT_FAR_LEAD
+        if far <= 0 or src < int(config.PREDICT_FAR_FROM * n):
+            return tuple(d for d in near if src + d < n)
+        # Skip a far target the near band already covers, so the extra read is
+        # never a duplicate of a prediction the token was making anyway.
+        out = [d for d in near if src + d < n]
+        if far not in out and src + far < n:
+            out.append(far)
+        return tuple(out)
+
     def _predict_graph(self, src: int, x: mx.array, top_k: int):
         """Build the prediction graph for layers past `src`. Returns
         (merged lazy mx array, targets, lengths, weight_kind) - no sync.
@@ -859,10 +894,10 @@ class PrefetchRing:
         # "scores" = MoEGate mixture weights (unit-mass on host).
         weight_kind: list[str | None] = []
         prune = float(config.PRUNE)
-        for d in range(2 + self.lead, self.predict_depth + self.lead + 2):
+        for d in self._distances(src, n):
             tgt = src + d
             if tgt >= n:
-                break
+                continue
             pred = self.layers[tgt].pred
             if pred is None or pred.gate is None:
                 continue

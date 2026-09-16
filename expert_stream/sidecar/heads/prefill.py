@@ -50,8 +50,10 @@ class PrefillUnionHead:
         n_heads: int | None = None,
         topk: int | None = None,
         feat_dim: int | None = None,
+        governor=None,
     ):
         self.enabled = bool(config.SIDECAR_HEAD_PREFILL)
+        self.governor = governor
         self.layer_keys = layer_keys
         self.n_layers = n_layers
         self.n_experts = n_experts
@@ -115,6 +117,22 @@ class PrefillUnionHead:
             },
         )
 
+    def _beats_copy(self) -> bool:
+        """Does the model add anything the free copy-warm set does not?
+
+        Measured on both banks, it did not: holdout recall 0.890 against a
+        copy-baseline ceiling of 0.906 on the 235B, and 0.908 against 0.901 on
+        GLM-4.7 - i.e. at best a wash - while 44% and 47% of the experts it
+        added went unused. The copy set costs nothing extra and is already
+        near-perfect at this target, so the model only ships once its shadow
+        genuinely clears the baseline it is supposed to improve on.
+        """
+        slot = self.slot
+        if len(slot.shadow_recalls) < 8 or not slot.ceilings:
+            return False
+        lift = slot.mean_shadow_recall() - slot.mean_ceiling()
+        return lift >= float(config.SIDECAR_MIN_GAIN)
+
     def _plan(self, features: np.ndarray) -> list[tuple[str, list[int]]]:
         """Copy-baseline warm ∪ model prediction, deduped, per layer.
 
@@ -128,7 +146,8 @@ class PrefillUnionHead:
                 if i < len(self.layer_keys):
                     plan[i] = list(ids)
                     self._copy_issued += len(ids)
-        if self.slot.prefetch_enabled or self.slot.locked:
+        gov_ok = self.governor is None or self.governor.actuating
+        if (self.slot.prefetch_enabled or self.slot.locked) and gov_ok and self._beats_copy():
             pred = self.slot.predict_topk(
                 features, self.topk, min_score=self.min_score
             )

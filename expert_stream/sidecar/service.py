@@ -44,6 +44,7 @@ from .features import (
     project_hidden,
     sketch_matrix,
 )
+from .governor import NetGovernor
 from .heads import PrefillUnionHead, PrunePolicyHead, ResidencyHead, WrapHead
 from .slot import _log
 
@@ -88,6 +89,13 @@ class ExpertSidecar:
             self.n_layers
         )
 
+        # One governor for the whole sidecar. Heads share it because they share
+        # the resource that actually binds - the drive - so attributing wall
+        # time to them individually would need them to take turns, which costs
+        # more probe time than it is worth. Any head that spends bandwidth asks
+        # this one object whether it may.
+        self.governor = NetGovernor(name="sidecar")
+
         self.wrap = WrapHead(
             self.slot_id,
             self.n_layers,
@@ -96,6 +104,7 @@ class ExpertSidecar:
             root,
             wrap=self.wrap_n,
             feat_dim=self.feat_dim,
+            governor=self.governor,
         )
         self.prefill = PrefillUnionHead(
             self.slot_id,
@@ -105,9 +114,14 @@ class ExpertSidecar:
             root,
             n_heads=prefill_layers,
             feat_dim=self.feat_dim,
+            governor=self.governor,
         )
         self.residency = ResidencyHead(
-            self.slot_id, self.n_experts, root, n_layers=self.n_layers
+            self.slot_id,
+            self.n_experts,
+            root,
+            n_layers=self.n_layers,
+            governor=self.governor,
         )
         self.prune = PrunePolicyHead(self.slot_id, root)
 
@@ -237,6 +251,12 @@ class ExpertSidecar:
                 self._gap_ema = (
                     gap if self._gap_ema == 0.0 else self._gap_ema * 0.9 + gap * 0.1
                 )
+                # One A/B sample per token. The gap spans the whole token
+                # (model + disk) plus the sidecar's own inline time from the
+                # previous call, so what the governor compares is end-to-end
+                # decode rate - including the cost of running the sidecar,
+                # which is the number that should decide whether it runs.
+                self.governor.note_token(gap + self._us_ema)
 
         history = list(self._history)
         if self._pretrain:
@@ -688,6 +708,11 @@ class ExpertSidecar:
             f"gain={w.slot.mean_gain():+.3f}/{w.slot.mean_shadow_gain():+.3f}",
             f"waste={w.slot.mean_waste():.2f}",
             f"topk={w.topk}",
+            # The two numbers that decide whether this is worth running: the
+            # governor's measured A/B, and the head's byte balance. Everything
+            # above them describes the model, not the trade.
+            self.governor.tick(),
+            f"spec={w.ledger.issued_mb_str()}",
         ]
         if p.enabled:
             parts.append(
@@ -761,6 +786,7 @@ class ExpertSidecar:
                 "overhead": round(self.overhead, 4),
                 "shed_level": self._shed,
             },
+            "governor": self.governor.stats(),
             "wrap": self.wrap.stats(),
             "prefill": self.prefill.stats(),
             "residency": self.residency.stats(),

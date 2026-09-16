@@ -3,13 +3,15 @@
 Local agents on MoE models that do not fit in RAM.
 
 Page experts from the SSD so 100 GB+ models actually load on 48 GB unified
-memory. A tiny **sidecar** (small online models, not the big MoE) watches
-which experts your traffic needs and keeps learning as you use it - prefetch
-gets smarter, hit rate climbs, decode speeds up. Continuous optimization,
-no separate training step.
+memory. Route prediction runs the next layers' real routers early and
+prefetches what they ask for. Decode miss reads go through a lean latch +
+read pool (less Python overhead on the hot path). An optional tiny **sidecar**
+can learn from your traffic too; a net-time governor only lets it spend disk
+when decode actually gets faster. Same bit-identical output when pruning is
+off.
 
 > **MLX / Apple Silicon.** Offloads MoE expert weights to the internal SSD
-> and pages them into Metal on demand — no CUDA, no NVIDIA, no separate
+> and pages them into Metal on demand - no CUDA, no NVIDIA, no separate
 > server or quantization pass required.
 
 **Jump:** [Quick start](#quick-start) · [Requirements](#requirements) ·
@@ -23,7 +25,7 @@ usable speed; experts stay on disk until the router asks.
 
 | Model | Full resident (no PagedMoE) | Peak RAM here | Decode |
 | --- | ---: | ---: | ---: |
-| **Qwen3-Coder-Next** 6-bit | ~65 GB (OOM) | ~30 GB | ~27 tok/s |
+| **Qwen3-Coder-Next** 6-bit | ~65 GB (OOM) | ~30 GB | ~29 tok/s |
 | **Qwen3-235B-A22B** 4-bit | ~132 GB (OOM) | ~33 GB | ~8 tok/s |
 | **GLM-4.7** 4-bit | ~199 GB (OOM) | ~34 GB | ~2 tok/s |
 | **Qwen3-Coder-480B** 4-bit | ~270 GB (OOM) | ~34 GB | ~2 tok/s |
@@ -32,10 +34,10 @@ The RAM gap looks wrong until you remember MoEs are sparse: most experts are
 idle on any given token, so you do not need the whole library in RAM.
 
 **PagedMoE** keeps the always-on backbone in memory and pages experts when
-the router picks them. LRU cache + prefetch + the sidecar keep agent turns
-warm.
+the router picks them. LRU cache + route prediction (and an optional
+governed sidecar) keep agent turns warm.
 
-> **Status:** `v0.2.0` pre-release. The engine is in this repo and installs
+> **Status:** `v0.2.2` pre-release. The engine is in this repo and installs
 > from a clone. Not on PyPI yet. APIs may change before `v1.0`.
 >
 > **Naming:** product / repo / PyPI / CLI = **PagedMoE** (`paged-moe`).
@@ -109,7 +111,7 @@ from mlx_lm import load, stream_generate
 # Same call as always. If the path is in ~/paged-moe-config.yaml, it streams.
 model, tokenizer = load("~/mlx-models/qwen3-235-4bit")
 for chunk in stream_generate(model, tokenizer, prompt, max_tokens=200):
-    print(chunk.text, end="", flush=True)
+ print(chunk.text, end="", flush=True)
 ```
 
 ```bash
@@ -123,7 +125,7 @@ Check a path:
 ```bash
 paged-moe status
 paged-moe which /path/to/model
-PAGED_MOE_DEBUG=1   # stderr: [paged-moe] stream via ... / passthrough ...
+PAGED_MOE_DEBUG=1 # stderr: [paged-moe] stream via ... / passthrough ...
 ```
 
 | Path | Role |
@@ -136,16 +138,16 @@ PAGED_MOE_DEBUG=1   # stderr: [paged-moe] stream via ... / passthrough ...
 ### Who this is for
 
 - Qwen / GLM / DeepSeek-class MoEs on Apple Silicon without a 128-512 GB box
-  (can be tuned outside that range; capability extends by a wide margin)
+ (can be tuned outside that range; capability extends by a wide margin)
 - Agent loops (tools, multi-turn, long prompts), not just one-shot chat
 - Plain mlx-community (or converted) checkpoints, not a special "streaming
-  edition" of two curated models
+ edition" of two curated models
 
 ### Who this is not for
 
 - Absolute minimum RAM footprint (~3 GB active). Other stacks optimize for
-  tiny resident sets; this one spends unified memory on a large expert cache
-  so agent turns stay warm
+ tiny resident sets; this one spends unified memory on a large expert cache
+ so agent turns stay warm
 - NVIDIA / CUDA servers. This is an MLX / Mac tool
 - Models that already fit in RAM. Stock `mlx_lm.load` is enough
 
@@ -155,7 +157,7 @@ PAGED_MOE_DEBUG=1   # stderr: [paged-moe] stream via ... / passthrough ...
 2. An OpenAI-compatible server your agent already knows how to talk to
 3. Bit-identical output to a fully resident run when expert pruning is off
 4. Agent-session hardening: prompt-prefix reuse, KV rules that do not corrupt
-   the next turn, memory that yields to long prefills instead of OOMing Metal
+ the next turn, memory that yields to long prefills instead of OOMing Metal
 
 Under the hood, mlx-lm routes MoE expert compute through `SwitchGLU`. This
 swaps that seam for a disk-backed version and keeps attention, KV cache,
@@ -209,8 +211,10 @@ RAM budget.
 Expert reads bypass the OS page cache so you are not double-spending memory
 on an invisible kernel copy of the same bytes.
 
-Prefetch plus the sidecar start reading the next experts before the GPU
-stalls. Same learning loop as up top: more traffic, better guesses.
+Route prediction asks upcoming layers what they want and starts those reads
+before the GPU stalls. That is the big disk-bound decode win. The optional
+sidecar can add next-token wrap prefetch on top; by default a governor A/Bs
+it and settles off unless decode tok/s actually improves.
 
 Optional decode pruning skips weak experts so fewer SSD reads happen per
 token (you trade a bit of fidelity for speed).
@@ -259,13 +263,13 @@ Online learning already runs during normal decode when
 ```bash
 # Fast warm-start (short decode, few prompts, many fit epochs)
 paged-moe-pretrain --quick \
-  --model ~/mlx-models/qwen3-235-4bit \
-  --corpus /path/to/prompts.jsonl
+ --model ~/mlx-models/qwen3-235-4bit \
+ --corpus /path/to/prompts.jsonl
 
 # Same module form:
 python -m expert_stream.pretrain_sidecar --quick \
-  --model ~/mlx-models/qwen3-235-4bit \
-  --corpus /path/to/prompts.jsonl
+ --model ~/mlx-models/qwen3-235-4bit \
+ --corpus /path/to/prompts.jsonl
 ```
 
 Corpus can be a directory of `.txt` / `.md` / `.jsonl`, or one `.jsonl` with
@@ -307,12 +311,17 @@ process environment). Common ones:
 | Knob | Role |
 | --- | --- |
 | `EXPERT_STREAM_SIDECAR` | `1` = online sidecar; `0` = paging only |
+| `EXPERT_STREAM_SIDECAR_GOVERNOR` | `1` (default) = only actuate while decode is faster |
+| `EXPERT_STREAM_PREDICT` | `auto` / `1` / `0` - route-prediction prefetch |
+| `EXPERT_STREAM_READ_POOL_THREADS` | Decode slot-read queue depth (`0` = auto, `-1` = old executor path) |
 | `EXPERT_STREAM_PRUNE` | Drop weak routed experts (speed vs fidelity) |
 | `EXPERT_STREAM_WAIT_ABOVE` | Only stall on high-weight disk misses |
 | `EXPERT_STREAM_CACHE_GB` | Pin expert-cache size (else auto under RAM budget) |
 | `EXPERT_STREAM_SIDECAR_DIR` | Where sidecar weights live |
 
 Full catalog lives in comments at the top of `expert_stream/config.py`.
+Wrap is on when the sidecar is; prefill / residency / prune heads stay off
+unless you turn them on.
 
 ### CLI cheat sheet
 
@@ -350,10 +359,10 @@ If you use this in research or write about it, please cite the repository
 
 ```bibtex
 @software{clark_paged_moe,
-  author = {Clark, Noah},
-  title  = {PagedMoE: Page MoE experts from disk on Apple Silicon},
-  year   = {2026},
-  url    = {https://github.com/noahclark556/paged-moe}
+ author = {Clark, Noah},
+ title = {PagedMoE: Page MoE experts from disk on Apple Silicon},
+ year = {2026},
+ url = {https://github.com/noahclark556/paged-moe}
 }
 ```
 

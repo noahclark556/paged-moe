@@ -413,35 +413,153 @@ def test_residency_reuse_is_measured_in_tokens_not_layer_calls():
                     h.note_demand(i, [i % 16])
                 h.end_token()
             assert h.protect_score("l0", 0, key_to_idx) > 0.5
+            # An expert nothing ever routed to has no score at all.
+            assert h.protect_score("l0", 15, key_to_idx) == 0.0
+        finally:
+            config.SIDECAR_HEAD_RESIDENCY, config.SIDECAR_RESIDENCY_HORIZON = saved
+
+
+def test_residency_needs_a_distinguishable_hot_set():
+    """Protection requires a *distribution*, not just a high score.
+
+    The measured failure of the old head: 88% of just-used experts are reused
+    within the horizon, so every score saturates near 1.0, a fixed threshold
+    protects nearly everything, and "protect nearly everything" degenerates
+    into evicting whatever the rate-limited scan reaches first - which is a
+    worse victim than LRU's, and measured +55% misses on a real bank.
+
+    So the bar tracks the observed quantile. Uniform demand must protect
+    nothing (LRU is the floor, and the floor is correct when there is nothing
+    to tell apart); demand with a genuine hot subset must protect that subset
+    and nothing else.
+    """
+    from expert_stream.sidecar.heads.residency import ResidencyHead
+
+    with tempfile.TemporaryDirectory() as td:
+        saved = (
+            config.SIDECAR_HEAD_RESIDENCY,
+            config.SIDECAR_RESIDENCY_HORIZON,
+            config.SIDECAR_RESIDENCY_MIN_HITS,
+        )
+        config.SIDECAR_HEAD_RESIDENCY = True
+        config.SIDECAR_RESIDENCY_HORIZON = 8
+        config.SIDECAR_RESIDENCY_MIN_HITS = 8
+        try:
+            n_layers, n_experts = 40, 16
+            key_to_idx = {f"l{i}": i for i in range(n_layers)}
+
+            # Uniform: every expert wanted every token. Nothing to choose.
+            flat = ResidencyHead("uniform", n_experts, Path(td))
+            for _ in range(200):
+                for i in range(n_layers):
+                    flat.note_demand(i, list(range(n_experts)))
+                flat.end_token()
+            protected = sum(
+                1
+                for e in range(n_experts)
+                if flat.should_protect("l0", e, key_to_idx)
+            )
+            assert protected == 0, (
+                f"protected {protected} keys in uniform demand - "
+                "this is the saturation bug that made the head lose to LRU"
+            )
+
+            # Skewed: experts 0-3 every token; two others rarely, and always
+            # further apart than the reuse horizon.
+            skew = ResidencyHead("skew", n_experts, Path(td))
+            for t in range(400):
+                cold = 4 + (t // 20) % 2
+                for i in range(n_layers):
+                    ids = [0, 1, 2, 3]
+                    if t % 20 == 0:
+                        ids.append(cold)
+                    skew.note_demand(i, ids)
+                skew.end_token()
+            assert skew.should_protect("l0", 0, key_to_idx), "hot key not protected"
+            for cold in (4, 5):
+                assert not skew.should_protect("l0", cold, key_to_idx), (
+                    f"cold key {cold} protected"
+                )
+        finally:
+            (
+                config.SIDECAR_HEAD_RESIDENCY,
+                config.SIDECAR_RESIDENCY_HORIZON,
+                config.SIDECAR_RESIDENCY_MIN_HITS,
+            ) = saved
+
+
+def test_residency_stays_off_when_the_governor_says_no():
+    """Residency spends no bandwidth, but it does change what gets re-read.
+
+    It is therefore behind the same net-time gate as the heads that do spend
+    bandwidth - otherwise the one head whose shipped predictor measured
+    *anti*-informative would be the one head nothing could switch off.
+    """
+    from expert_stream.sidecar.heads.residency import ResidencyHead
+
+    class _Gov:
+        def __init__(self):
+            self.actuating = False
+
+    with tempfile.TemporaryDirectory() as td:
+        saved = config.SIDECAR_HEAD_RESIDENCY, config.SIDECAR_RESIDENCY_HORIZON
+        config.SIDECAR_HEAD_RESIDENCY = True
+        config.SIDECAR_RESIDENCY_HORIZON = 8
+        try:
+            gov = _Gov()
+            h = ResidencyHead("gov", 16, Path(td), governor=gov)
+            key_to_idx = {f"l{i}": i for i in range(40)}
+            for t in range(400):
+                for i in range(40):
+                    ids = [0, 1, 2, 3]
+                    if t % 20 == 0:
+                        ids.append(4 + (t // 20) % 2)
+                    h.note_demand(i, ids)
+                h.end_token()
+            assert not h.should_protect("l0", 0, key_to_idx)
+            gov.actuating = True
             assert h.should_protect("l0", 0, key_to_idx)
-            # An expert nothing ever routed to is not protected.
-            assert not h.should_protect("l0", 15, key_to_idx)
         finally:
             config.SIDECAR_HEAD_RESIDENCY, config.SIDECAR_RESIDENCY_HORIZON = saved
 
 
 def test_residency_protect_is_rate_limited():
+    """The cap binds even when the hot cluster is most of the cache.
+
+    A distinguishable hot set can still be far larger than the share of
+    evictions it is safe to divert - here 75% of keys qualify - and a scan that
+    reprieves everything it looks at does not evict less, it just evicts
+    something more recently used than LRU would have picked. The cap is what
+    keeps a wrong signal a bounded perturbation instead of a policy.
+    """
     from expert_stream.sidecar.heads.residency import ResidencyHead
 
     with tempfile.TemporaryDirectory() as td:
-        saved = config.SIDECAR_HEAD_RESIDENCY
+        saved = config.SIDECAR_HEAD_RESIDENCY, config.SIDECAR_RESIDENCY_HORIZON
         config.SIDECAR_HEAD_RESIDENCY = True
+        config.SIDECAR_RESIDENCY_HORIZON = 8
         try:
             h = ResidencyHead("res2", 16, Path(td))
-            key_to_idx = {f"l{i}": i for i in range(4)}
-            for _ in range(80):
-                for i in range(4):
-                    h.note_demand(i, list(range(16)))
+            key_to_idx = {f"l{i}": i for i in range(16)}
+            for t in range(400):
+                for i in range(16):
+                    ids = list(range(12))  # a hot set of 12 of 16 experts
+                    if t % 20 == 0:
+                        ids.append(12 + (t // 20) % 2)
+                    h.note_demand(i, ids)
                 h.end_token()
+            assert h.should_protect("l0", 0, key_to_idx), "hot key not protected"
+            scans = 400
             protected = 0
-            for _ in range(400):
+            for _ in range(scans):
                 h.on_scan()
                 if h.should_protect("l0", 0, key_to_idx):
                     h.on_protect()
                     protected += 1
-            assert 0 < protected < 400 * config.SIDECAR_RESIDENCY_MAX_PROTECT + 70
+            # Grace of 64 scans before the limiter engages, then the cap holds.
+            assert 0 < protected <= scans * config.SIDECAR_RESIDENCY_MAX_PROTECT + 64
         finally:
-            config.SIDECAR_HEAD_RESIDENCY = saved
+            config.SIDECAR_HEAD_RESIDENCY, config.SIDECAR_RESIDENCY_HORIZON = saved
 
 
 def test_prefill_targets_hot_set_not_union():
@@ -585,7 +703,242 @@ def test_prune_mass_gate_is_relative_to_the_shipped_threshold():
             config.SIDECAR_HEAD_PRUNE, config.PRUNE, config.WAIT_ABOVE = saved
 
 
-def test_topk_backs_off_when_extra_reads_are_wasted():
+class _SpecCache:
+    """Minimal cache stand-in exposing only what wrap issuance consults."""
+
+    def __init__(self, slack=16, miss_bytes=100_000_000, expert_bytes=1_000_000):
+        self._slack = slack
+        self.demand_miss_bytes = miss_bytes
+        self._expert_bytes = expert_bytes
+        self.batches = []
+
+    def read_slack(self):
+        return self._slack
+
+    def expert_nbytes(self, layer_key):
+        return self._expert_bytes
+
+    def prefetch_many(self, batch):
+        self.batches.append([(k, list(ids)) for k, ids in batch])
+
+    @property
+    def issued(self):
+        return sum(len(ids) for b in self.batches for _, ids in b)
+
+
+def _wrap_head(td, name="iss", **cfg):
+    from expert_stream.sidecar.heads.wrap import WrapHead
+
+    h = WrapHead(name, 8, 32, [f"l{i}" for i in range(8)], Path(td))
+    h.slot.prefetch_enabled = True
+    for k, v in cfg.items():
+        setattr(h, k, v)
+    return h
+
+
+def test_issue_stands_down_when_the_disk_has_no_slack():
+    """Speculation into a busy drive is a transfer, not a gain.
+
+    If the reader threads are already saturated with reads some layer is
+    blocked on, a speculative read does not use spare capacity - it queues
+    ahead of the blocking one and pushes the token that needed it further out.
+    This is the gate the shipped head did not have, and on a bandwidth-bound
+    decode it is the difference between a win and a 24% regression.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        saved = config.SIDECAR_HEAD_WRAP
+        config.SIDECAR_HEAD_WRAP = True
+        try:
+            h = _wrap_head(td)
+            cache = _SpecCache(slack=0)
+            h._issue({0: [(5, 0.99), (6, 0.98)]}, {}, cache)
+            assert cache.batches == [], "issued reads with no slack"
+            assert h._skipped_no_slack == 1
+            assert h.ledger.issued == 0
+        finally:
+            config.SIDECAR_HEAD_WRAP = saved
+
+
+def test_issue_is_bounded_by_the_byte_budget():
+    """Volume is capped by a share of what demand misses already cost.
+
+    The allowance is derived from the model's own measured demand-miss bytes
+    rather than configured as a count, because the same count means completely
+    different things when an expert is 1.6 MB and when it is 10.6 MB - and it
+    is the bytes, not the reads, that the drive charges for.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        saved = config.SIDECAR_HEAD_WRAP, config.SIDECAR_SPEC_BYTE_FRAC
+        config.SIDECAR_HEAD_WRAP = True
+        config.SIDECAR_SPEC_BYTE_FRAC = 0.25
+        try:
+            # 4 MB of demand misses this token, 25% allowance, 1 MB experts:
+            # room for exactly one speculative read.
+            h = _wrap_head(td, _byte_frac=0.25, _min_prob=0.3)
+            cache = _SpecCache(slack=64, miss_bytes=4_000_000)
+            probs = {0: [(5, 0.9), (6, 0.85)], 1: [(7, 0.8), (8, 0.75)]}
+            h._issue(probs, {}, cache)
+            assert cache.issued == 1, cache.batches
+            # ...and the byte budget goes to the best guess available, not to
+            # whichever layer happened to be enumerated first.
+            assert cache.batches[0] == [("l0", [5])], cache.batches
+            assert h.ledger.issued_bytes == 1_000_000
+
+            # A model whose experts are all resident has no stall to hide
+            # behind, so it gets no allowance at all.
+            quiet = _wrap_head(td, name="quiet", _min_prob=0.3)
+            idle = _SpecCache(slack=64, miss_bytes=0)
+            quiet._issue(probs, {}, idle)
+            assert idle.batches == []
+            assert quiet._skipped_no_budget == 1
+        finally:
+            config.SIDECAR_HEAD_WRAP, config.SIDECAR_SPEC_BYTE_FRAC = saved
+
+
+def test_issue_is_silent_when_the_model_is_unsure():
+    """Volume tracks confidence. A guessing head ships nothing.
+
+    The old head issued wrap*topk reads every token regardless of how sure it
+    was, and most tokens it was not sure. That is the single biggest source of
+    the measured waste (44% and 85% of issued reads unused).
+    """
+    with tempfile.TemporaryDirectory() as td:
+        saved = config.SIDECAR_HEAD_WRAP
+        config.SIDECAR_HEAD_WRAP = True
+        try:
+            h = _wrap_head(td, _min_prob=0.5)
+            cache = _SpecCache(slack=64)
+            h._issue({0: [(5, 0.2), (6, 0.1)], 1: [(7, 0.49)]}, {}, cache)
+            assert cache.batches == [], "issued reads the model barely believes"
+
+            # The same head, same budget, once it is confident.
+            h._issue({0: [(5, 0.97)]}, {}, cache)
+            assert cache.issued == 1, cache.batches
+        finally:
+            config.SIDECAR_HEAD_WRAP = saved
+
+
+def test_issue_skips_what_the_baseline_already_covers():
+    """Actuation stays incremental, which is what keeps it quality-safe.
+
+    The engine's ring replays the previous token's experts regardless, so
+    re-issuing them costs bandwidth and adds no coverage.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        saved = config.SIDECAR_HEAD_WRAP
+        config.SIDECAR_HEAD_WRAP = True
+        try:
+            h = _wrap_head(td, _min_prob=0.3)
+            cache = _SpecCache(slack=64)
+            h._issue({0: [(5, 0.99), (6, 0.98)]}, {0: [5, 6]}, cache)
+            assert cache.batches == [], "re-issued experts the ring already has"
+        finally:
+            config.SIDECAR_HEAD_WRAP = saved
+
+
+def test_governor_veto_stops_all_speculation():
+    """The outer guarantee: a veto reaches the disk, not just the bookkeeping."""
+    with tempfile.TemporaryDirectory() as td:
+        saved = config.SIDECAR_HEAD_WRAP
+        config.SIDECAR_HEAD_WRAP = True
+        try:
+            class _Gov:
+                actuating = False
+
+            h = _wrap_head(td, name="veto")
+            h.governor = _Gov()
+            assert not h._actuating()
+            cache = _SpecCache(slack=64)
+            for t in range(40):
+                h.observe_end_token({0: [1, 2], 1: [3]}, [], cache)
+            assert cache.batches == [], "speculated while vetoed"
+            assert h.ledger.issued == 0
+            assert h.mode == "hold"
+        finally:
+            config.SIDECAR_HEAD_WRAP = saved
+
+
+def test_head_measures_itself_for_free_while_switched_off():
+    """A demoted head must be able to earn its way back without spending disk.
+
+    While the governor has actuation off, the head still scores the reads it
+    *would* have issued against the demand that followed - that demand is
+    reported either way, so the measurement is free - and asks for a fresh A/B
+    once it clears the bar it was switched off for. Without this path, a head
+    that trains its way to usefulness waits on a timer that is deliberately
+    slow, because watching is the thing that costs.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        saved = config.SIDECAR_HEAD_WRAP, config.SIDECAR_TARGET_PRECISION
+        config.SIDECAR_HEAD_WRAP = True
+        config.SIDECAR_TARGET_PRECISION = 0.5
+        try:
+            class _Gov:
+                actuating = False
+
+                def __init__(self):
+                    self.requests = []
+
+                def request_probe(self, reason=""):
+                    self.requests.append(reason)
+                    return True
+
+            gov = _Gov()
+            h = _wrap_head(td, name="cf", _min_prob=0.0)
+            h.governor = gov
+            cache = _SpecCache(slack=64)
+            # The demand has to *alternate* for there to be anything to
+            # predict: what the head adds is coverage beyond the previous
+            # token's experts, which the engine's ring replays anyway. A
+            # constant stream is already fully covered by the ring, and a head
+            # correctly adds nothing to it.
+            a = {0: [1, 2], 1: [3, 4], 2: [5]}
+            b = {0: [9, 10], 1: [11, 12], 2: [13]}
+            for t in range(1500):
+                h.observe_end_token(a if t % 2 else b, [], cache)
+            assert cache.batches == [], "spent disk while switched off"
+            assert h._cf_precision > 0.5, h._cf_precision
+            assert gov.requests, "never asked to be re-measured"
+            assert "counterfactual" in gov.requests[0]
+        finally:
+            config.SIDECAR_HEAD_WRAP, config.SIDECAR_TARGET_PRECISION = saved
+
+
+def test_head_demotes_on_bytes_not_on_recall():
+    """Demotion has to key on the unit that costs.
+
+    The shipped head held `gain` +0.26 while 44% of its reads went unused and
+    the machine ran 24% slower. Any gate that cannot see that is not a gate.
+    """
+    with tempfile.TemporaryDirectory() as td:
+        saved = config.SIDECAR_HEAD_WRAP
+        config.SIDECAR_HEAD_WRAP = True
+        try:
+            h = _wrap_head(td, name="deficit")
+            # Excellent recall, and a terrible trade.
+            h.slot.recalls.extend([0.9] * 32)
+            h.slot.precisions.extend([0.9] * 32)
+            h.slot.gains.extend([0.26] * 32)
+            assert not h._in_deficit(), "judged before there was evidence"
+            h.ledger.note_issued(1000, 1_000_000)
+            h.ledger.note_used(150, 1_000_000)
+            assert h._in_deficit()
+            h._gate()
+            assert not h.slot.prefetch_enabled, "kept actuating at 85% waste"
+            # A fresh window, so the head is judged on what it does next rather
+            # than on a debt it can never pay off.
+            assert h.ledger.window_issued == 0
+        finally:
+            config.SIDECAR_HEAD_WRAP = saved
+
+
+def test_topk_tracks_router_fanout():
+    """top-k is now only how many candidates are considered, not how many ship.
+
+    What ships is decided by probability and the byte budget, so top-k just
+    follows the router's observed fan-out. The cost knob it used to be is
+    tested below.
+    """
     from expert_stream.sidecar.heads.wrap import WrapHead
 
     with tempfile.TemporaryDirectory() as td:
@@ -596,17 +949,55 @@ def test_topk_backs_off_when_extra_reads_are_wasted():
             h = WrapHead("tk", 8, 32, [f"l{i}" for i in range(8)], Path(td))
             assert h.auto_topk
             h.slot.demand_sizes.extend([6] * 32)
-            h.slot.wastes.extend([0.2] * 32)
             h._retune_topk()
-            paying = h.topk
-            h.slot.wastes.clear()
-            h.slot.wastes.extend([0.99] * 32)
-            for _ in range(3):
-                h._retune_topk()
-            assert h.topk < paying, (paying, h.topk)
-            assert h.topk >= 1
+            narrow = h.topk
+            h.slot.demand_sizes.clear()
+            h.slot.demand_sizes.extend([12] * 32)
+            h._retune_topk()
+            assert h.topk > narrow, (narrow, h.topk)
+            assert h.topk <= h.slot.n_experts
         finally:
             config.SIDECAR_HEAD_WRAP, config.SIDECAR_TOPK = saved
+
+
+def test_issue_threshold_tightens_when_reads_are_wasted():
+    """The cost knob: the confidence bar, servoing on measured precision.
+
+    The old head traded waste against top-k, which changed how many reads went
+    out per layer but not whether the ones that went out were any good. This
+    is the replacement, and it is denominated in the thing that costs - a read
+    that nothing wanted is bandwidth taken from a demand miss.
+    """
+    from expert_stream.sidecar.heads.wrap import WrapHead
+
+    with tempfile.TemporaryDirectory() as td:
+        saved = config.SIDECAR_HEAD_WRAP, config.SIDECAR_TARGET_PRECISION
+        config.SIDECAR_HEAD_WRAP = True
+        config.SIDECAR_TARGET_PRECISION = 0.5
+        try:
+            h = WrapHead("thr", 8, 32, [f"l{i}" for i in range(8)], Path(td))
+            start = h._min_prob
+
+            # 15% precision - the state the head actually shipped in. The bar
+            # must rise.
+            h.ledger.note_issued(1000, 1_000_000)
+            h.ledger.note_used(150, 1_000_000)
+            for _ in range(5):
+                h._retune_threshold()
+            tightened = h._min_prob
+            assert tightened > start, (start, tightened)
+
+            # Comfortably above target: the bar may relax so the head is not
+            # needlessly silent, but never below a floor.
+            h.ledger.reset_window()
+            h.ledger.note_issued(1000, 1_000_000)
+            h.ledger.note_used(950, 1_000_000)
+            for _ in range(40):
+                h._retune_threshold()
+            assert h._min_prob < tightened
+            assert h._min_prob >= config.SIDECAR_MIN_PROB * 0.25
+        finally:
+            config.SIDECAR_HEAD_WRAP, config.SIDECAR_TARGET_PRECISION = saved
 
 
 def test_disabled_sidecar_does_no_work_on_the_decode_path():
