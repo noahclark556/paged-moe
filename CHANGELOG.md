@@ -8,6 +8,26 @@ Format loosely follows Keep a Changelog. Versioning aims for SemVer.
 
 <!-- Nothing yet. -->
 
+## [0.2.4] - 2026-09-17
+
+### Added
+
+- Flow decode (`EXPERT_STREAM_FLOW`, off by default): one sync per token via
+  a GPU expert->slot table instead of one sync per MoE layer. Fidelity knob;
+  falls back when the slab or router is unavailable
+- `EXPERT_STREAM_FLOW_TOPM` / `EXPERT_STREAM_FLOW_WARMUP` for resident-only
+  selection and post-prefill warm-up before flow takes over
+- N-gram self-draft decode (`EXPERT_STREAM_LOOKUP`, off by default): more
+  tokens per expert-byte pass when the context repeats. Bit-identical under
+  greedy at `PRUNE=0`; leave off for prune recipes / varied agent traffic
+- DeepSeek-V3.2 chat-template shim so mlx-lm's `enable_thinking` maps to
+  `thinking_mode`
+
+### Changed
+
+- MoE layers reuse the block's own router output when available (no second
+  router pass on the hot path)
+
 ## [0.2.3] - 2026-09-16
 
 ### Added
@@ -64,7 +84,8 @@ Format loosely follows Keep a Changelog. Versioning aims for SemVer.
 - Initial public engine snapshot (import name `expert_stream`)
 - Sample `~/paged-moe-config.yaml` seeding; sidecar data under `~/.paged_moe/`
 
-[Unreleased]: https://github.com/noahclark556/paged-moe/compare/v0.2.3...HEAD
+[Unreleased]: https://github.com/noahclark556/paged-moe/compare/v0.2.4...HEAD
+[0.2.4]: https://github.com/noahclark556/paged-moe/compare/v0.2.3...v0.2.4
 [0.2.3]: https://github.com/noahclark556/paged-moe/compare/v0.2.2...v0.2.3
 [0.2.2]: https://github.com/noahclark556/paged-moe/compare/v0.2.0...v0.2.2
 [0.2.0]: https://github.com/noahclark556/paged-moe/releases/tag/v0.2.0

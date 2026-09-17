@@ -58,76 +58,11 @@ from mlx_lm.models.cache import (
     trim_prompt_cache,
 )
 
-from . import adaptive_prefill, config, kvmem, prefill_fused
+from . import adaptive_prefill, config, kvmem, lookup_decode, prefill_fused
 from .loader import load as _streamed_load
 from .loader import relieve_pressure
 
-# mlx-lm's DeepSeek-V3.2 chat template takes `thinking_mode` ("thinking"|"chat"),
-# but TokenizerWrapper always injects `enable_thinking`, and ga historically
-# sends that too. Without this map, every chat request dies with:
-#   encode_messages() got an unexpected keyword argument 'enable_thinking'
-def _compat_deepseek_v32_chat_template() -> None:
-    try:
-        import mlx_lm.chat_templates.deepseek_v32 as mod
-    except ImportError:
-        return
-    _orig = mod.apply_chat_template
-
-    def apply_chat_template(
-        messages,
-        continue_final_message=False,
-        add_generation_prompt=False,
-        **kwargs,
-    ):
-        if "thinking_mode" not in kwargs and "enable_thinking" in kwargs:
-            kwargs["thinking_mode"] = (
-                "thinking" if kwargs["enable_thinking"] else "chat"
-            )
-        kwargs.pop("enable_thinking", None)
-        # ga/mlx pass these for Jinja templates; this Python template does not.
-        if "preserve_thinking" in kwargs:
-            # drop_thinking=True is the template default (strip prior reasoning).
-            kwargs.setdefault(
-                "drop_thinking", not bool(kwargs.pop("preserve_thinking"))
-            )
-        else:
-            kwargs.pop("preserve_thinking", None)
-        kwargs.pop("reasoning_effort", None)
-
-        # Thinking mode asserts that every assistant turn *after* the last user
-        # has reasoning_content or tool_calls. Host apps often park a bare ACK
-        # there (ga task_state). Give those a stub so the request does not 404.
-        thinking_mode = kwargs.get("thinking_mode", "thinking")
-        if thinking_mode == "thinking" and isinstance(messages, list):
-            last_user = -1
-            for i in range(len(messages) - 1, -1, -1):
-                if isinstance(messages[i], dict) and messages[i].get("role") == "user":
-                    last_user = i
-                    break
-            fixed = []
-            for i, msg in enumerate(messages):
-                if (
-                    i > last_user
-                    and isinstance(msg, dict)
-                    and msg.get("role") == "assistant"
-                    and not msg.get("tool_calls")
-                    and not msg.get("reasoning_content")
-                ):
-                    msg = {**msg, "reasoning_content": "\n"}
-                fixed.append(msg)
-            messages = fixed
-
-        return _orig(
-            messages,
-            continue_final_message=continue_final_message,
-            add_generation_prompt=add_generation_prompt,
-            **kwargs,
-        )
-
-    mod.apply_chat_template = apply_chat_template
-
-
-_compat_deepseek_v32_chat_template()
+# DeepSeek enable_thinking -> thinking_mode shim installs via loader import.
 
 # mlx-lm has no deepseek_v32 tool_parser yet, so has_tool_calling stays false
 # and the server only warns + skips structured tool_calls. The chat template
@@ -176,6 +111,177 @@ def _parse_deepseek_dsml_tool_call(
     if not out:
         raise ValueError("no DSML invoke blocks found")
     return out
+
+
+def _json_tool_body_candidates(text: str) -> list[str]:
+    """Bodies mlx-lm json_tools should try before giving up.
+
+    Qwen2.5's shipped chat template prints the example as
+    `{{"name": ..., "arguments": ...}}`. json.loads then fails at column 2
+    (`Expecting property name`) and the server drops the call, so the caller sees an
+    empty turn. Strip that extra brace pair; also try the outermost JSON
+    object if the model wrapped it in junk.
+    """
+    s = (text or "").strip()
+    out = [s]
+    if s.startswith("{{") and s.endswith("}}"):
+        out.append(s[1:-1].strip())
+    i, j = s.find("{"), s.rfind("}")
+    if i >= 0 and j > i:
+        slice_ = s[i : j + 1]
+        out.append(slice_)
+        if slice_.startswith("{{") and slice_.endswith("}}"):
+            out.append(slice_[1:-1].strip())
+    # Dedup while keeping order.
+    seen: set[str] = set()
+    uniq: list[str] = []
+    for c in out:
+        if c not in seen:
+            seen.add(c)
+            uniq.append(c)
+    return uniq
+
+
+def _repair_json_noise(s: str) -> str:
+    """Cheap fixes for common model JSON mistakes (not a full JSON5 parser)."""
+    s = s.replace("\u201c", '"').replace("\u201d", '"').replace("\u2018", "'").replace(
+        "\u2019", "'"
+    )
+    # Trailing commas before } or ].
+    s = re.sub(r",(\s*[}\]])", r"\1", s)
+    return s
+
+
+def _loads_tool_obj(s: str) -> dict | None:
+    for cand in (s, _repair_json_noise(s)):
+        try:
+            obj = json.loads(cand)
+        except json.JSONDecodeError:
+            obj = None
+        if isinstance(obj, dict):
+            return obj
+        # First complete object if there is trailing junk.
+        try:
+            obj, _end = json.JSONDecoder().raw_decode(cand.lstrip())
+            if isinstance(obj, dict):
+                return obj
+        except json.JSONDecodeError:
+            pass
+    # Python-literal shape: {'name': '...', 'arguments': {...}}
+    try:
+        import ast
+
+        obj = ast.literal_eval(_repair_json_noise(s))
+        if isinstance(obj, dict):
+            return obj
+    except Exception:
+        pass
+    return None
+
+
+def _salvage_tool_call(text: str) -> dict | None:
+    """Pull name (+ arguments when possible) out of broken tool JSON.
+
+    mlx-lm's tool state machine never puts the raw markup into `content`, so a
+    failed parse is an empty turn for the caller. Returning a name with best-effort
+    args is better than dropping the call.
+    """
+    s = (text or "").strip()
+    m = re.search(r'"name"\s*:\s*"((?:\\.|[^"\\])*)"', s)
+    if not m:
+        m = re.search(r"'name'\s*:\s*'([^']*)'", s)
+    if not m:
+        return None
+    name = m.group(1)
+    try:
+        name = json.loads(f'"{name}"')
+    except json.JSONDecodeError:
+        pass
+    if not isinstance(name, str) or not name.strip():
+        return None
+    name = name.strip()
+    args: dict = {}
+    am = re.search(r'["\']arguments["\']\s*:\s*', s)
+    if am:
+        rest = s[am.end() :].lstrip()
+        for attempt in (rest, _repair_json_noise(rest)):
+            try:
+                parsed, _ = json.JSONDecoder().raw_decode(attempt)
+                if isinstance(parsed, dict):
+                    args = parsed
+                    break
+            except json.JSONDecodeError:
+                continue
+    return {"name": name, "arguments": args}
+
+
+def _normalize_tool_obj(obj: dict) -> dict | None:
+    name = obj.get("name")
+    if not isinstance(name, str) or not name.strip():
+        return None
+    args = obj.get("arguments", {})
+    if isinstance(args, str):
+        loaded = _loads_tool_obj(args)
+        args = loaded if isinstance(loaded, dict) else {}
+    elif not isinstance(args, dict):
+        args = {}
+    return {"name": name.strip(), "arguments": args}
+
+
+def _wrap_json_tools_parser(orig):
+    """Retry / repair / salvage after stock json_tools.parse_tool_call fails."""
+
+    def parse_tool_call(text, tools=None):
+        try:
+            return orig(text, tools)
+        except (json.JSONDecodeError, ValueError, TypeError) as first:
+            last: Exception = first
+            for cand in _json_tool_body_candidates(text):
+                obj = _loads_tool_obj(cand)
+                if obj is None:
+                    continue
+                norm = _normalize_tool_obj(obj)
+                if norm is not None:
+                    return norm
+                last = ValueError("tool JSON missing name")
+            salvaged = _salvage_tool_call(text)
+            if salvaged is not None:
+                preview = (text or "").replace("\n", "\\n")
+                if len(preview) > 400:
+                    preview = preview[:400] + "..."
+                print(
+                    f"[paged-moe] tool JSON repaired via salvage "
+                    f"({type(first).__name__}: {first}); body={preview!r}",
+                    flush=True,
+                )
+                return salvaged
+            preview = (text or "").replace("\n", "\\n")
+            if len(preview) > 600:
+                preview = preview[:600] + "..."
+            print(
+                f"[paged-moe] tool JSON unrecoverable ({type(first).__name__}: {first}); "
+                f"body={preview!r}",
+                flush=True,
+            )
+            raise last
+
+    parse_tool_call._paged_moe_json_wrap = True  # type: ignore[attr-defined]
+    return parse_tool_call
+
+
+def _install_json_tools_unwrap(tokenizer) -> None:
+    """Harden mlx-lm's json_tools parser. No-op for qwen3_coder / glm / DSML."""
+    orig = getattr(tokenizer, "_tool_parser", None)
+    if orig is None or getattr(orig, "_paged_moe_json_wrap", False):
+        return
+    mod = getattr(orig, "__module__", "") or ""
+    if not mod.endswith("json_tools"):
+        return
+    tokenizer._tool_parser = _wrap_json_tools_parser(orig)
+    print(
+        "[paged-moe] json_tools: unwrap/repair/salvage Qwen2.5 tool bodies",
+        flush=True,
+    )
 
 
 def _install_deepseek_tool_parser(tokenizer) -> None:
@@ -242,6 +348,28 @@ def _install_adaptive_prefill_generate() -> None:
     _orig_gs = _mlx_gen.generate_step
     _orig_sgs = _mlx_gen.speculative_generate_step
 
+    def _timed_decode(gen):
+        """One overall decode tok/s line for the generation, not a per-tick EMA.
+
+        Clock starts after prefill (caller only wraps the decode generator), so
+        this is tokens out / wall decode time - the number that answers "how
+        fast was this reply", as opposed to the sidecar tick's rolling average.
+        """
+        t0 = time.perf_counter()
+        n = 0
+        try:
+            for item in gen:
+                n += 1
+                yield item
+        finally:
+            dt = time.perf_counter() - t0
+            if n > 0 and dt > 0:
+                print(
+                    f"[paged-moe] decode: {n} tokens in {dt:.1f}s = "
+                    f"{n / dt:.2f} tok/s",
+                    flush=True,
+                )
+
     def _quantize_fn(kv_bits, kv_group_size, quantized_kv_start):
         return functools.partial(
             _mlx_gen.maybe_quantize_kv_cache,
@@ -249,6 +377,32 @@ def _install_adaptive_prefill_generate() -> None:
             kv_group_size=kv_group_size,
             kv_bits=kv_bits,
         )
+
+    def _dense_model(model) -> bool:
+        info = getattr(model, "_expert_stream_info", None) or {}
+        return info.get("mode") == "dense"
+
+    def _dense_lookup_on(model) -> bool:
+        if not _dense_model(model):
+            return False
+        try:
+            from .dense import lookup_enabled
+
+            return bool(lookup_enabled())
+        except Exception:
+            return False
+
+    def _dense_adapt(model, ctx_tokens: int) -> None:
+        if not _dense_model(model):
+            return
+        cache = getattr(model, "_expert_stream_cache", None)
+        adapt = getattr(cache, "adapt_to_context", None)
+        if adapt is None:
+            return
+        try:
+            adapt(int(ctx_tokens))
+        except Exception as e:
+            print(f"[dense] adaptive pin failed: {e!r}", flush=True)
 
     def generate_step(
         prompt,
@@ -266,7 +420,16 @@ def _install_adaptive_prefill_generate() -> None:
         prompt_progress_callback=None,
         input_embeddings=None,
     ):
-        if not adaptive_prefill.enabled():
+        # Lookup decode replaces the decode loop further down, so it needs this
+        # wrapper even when adaptive prefill has nothing to contribute.
+        # Dense multi-token verify is a separate switch (dense.lookup); MoE
+        # LOOKUP stays alone so agent traffic on streamed MoE is unchanged.
+        if (
+            not adaptive_prefill.enabled()
+            and not config.LOOKUP
+            and not _dense_lookup_on(model)
+            and not _dense_model(model)
+        ):
             yield from _orig_gs(
                 prompt,
                 model,
@@ -314,11 +477,20 @@ def _install_adaptive_prefill_generate() -> None:
         # Mirror mlx-lm: leave one token for the decode _step.
         if not isinstance(prompt, mx.array):
             prompt = mx.array(prompt)
+        # The prefill loop below slices `prompt` down to its remainder; lookup
+        # decode needs the part it consumed as drafting context.
+        full_prompt = prompt
         total = int(prompt.size)
         processed = 0
         progress(processed, total)
         mode = adaptive_prefill.resolve_mode(model)
         cap = int(prefill_step_size or config.ADAPTIVE_PREFILL_MAX)
+
+        # Dense: spend unused KV reserve on pinned MLP pages for this turn's
+        # context (+ decode budget) before the first weight pass.
+        if _dense_model(model):
+            kv0 = adaptive_prefill.cache_offset(prompt_cache)
+            _dense_adapt(model, kv0 + total + int(max_tokens))
 
         with mx.stream(_mlx_gen.generation_stream):
             while total - processed > 1:
@@ -342,25 +514,64 @@ def _install_adaptive_prefill_generate() -> None:
                 prompt = prompt[n:]
                 mx.clear_cache()
 
-        yield from _orig_gs(
-            prompt,
-            model,
-            max_tokens=max_tokens,
-            sampler=sampler,
-            logits_processors=logits_processors,
-            max_kv_size=max_kv_size,
-            prompt_cache=prompt_cache,
-            # Exactly one token is left (loop condition above), so this only
-            # has to be >= 1; keep it at the model's ceiling regardless.
-            prefill_step_size=cap,
-            kv_bits=kv_bits,
-            kv_group_size=kv_group_size,
-            quantized_kv_start=quantized_kv_start,
-            # Prefill is already reported complete above. Forwarding `progress`
-            # would let mlx-lm re-report the 1-token remainder as (0, 1) and
-            # (1, 1), so any TTFT / percent readout jumps backwards at the end.
-            prompt_progress_callback=lambda *_: None,
-            input_embeddings=None,
+        if _dense_lookup_on(model):
+            from .dense import lookup as dense_lookup
+
+            yield from _timed_decode(
+                dense_lookup.generate_step(
+                    prompt,
+                    model,
+                    max_tokens=max_tokens,
+                    sampler=sampler,
+                    logits_processors=logits_processors,
+                    prompt_cache=prompt_cache,
+                    history=_drafting_history(full_prompt, int(prompt.size)),
+                    quantize_cache_fn=quantize_cache_fn,
+                    generation_stream=_mlx_gen.generation_stream,
+                )
+            )
+            return
+
+        if config.LOOKUP:
+            # N-gram self-draft: verify several tokens per pass so they share
+            # their expert reads. Quality-neutral, so it needs no gate beyond
+            # the flag. Same (token, logprobs) contract as _orig_gs.
+            yield from _timed_decode(
+                lookup_decode.generate_step(
+                    prompt,
+                    model,
+                    max_tokens=max_tokens,
+                    sampler=sampler,
+                    logits_processors=logits_processors,
+                    prompt_cache=prompt_cache,
+                    history=_drafting_history(full_prompt, int(prompt.size)),
+                    quantize_cache_fn=quantize_cache_fn,
+                    generation_stream=_mlx_gen.generation_stream,
+                )
+            )
+            return
+
+        yield from _timed_decode(
+            _orig_gs(
+                prompt,
+                model,
+                max_tokens=max_tokens,
+                sampler=sampler,
+                logits_processors=logits_processors,
+                max_kv_size=max_kv_size,
+                prompt_cache=prompt_cache,
+                # Exactly one token is left (loop condition above), so this only
+                # has to be >= 1; keep it at the model's ceiling regardless.
+                prefill_step_size=cap,
+                kv_bits=kv_bits,
+                kv_group_size=kv_group_size,
+                quantized_kv_start=quantized_kv_start,
+                # Prefill is already reported complete above. Forwarding `progress`
+                # would let mlx-lm re-report the 1-token remainder as (0, 1) and
+                # (1, 1), so any TTFT / percent readout jumps backwards at the end.
+                prompt_progress_callback=lambda *_: None,
+                input_embeddings=None,
+            )
         )
 
     def speculative_generate_step(
@@ -744,6 +955,7 @@ def _prefill_remainder(
             expert_cache.bytes_read,
             expert_cache.disk_wait_s,
             expert_cache.prefill_layers,
+            expert_cache.materialize_s,
         )
     while processed < target:
         remaining = target - processed
@@ -754,8 +966,10 @@ def _prefill_remainder(
             )
         else:
             n = min(step_cap, remaining)
-        # mlx-lm only reports progress after a chunk finishes; fused prefill
-        # is one chunk, so announce up front or it looks hung.
+        # mlx-lm's progress callback only fires *after* a chunk completes, and a
+        # fused chunk is the whole prompt, so the single tick lands at the very
+        # end. Say up front what is about to happen, or minutes of expert
+        # streaming are indistinguishable from a hang.
         print(
             f"[prefill] chunk {n} tok at kv={kv_len} ({processed}/{target} done)"
             " - one pass over the expert mass",
@@ -784,34 +998,77 @@ def _prefill_remainder(
 
 
 def _log_prefill_cost(model, expert_cache, base, t0, tokens: int) -> None:
-    """One line per prefill: disk wait vs compute.
+    """One line per prefill, split into terms that can each be acted on.
 
-    disk_wait_s is time a layer blocked on a read; elapsed - blocked is the
-    compute floor. Without the split, I/O-bound and GPU-bound prefills look
-    the same from the progress ticks.
+    Three costs, not two, and the third one used to hide inside the second:
+
+    * **blocked** - a layer sat waiting for a read that had not landed. Reduce
+      by reading earlier (more concurrency, deeper readahead) or reading less.
+    * **copy** - ``_materialize``: a host-side copy of every byte read, on the
+      calling thread. Scales with bytes, not tokens, so a full pass over the
+      expert mass pays it in full. Reduce by landing reads somewhere the GPU can
+      use directly, not by touching the drive.
+    * **rest** - everything else: attention, MoE matmuls, router syncs, Python.
+      The only genuinely compute-shaped term.
+
+    Reporting copy as compute is how a memcpy-bound prefill gets mistaken for a
+    GPU-bound one, which is exactly the wrong half to optimize. ``GB/s`` is bytes
+    over wall time, so it is a utilization figure, not the drive's rate: it can
+    only approach the device's number when ``rest`` and ``copy`` are small.
     """
     elapsed = time.perf_counter() - t0
     if expert_cache is None or base is None or tokens <= 0 or elapsed < 1.0:
         return
     read_gb = (expert_cache.bytes_read - base[0]) / 1e9
     blocked = expert_cache.disk_wait_s - base[1]
+    copy = expert_cache.materialize_s - base[3]
     moe_layers = int(getattr(model, "_expert_stream_info", {}).get("moe_layers") or 0)
     layers = expert_cache.prefill_layers - base[2]
     passes = f"{layers / moe_layers:.1f} pass" if moe_layers else f"{layers} layer"
     print(
-        f"[prefill] {tokens} tok in {elapsed:.1f}s | {read_gb:.0f} GB experts "
-        f"({passes}es over the mass, {read_gb / elapsed:.1f} GB/s effective) | "
-        f"{blocked:.0f}s blocked on disk, {elapsed - blocked:.0f}s compute",
+        f"[prefill] {tokens} tok in {elapsed:.1f}s · {read_gb:.0f} GB experts "
+        f"({passes}es over the mass, {read_gb / elapsed:.1f} GB/s wall) · "
+        f"{blocked:.0f}s blocked, {copy:.0f}s copy "
+        f"({read_gb / max(copy, 1e-6):.0f} GB/s), {elapsed - blocked - copy:.0f}s rest",
         flush=True,
     )
+
+
+def _drafting_history(full_prompt, remaining: int) -> list[int]:
+    """Tokens preceding the next decode step, prompt-cache prefix included.
+
+    generate_step only sees the remainder the prompt cache could not serve,
+    which on a warm agent turn is a couple of tokens. An n-gram drafter given
+    only that finds nothing to match, so recover the served prefix here.
+    """
+    total = int(full_prompt.size)
+    seq = getattr(_req_ctx, "draft_history", None)
+    _req_ctx.draft_history = None  # single-shot; never reuse across requests
+    tail = full_prompt.tolist()
+    if seq is not None and len(seq) >= total and seq[len(seq) - total :] == tail:
+        return seq[: len(seq) - remaining]
+    # Not this request's prompt: draft off the remainder alone rather than
+    # feeding the matcher a sequence the KV cache never saw.
+    return tail[: total - remaining]
 
 
 def _snapshot_user_segment(model, kwargs) -> None:
     """Prefill + store prefix KV snapshots for next-turn reuse.
 
-    Trimmable caches (DeepSeek / Qwen3-MoE / GLM, ...): one fused prefill,
-    then fork each boundary with deepcopy+trim. Non-trimmable (qwen3-next
-    hybrid): still stop mid-prefill at each boundary.
+    Storing the cache keyed by a prefix the *next* request will repeat is what
+    turns a 30k-token agent turn from a full re-prefill into a few seconds.
+
+    Two paths, same stored result:
+
+    * **Trimmable caches** (DeepSeek-V3.2, Qwen3-MoE, GLM, ...): prefill the
+      whole remainder in one fused pass, then fork each boundary with
+      deepcopy + trim. Mid-prefill stops used to cost a full expert-mass read
+      each; on a cold ~14k agent prompt that was a second ~368 GB pass for a
+      snapshot that ``insert_cache`` of the final sequence would pop anyway
+      (trimmable stores drop their own prefixes).
+    * **Non-trimmable caches** (qwen3-next hybrid): still stop at each
+      boundary. Those caches cannot recover a shorter prefix after overshooting,
+      so the mid-prefill stop is load-bearing.
     """
     ctx_tokens = getattr(_req_ctx, "tokens", None)
     _req_ctx.tokens = None  # single-shot; never reuse across requests
@@ -823,8 +1080,12 @@ def _snapshot_user_segment(model, kwargs) -> None:
     if tokenizer is None or prompt is None or cache is None:
         return
 
-    # Speculative decode: model + draft caches must advance over the same
-    # tokens or acceptance crater (target still validates every token).
+    # With speculative decoding the cache list is model layers + draft layers,
+    # and a stored snapshot is only useful if BOTH advanced over the same
+    # tokens: speculative_generate_step prefills each model with whatever
+    # prompt remainder it gets, so a draft cache that skipped the snapshotted
+    # span would be conditioned on a hole (correctness is unaffected - the
+    # target validates every token - but acceptance, and thus speed, craters).
     draft_model = kwargs.get("draft_model")
     n_model_layers = len(model.layers)
     draft_cache = cache[n_model_layers:] if draft_model is not None else []
@@ -924,10 +1185,9 @@ def _snapshot_user_segment(model, kwargs) -> None:
 def install_patches(model=None):
     """Apply every mlx-lm patch a streamed model needs, and return nothing.
 
-    Split out of `main()` so `bench/session_memory.py` can replay the real
-    serving path - prompt-cache handover, KV conversion, snapshotting, the
-    memory guards - instead of an approximation of it. A memory benchmark that
-    measures a different code path than production is worse than no benchmark.
+    Split out of `main()` so callers can replay the real serving path -
+    prompt-cache handover, KV conversion, snapshotting, the memory guards -
+    without duplicating setup.
 
     `model` short-circuits the ModelProvider hook for callers that loaded the
     model themselves.
@@ -951,6 +1211,7 @@ def install_patches(model=None):
         mt = getattr(getattr(model, "args", None), "model_type", None)
         if mt == "deepseek_v32":
             _install_deepseek_tool_parser(self.tokenizer)
+        _install_json_tools_unwrap(self.tokenizer)
         # Idempotent: the PagedMoE loader already did this, but a model that
         # arrived through mlx-lm's own loader still needs it.
         prefill_fused.install(model)
@@ -976,7 +1237,11 @@ def install_patches(model=None):
             _dequantize_kv_cache(cache, _model)
         _req_ctx.store = self
         _req_ctx.model_key = model_key
-        _req_ctx.tokens = list(tokens)
+        seq = list(tokens)
+        _req_ctx.tokens = seq
+        # Same sequence, separate slot: the snapshot path clears .tokens before
+        # generate_step runs, and the drafter needs the prefix the cache served.
+        _req_ctx.draft_history = seq
         _req_ctx.cached = len(tokens) - len(rest)
         return cache, rest
 

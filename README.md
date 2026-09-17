@@ -55,7 +55,7 @@ idle on any given token, so you do not need the whole library in RAM.
 the router picks them. LRU cache + route prediction (and an optional
 governed sidecar) keep agent turns warm.
 
-> **Status:** `v0.2.3` pre-release. The engine is in this repo and installs
+> **Status:** `v0.2.4` pre-release. The engine is in this repo and installs
 > from a clone. Not on PyPI yet. APIs may change before `v1.0`.
 >
 > **Naming:** product / repo / PyPI / CLI = **PagedMoE** (`paged-moe`).
@@ -353,6 +353,8 @@ process environment). Common ones:
 | `EXPERT_STREAM_READ_POOL_THREADS` | Decode slot-read queue depth (`0` = auto, `-1` = old executor path) |
 | `EXPERT_STREAM_PRUNE` | Drop weak routed experts (speed vs fidelity) |
 | `EXPERT_STREAM_WAIT_ABOVE` | Only stall on high-weight disk misses |
+| `EXPERT_STREAM_FLOW` | `1` = one sync per token (GPU slot table); fidelity knob, off by default |
+| `EXPERT_STREAM_LOOKUP` | `1` = n-gram self-draft (more tokens per disk pass); off by default |
 | `EXPERT_STREAM_CACHE_GB` | Pin expert-cache size (else auto under RAM budget) |
 | `EXPERT_STREAM_SIDECAR_DIR` | Where sidecar weights live |
 

@@ -289,9 +289,7 @@ class NetGovernor:
                 self._flips += 1
             self._confirms = 0
             self._decision = on
-            _log(
-                f"governor {self.name} actuation {'ON' if on else 'OFF'}: {reason}"
-            )
+            _log(f"governor {self.name} actuation {'ON' if on else 'OFF'}: {reason}")
 
     def request_probe(self, reason: str = "") -> bool:
         """Ask for a re-measure from free shadow evidence.

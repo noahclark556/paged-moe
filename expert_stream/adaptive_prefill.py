@@ -3,22 +3,34 @@
 """
 Prefill chunk sizing.
 
-Attention on DSA models wants a small chunk (dense pe_scores vs Metal's max
-buffer). The MoE half wants the largest chunk that fits, because each walk
-streams the expert mass once. prefill_fused splits those granularities;
-this module sizes both:
+Two different quantities want two different chunk sizes, and mlx-lm's single
+`prefill_step_size` has to be both:
 
-  attention_sub_chunk(owner, kv_len)  - score-matrix / ATTN_SUB_CHUNK bound
-  next_chunk(...)                    - model-level step (activation bound)
+* **Attention** on a DSA-family model materializes a dense
+  `pe_scores [heads, chunk, keys]`, so `chunk · (kv + chunk)` is bounded by
+  Metal's max single buffer. Against a long KV that forces a tiny chunk.
+* **The MoE half** cares only about how many times the prompt is walked: each
+  walk streams the entire expert mass off the SSD (~368 GB on DeepSeek-V3.2),
+  so it wants the *largest* chunk that fits in activation memory.
+
+`prefill_fused` resolves the conflict by sub-chunking attention inside each
+decoder layer, which leaves this module with two clean jobs:
+
+  `attention_sub_chunk(model, kv_len)` - the score-matrix bound (per layer).
+  `next_chunk(...)`                    - the model-level step, an activation
+                                         bound, large and KV-independent once
+                                         fused prefill is active.
 
 Modes (EXPERT_STREAM_ADAPTIVE_PREFILL_MODE):
-  auto   - DSA when the model has an indexer; else fused (no attention split)
-  dsa    - always apply the score-matrix bound
-  fused  - never split attention
-  off    - disabled (same as ADAPTIVE_PREFILL=0)
+  auto  - score-matrix bound when the model looks like deepseek_v32 / has an
+          indexer; fused-SDPA MoEs need no attention split at all
+  dsa   - always apply the score-matrix bound
+  fused - never split attention
+  off   - disabled (same as ADAPTIVE_PREFILL=0)
 
-Sizing only changes SDPA reduction blocking. Never feeds predicted experts
-into compute.
+Quality: sizing changes only how SDPA's reduction is blocked - the same class
+of variation as any other prefill_step_size, logit-near-identical, and
+bit-identical for a fixed schedule. Never feeds predicted experts into compute.
 """
 
 from __future__ import annotations
@@ -30,9 +42,11 @@ import mlx.core as mx
 
 from . import config
 
-# Model types that build a dense pe_scores matrix. Inclusive on purpose: a
-# false positive only makes attention sub-chunks smaller. deepseek_v3 is
-# absent (plain MLA, fused SDPA).
+# Model types known to build a dense pe_scores / score matrix over (chunk × keys)
+# before any sparse mask. Keep this list inclusive - a false positive only makes
+# attention sub-chunks smaller, and with fused prefill that no longer costs an
+# expert-mass pass. `deepseek_v3` is deliberately absent: plain MLA has no
+# indexer and runs on fused SDPA, so it sizes like the rest.
 _DSA_MODEL_TYPES = frozenset(
     {
         "deepseek_v32",
@@ -144,7 +158,7 @@ def dsa_max_chunk(
 ) -> int:
     """Largest ``C`` whose dense ``pe_scores [heads, C, kv+C]`` fits Metal.
 
-    Solves ``heads * C * (kv + C) * dtype_bytes <= safety * max_buffer`` for C.
+    Solves ``heads · C · (kv + C) · dtype_bytes <= safety · max_buffer`` for C.
 
     There is deliberately no lower clamp: this is a hard allocation bound, and
     a floor that overrides it just relocates the OOM. The old floor existed
@@ -190,8 +204,11 @@ def _layer_shape(layer: Any) -> tuple[bool, int]:
 def attention_sub_chunk(owner: Any, kv_len: int) -> int:
     """Query rows one attention call may process against `kv_len` keys.
 
-    DSA materializes a dense score matrix (shrinks with KV). Fused-SDPA gets
-    the whole chunk so prefill_fused's split is a no-op there.
+    `owner` is a decoder layer (preferred) or the whole model. DSA-family
+    attention materializes a dense score matrix, so this shrinks quadratically
+    with KV. Fused-SDPA attention tiles internally and never builds that
+    matrix, so it gets the whole chunk - which makes prefill_fused's split a
+    no-op on those architectures rather than a cost.
     """
     cap = int(config.ADAPTIVE_PREFILL_MAX or config.PREFILL_CHUNK)
     mode = mode_name()
@@ -207,7 +224,11 @@ def attention_sub_chunk(owner: Any, kv_len: int) -> int:
         return cap
     if not (dsa or forced):
         return cap
-    # Metal bound = what fits; ATTN_SUB_CHUNK = what is fast. Take the min.
+    # Two independent caps. The Metal bound says what *fits*; ATTN_SUB_CHUNK
+    # says what is *fast*. Sizing to the Metal bound was leaving score work on
+    # the table: a sub-chunk only ever needs its own causal triangle, and a
+    # materialized mask cannot skip it, so overhead scales with C/T (see
+    # config.ATTN_SUB_CHUNK). Take the smaller of the two.
     bound = dsa_max_chunk(kv_len, n_heads=heads, c_max=cap)
     target = int(config.ATTN_SUB_CHUNK or 0)
     return bound if target <= 0 else max(1, min(bound, target))
@@ -220,10 +241,12 @@ def next_chunk(
     *,
     prefill_cap: Optional[int] = None,
 ) -> int:
-    """Tokens to prefill on this step (always >= 1 when remaining >= 1).
+    """Tokens to prefill on this step (always ≥ 1 when remaining ≥ 1).
 
-    With fused prefill installed this is an activation bound (large); the
-    score-matrix bound lives inside the layer.
+    With fused prefill installed the decoder layers sub-chunk their own
+    attention, so this step is bounded by activation memory (the cap) rather
+    than by the score matrix - which is the whole point: the expert mass is
+    read once per step, so a step should be as large as it can be.
     """
     rem = max(0, int(remaining))
     if rem <= 0:

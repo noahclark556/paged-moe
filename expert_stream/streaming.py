@@ -94,6 +94,87 @@ class _RoutePredictor:
         self.norm_weight = norm_weight
 
 
+# The router output of the most recent gate call: (id(gate), id(x), out).
+#
+# Every MoE block runs `self.gate(x)` and then `self.switch_mlp(x, inds)` with
+# the same `x`, so the weights the selectors need are already in the graph by
+# the time the streamed layer runs - re-deriving them means a second full
+# router pass (on GLM-4.7 that is ~10 extra kernels to encode inside a
+# blocking eval, 89 times per token). One slot is enough because the gate call
+# immediately precedes the switch_mlp call; route prediction also runs gates,
+# but only from the *previous* layer, so its write is always overwritten by the
+# real one before anybody reads it. Both ids are checked anyway, and a mismatch
+# just falls back to re-running the router.
+_LAST_ROUTE: tuple | None = None
+_TAPPED_ROUTERS: dict[type, type] = {}
+
+
+def _tap_router(gate) -> None:
+    """Record `gate`'s output on the way past, for _tapped_route to pick up.
+
+    Retypes the instance instead of wrapping it: `block.gate(x)` looks
+    __call__ up on the class, and swapping the module for a wrapper object
+    would take the router's weights out of the model's parameter tree.
+    """
+    cls = type(gate)
+    if cls in _TAPPED_ROUTERS.values():
+        return
+    tapped = _TAPPED_ROUTERS.get(cls)
+    if tapped is None:
+        base_call = cls.__call__
+
+        def __call__(self, x):  # noqa: N807 - mirrors the wrapped signature
+            out = base_call(self, x)
+            global _LAST_ROUTE
+            _LAST_ROUTE = (id(self), id(x), out)
+            return out
+
+        tapped = type(f"Tapped{cls.__name__}", (cls,), {"__call__": __call__})
+        _TAPPED_ROUTERS[cls] = tapped
+    try:
+        gate.__class__ = tapped
+    except TypeError:
+        pass  # exotic router class; the re-run path still works
+
+
+def _route_rank_mx(gate, x, ind2):
+    """A monotone score per routed slot as an mx.array, without a sync.
+
+    Flow decode only ever *ranks* the router's own top-k, so any monotone
+    transform of the mixture weight will do: MoEGate hands its scores back
+    already, and for a logits router the selected logits order exactly the way
+    a softmax over them would. Returns None when the router output was not
+    captured, which sends the layer down the ordinary per-layer path.
+    """
+    if gate is None:
+        return None
+    out = _tapped_route(gate, x)
+    if out is None:
+        return None
+    K = ind2.shape[-1]
+    if isinstance(out, (tuple, list)):
+        if len(out) < 2 or not isinstance(out[1], mx.array):
+            return None
+        return out[1].reshape(-1, K).astype(mx.float32)
+    if isinstance(out, mx.array) and out.ndim >= 2:
+        logits = out if out.ndim == 2 else out.reshape(-1, out.shape[-1])
+        return mx.take_along_axis(logits, ind2, axis=-1).astype(mx.float32)
+    return None
+
+
+def _tapped_route(gate, x):
+    """This layer's own router output, or None if it was not the last call.
+
+    `x` is the *unreshaped* activation the block passed to both the gate and
+    switch_mlp, so identity on it is what proves the recorded output belongs to
+    this forward rather than to a prediction or a previous layer.
+    """
+    rec = _LAST_ROUTE
+    if rec is None or rec[0] != id(gate) or rec[1] != id(x):
+        return None
+    return rec[2]
+
+
 class StreamedSwitchGLU(nn.Module):
     def __init__(
         self,
@@ -120,6 +201,8 @@ class StreamedSwitchGLU(nn.Module):
         # Experts an earlier layer predicted this layer would want on this
         # step (accuracy accounting only - never used to pick experts).
         self.predicted: set[int] = set()
+        # Gather row indices per (N, M), built once (flow decode).
+        self._flow_lhs_cache: dict[tuple, mx.array] = {}
 
     # ------------------------------------------------------------- compute
 
@@ -210,8 +293,7 @@ class StreamedSwitchGLU(nn.Module):
         `lhs_indices` also avoids materializing the gathered activations.
 
         Bit-identical to `_run` on the same weights: same kernel, same
-        quantization parameters, just batched (verified in tests/test_stream.py
-        and bench/slab_probe.py).
+        quantization parameters, just batched (verified in tests/test_stream.py).
         """
         N, K = inds.shape
         flat = inds.reshape(-1)
@@ -243,6 +325,88 @@ class StreamedSwitchGLU(nn.Module):
         out = mx.zeros((N * K, y.shape[-1]), dtype=y.dtype)
         out[mx.array(kept_pos)] = y
         return out.reshape(N, K, -1)
+
+    # ------------------------------------------------------ flow (no sync)
+
+    def _flow_lhs(self, n_rows: int, m: int):
+        """Row-of-x for each gather row. Static per (N, M), so build it once."""
+        key = (n_rows, m)
+        lhs = self._flow_lhs_cache.get(key)
+        if lhs is None:
+            lhs = mx.array((np.arange(n_rows * m, dtype=np.uint32) // m))
+            self._flow_lhs_cache[key] = lhs
+        return lhs
+
+    def _run_flow(self, x_flat, ind2, rank, table, topm: int):
+        """Decode compute with no host round trip.
+
+        `table` maps expert id -> slab slot (-1 when not resident) and lives on
+        the GPU, so residency, selection and the gather indices are all mx ops.
+        Nothing here needs the routing on the CPU, which is what lets a whole
+        token be one graph instead of one graph per MoE layer.
+
+        Returns [N, K, D]: computed rows sit in their own router slots and every
+        other slot is zero, so the parent block's weighted sum simply omits what
+        was not computed - the same shape contract `_run_slab` honors under a
+        prune mask.
+        """
+        N, K = ind2.shape
+        m = K if topm <= 0 else min(topm, K)
+        slots = mx.take(table, ind2)  # [N, K]
+        resident = slots >= 0
+        if m < K:
+            # Rank among *resident* experts only: one we would have to read
+            # cannot displace one we can compute now. Every id considered is
+            # still one this layer's router chose, so this picks among the
+            # router's experts and never substitutes for them.
+            sel = mx.argpartition(
+                -mx.where(resident, rank, mx.array(-mx.inf, mx.float32)),
+                kth=m - 1,
+                axis=-1,
+            )[..., :m]
+            sel_slots = mx.take_along_axis(slots, sel, axis=-1)
+            valid = mx.take_along_axis(resident, sel, axis=-1)
+        else:
+            sel = None
+            sel_slots = slots
+            valid = resident
+
+        rhs = mx.maximum(sel_slots, 0).reshape(-1).astype(mx.uint32)
+        lhs = self._flow_lhs(N, m)
+        xe = x_flat[:, None, :]
+        x_up = self._gather_proj(xe, "up_proj", rhs, lhs)
+        x_gate = self._gather_proj(xe, "gate_proj", rhs, lhs)
+        y = self._gather_proj(self.activation(x_up, x_gate), "down_proj", rhs)
+        y = y.reshape(N, m, -1)
+        # A slot with no resident expert contributes nothing. Zeroing the row is
+        # the graph-only equivalent of leaving it out of the gather, which would
+        # need a host-side count of what survived.
+        y = y * valid[..., None].astype(y.dtype)
+        if sel is None:
+            return y, valid
+        out = mx.zeros((N, K, y.shape[-1]), dtype=y.dtype)
+        idx = mx.broadcast_to(sel[..., None], y.shape)
+        return mx.put_along_axis(out, idx, y, axis=-2), valid
+
+    def _flow_forward(self, x, x_flat, ind2):
+        """One MoE layer of a flow-decode token, or None to use the sync path."""
+        table = self.cache.flow_table(self.layer_key)
+        if table is None:
+            return None
+        rank = _route_rank_mx(self.pred.gate if self.pred else None, x, ind2)
+        if rank is None:
+            return None
+        if self.ring_index == 0:
+            # The previous token's routing is materialized by now (the sampler
+            # synced it), so this is where the reads for this token get issued -
+            # a whole token of lead time instead of a few layers.
+            self.ring.flow_pump()
+            self.cache.leave_prefill()
+        out, valid = self._run_flow(x_flat, ind2, rank, table, config.FLOW_TOPM)
+        self.ring.flow_note(self.ring_index, ind2, valid)
+        if self.ring_index + 1 >= len(self.ring.layers):
+            self.ring.flow_note_hidden(x_flat[-1])
+        return out
 
     def _run(self, x_flat, inds: np.ndarray, groups, eval_groups: bool, keep=None):
         """Shared compute: iterate experts in ascending-id order, run the FFN
@@ -324,6 +488,19 @@ class StreamedSwitchGLU(nn.Module):
         ind2 = indices.reshape(-1, K)
         N = ind2.shape[0]  # static shape: known without a sync
 
+        # Flow decode: keep the whole layer on the GPU so the token needs no
+        # per-layer sync at all. Returns None (and falls through to the path
+        # below) whenever its preconditions do not hold - no slab, an
+        # unrecognized router, a table that does not exist yet - so enabling it
+        # can never break a model, only leave it on the ordinary path.
+        if config.FLOW and N <= _DECODE_MAX_TOKENS and self.cache.slab is not None:
+            if self.ring_index == 0:
+                self.ring.flow_token_start()
+            if self.ring.flow_ready():
+                flowed = self._flow_forward(x, x_flat, ind2)
+                if flowed is not None:
+                    return flowed.reshape(*lead_shape, -1)
+
         # Opt-in approximate routing. Re-derive the router's weights for the
         # selected experts (the router is a resident matvec - the same decision
         # the block just made), then decide which slots to actually compute:
@@ -369,11 +546,15 @@ class StreamedSwitchGLU(nn.Module):
             and self.pred.gate is not None
         ):
             try:
+                tapped = _tapped_route(self.pred.gate, x)
+                self.cache.route_calls += 1
+                self.cache.route_tapped += tapped is not None
                 wnp = _route_weights_from_gate(
                     self.pred.gate,
                     x_flat,
                     ind2,
                     pending=self.ring.pending_sync(),
+                    tapped=tapped,
                 )
                 if wnp is not None:
                     # Adaptive prune/wait from sidecar when head is live.
@@ -404,9 +585,7 @@ class StreamedSwitchGLU(nn.Module):
         if keep is not None and wnp is not None:
             free_arr = None
             if config.KEEP_FREE or wait_on:
-                # One residency query serves both halves of the trade: which
-                # experts are free (never drop those) and which would block on
-                # the disk (don't wait for the unimportant ones).
+                # One residency query serves both KEEP_FREE and WAIT_ABOVE.
                 need = np.unique(inds if wait_on else inds[~keep])
                 free = self.cache.free_ids(self.layer_key, need)
                 free_arr = np.array(sorted(free), inds.dtype)
@@ -491,7 +670,7 @@ class StreamedSwitchGLU(nn.Module):
             # ever demand more than `cap` experts, so predicting the router's
             # full K would spend the disk on slots that cannot be requested.
             self.ring.speculate(
-                self.ring_index, x_flat[-1:], cap if cap_on else K
+                self.ring_index, x_flat[-1:], cap if cap_on else K, positions=N
             )
             # Last MoE layer of the token: close the sidecar's token window so
             # it can train and prefetch the next token's early layers. Cheap
@@ -528,6 +707,7 @@ class StreamedSwitchGLU(nn.Module):
             # A prediction left over from the previous decode token is stale
             # (routing came from a hidden state this prompt replaces).
             self.ring.drop_pending()
+            self.ring.flow_drop()
             # Clear decode-token sidecar state once at the start of the prefill
             # pass - NOT on every MoE layer. drop_token() aborts the prefill
             # chunk window; calling it per-layer left prefill_r stuck at 0/0.
@@ -637,6 +817,10 @@ class PrefetchRing:
         # below is gated on this so disabled models pay a single None-check.
         self.sidecar = None
         self._token_open = False
+        # Flow decode: one token's lazy routing, read at the next token's start.
+        self._flow_recs: list[tuple] = []
+        self._flow_hidden = None
+        self._flow_tokens = 0
 
     def attach_sidecar(self, sidecar) -> None:
         self.sidecar = sidecar
@@ -656,8 +840,83 @@ class PrefetchRing:
         self.sidecar.note_demand(layer_key, expert_ids)
         self._token_open = True
 
+    # --------------------------------------------------------- flow decode
+
+    def flow_token_start(self) -> None:
+        """Count decode tokens since the last prefill (flow warmup gate)."""
+        self._flow_tokens += 1
+        if self._flow_tokens == config.FLOW_WARMUP + 1:
+            # Handing over from the per-layer path: its last deferred prediction
+            # has no sync left to ride on, so let it go rather than leak a graph.
+            self.drop_pending()
+
+    def flow_ready(self) -> bool:
+        return self._flow_tokens > config.FLOW_WARMUP
+
+    def flow_note(self, index: int, ind2, valid) -> None:
+        """Hold a layer's routing for the next token to read.
+
+        These stay lazy on purpose: touching them here is the sync flow decode
+        exists to avoid. The sampler materializes them at the end of the token
+        (they are ancestors of the sampled id), and `flow_pump` reads them at
+        the start of the next one, by which time it is a host copy.
+        """
+        self._flow_recs.append((index, ind2, valid))
+
+    def flow_note_hidden(self, hidden) -> None:
+        self._flow_hidden = hidden
+
+    def flow_pump(self) -> None:
+        """Start of a flow-decode token: learn the last one, read for this one.
+
+        This is the whole host side of flow decode, and it runs once per token
+        rather than once per layer. Last token's routing is the best available
+        statement of what this token wants, and issuing it here gives the reads
+        a full token of cover instead of the few layers a prefetch stride buys.
+        """
+        recs = self._flow_recs
+        if not recs:
+            return
+        self._flow_recs = []
+        hidden = self._flow_hidden
+        self._flow_hidden = None
+        cache = self.cache
+        batch: list[tuple[str, list[int]]] = []
+        for index, ind2, valid in recs:
+            layer = self.layers[index]
+            inds = np.asarray(ind2)
+            ids = [int(e) for e in np.unique(inds)]
+            layer.last_ids = ids
+            cache.route_total += len(ids)
+            # Slots the router asked for vs slots that had a resident expert:
+            # this is flow's whole quality story, so keep it on the same
+            # counters PRUNE reports through (`pruned_frac`).
+            vnp = np.asarray(valid)
+            cache.demand_slots += int(inds.size)
+            cache.pruned_slots += int(inds.size - vnp.sum())
+            self.note_demand(layer.layer_key, ids)
+            batch.append((layer.layer_key, ids))
+        if batch:
+            cache.prefetch_many(batch)
+        if self.sidecar is not None:
+            if hidden is not None:
+                try:
+                    if hidden.dtype != mx.float32:
+                        hidden = hidden.astype(mx.float32)
+                    self.sidecar.note_hidden(np.asarray(hidden))
+                except Exception:
+                    pass
+            self.sidecar.end_token(cache)
+            self._token_open = False
+
+    def flow_drop(self) -> None:
+        """Forget held routing: a prefill replaces the state it came from."""
+        self._flow_recs = []
+        self._flow_hidden = None
+        self._flow_tokens = 0
+
     def end_decode_token(self, hidden=None) -> None:
-        """Close a decode token for the sidecar (wrap prefetch + online train)."""
+        """Close a decode token for the sidecar."""
         if self.sidecar is None or not self._token_open:
             return
         self._token_open = False
@@ -677,8 +936,18 @@ class PrefetchRing:
             _log(f"decode-token mode={mode}")
         self._sidecar_breadcrumb = getattr(self, "_sidecar_breadcrumb", 0) + 1
 
-    def _token_boundary(self) -> None:
+    def _token_boundary(self, positions: int = 1) -> None:
         """Measure decode throughput per window; used by the auto governor.
+
+        `positions` is how many token positions the pass just covered, which is
+        1 for ordinary decode and up to LOOKUP_TOKENS+1 under lookup decode.
+        Counting passes instead would stretch every window by that factor: a
+        96-token reply is only ~22 passes at a 4.3 tok/pass accept rate, so the
+        governor would never reach PREDICT_MIN_TOKENS inside a normal reply and
+        would sit in its probe, spending half of it in the losing state. It
+        slightly overstates the rate (rejected positions are counted), but the
+        accept rate does not depend on prediction, so both sides are inflated
+        equally and the comparison is unaffected.
 
         Prefetching is only free when the read is the bottleneck. On unified
         memory the reader threads and the GPU share memory bandwidth, so
@@ -716,7 +985,7 @@ class PrefetchRing:
             # A gap between requests, not a decode step.
             return
         self._win_time += dt
-        self._win_tokens += 1
+        self._win_tokens += max(1, positions)
         if self._win_tokens < max(4, config.PREDICT_WINDOW):
             return
         tokens, seconds = self._win_tokens, self._win_time
@@ -845,8 +1114,8 @@ class PrefetchRing:
         """Which layer distances to predict from `src`.
 
         The near band is the shipped behaviour. The far entry is the payoff
-        from bench/router_matrix.py, which mapped router agreement over every
-        (source, target) pair and found the decay is NOT a function of
+        from measured router agreement over every (source, target) pair: the
+        decay is NOT a function of
         distance but of SOURCE DEPTH: on Qwen3-235B, precision among cache
         misses from layer 0 is gone by distance 4 (0.28), while from layer 24
         it is still 0.73 at distance 32 - against a net-win bar of 0.5. Early
@@ -1091,13 +1360,19 @@ class PrefetchRing:
             self.cache.prefetch_many(batch)
         self.cache.spec_s += time.perf_counter() - t0
 
-    def speculate(self, current_index: int, x: mx.array | None = None, top_k: int = 0):
+    def speculate(
+        self,
+        current_index: int,
+        x: mx.array | None = None,
+        top_k: int = 0,
+        positions: int = 1,
+    ):
         n = len(self.layers)
         if n < 2:
             return
 
         if self._auto and current_index == 0:
-            self._token_boundary()
+            self._token_boundary(positions)
 
         # Predict on a stride, not every layer. Predicting `depth` layers ahead
         # at every layer means each layer is predicted `depth` times, so the
@@ -1226,32 +1501,49 @@ def _selector_mask(
 
 
 def _route_weights_from_gate(
-    gate, x_flat: mx.array, ind2: mx.array, pending: tuple = ()
+    gate,
+    x_flat: mx.array,
+    ind2: mx.array,
+    pending: tuple = (),
+    tapped=None,
 ) -> np.ndarray | None:
     """Mixture weights for `ind2`, from either router family.
 
     * `nn.Linear` (Qwen3-MoE / Qwen3-Next): gate returns logits; softmax over
       the selected logits is the parent block's normalized top-k scores.
-    * `MoEGate` (GLM / DeepSeek): gate returns `(inds, scores)` already; we
-      align those scores onto `ind2` and normalize to unit mass.
+    * `MoEGate` (GLM / DeepSeek): gate returns `(inds, scores)` already; those
+      scores are in `ind2` order when they come from the block itself, and are
+      aligned by expert id when the router had to be re-run.
+
+    `tapped` is the output the parent block's own gate call produced for this
+    same activation (see _tap_router). Reusing it is not just cheaper: the
+    re-run path has to align by expert id because argpartition does not order
+    ties, and the block's scores are already the ones it will weigh with.
 
     Returns None if the gate shape is unrecognized (caller leaves routing
     exact). Syncs `ind2` + weights, and any deferred prediction in `pending`.
     """
-    out = gate(x_flat)
+    K = ind2.shape[-1]
+    out = tapped if tapped is not None else gate(x_flat)
     if isinstance(out, (tuple, list)):
         if len(out) < 2:
             return None
         g_inds, g_scores = out[0], out[1]
         if not isinstance(g_inds, mx.array) or not isinstance(g_scores, mx.array):
             return None
+        if tapped is not None:
+            # Straight from the block: same order as ind2, no alignment needed.
+            g_scores = g_scores.reshape(-1, K)
+            mx.eval(ind2, g_scores, *pending)
+            return _unit_mass(np.asarray(g_scores).astype(np.float32))
         mx.eval(ind2, g_inds, g_scores, *pending)
         w = _align_scores_to_indices(
             np.asarray(g_inds), np.asarray(g_scores), np.asarray(ind2)
         )
         return _unit_mass(w)
-    if isinstance(out, mx.array) and out.ndim == 2:
-        sel = mx.take_along_axis(out, ind2, axis=-1)
+    if isinstance(out, mx.array) and out.ndim >= 2:
+        logits = out if out.ndim == 2 else out.reshape(-1, out.shape[-1])
+        sel = mx.take_along_axis(logits, ind2, axis=-1)
         w = mx.softmax(sel.astype(mx.float32), axis=-1)
         mx.eval(ind2, w, *pending)
         return np.asarray(w)
@@ -1386,9 +1678,10 @@ def patch_model(
             raise ValueError(f"checkpoint has no tensors for MoE module {path}")
         cache.register_layer(path, components)
 
-        streamed = StreamedSwitchGLU(
-            path, module, cache, ring, _find_router(model, path)
-        )
+        predictor = _find_router(model, path)
+        if predictor is not None:
+            _tap_router(predictor.gate)
+        streamed = StreamedSwitchGLU(path, module, cache, ring, predictor)
         parent, attr = _resolve_parent(model, path)
         if attr.isdigit():
             parent[int(attr)] = streamed
@@ -1399,13 +1692,7 @@ def patch_model(
         # Import only when enabled so a disabled model never loads the learner.
         from .sidecar import ExpertSidecar
 
-        n_experts = 0
-        for comps in cache._layouts.values():
-            locator = next(iter(comps.values()))
-            if isinstance(locator, StackedLocator):
-                n_experts = max(n_experts, int(locator.stacked.shape[0]))
-            elif isinstance(locator, DirectLocator):
-                n_experts = max(n_experts, len(locator.per_expert))
+        n_experts = max_expert_count(cache)
         if n_experts <= 0:
             from .sidecar.slot import _log
 
@@ -1421,6 +1708,18 @@ def patch_model(
             )
 
     return ring
+
+
+def max_expert_count(cache: ExpertCache) -> int:
+    """Routed experts per layer, from the registered layouts (0 if unknown)."""
+    n_experts = 0
+    for comps in cache._layouts.values():
+        locator = next(iter(comps.values()))
+        if isinstance(locator, StackedLocator):
+            n_experts = max(n_experts, int(locator.stacked.shape[0]))
+        elif isinstance(locator, DirectLocator):
+            n_experts = max(n_experts, len(locator.per_expert))
+    return n_experts
 
 
 def expert_tensor_names(

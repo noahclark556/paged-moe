@@ -33,6 +33,7 @@ import json
 import os
 import struct
 import threading
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -228,8 +229,29 @@ class FilePool:
 
 
 def read_tensor_numpy(pool: FilePool, loc: TensorLoc) -> np.ndarray:
-    """Read one tensor (or expert slice) out of the checkpoint into RAM."""
+    """Read one tensor (or expert slice) out of the checkpoint into RAM.
+
+    ``EXPERT_STREAM_READ_DELAY_US_PER_MB`` (device sandbox) adds sleep so a
+    fast host SSD can stand in for a slower target disk. 0 / unset = off.
+    """
+    delay_us = _read_delay_us_per_mb()
+    if delay_us > 0 and loc.nbytes > 0:
+        time.sleep(loc.nbytes * (delay_us / 1e6) / (1 << 20))
     data = pool.read_bytes(loc.file, loc.offset, loc.nbytes)
     np_dtype, _itemsize = _DTYPES[loc.dtype]
     arr = np.frombuffer(data, dtype=np_dtype)
     return arr.reshape(loc.shape)
+
+
+_READ_DELAY_US_PER_MB: float | None = None
+
+
+def _read_delay_us_per_mb() -> float:
+    global _READ_DELAY_US_PER_MB
+    if _READ_DELAY_US_PER_MB is None:
+        raw = os.environ.get("EXPERT_STREAM_READ_DELAY_US_PER_MB", "").strip()
+        try:
+            _READ_DELAY_US_PER_MB = float(raw) if raw else 0.0
+        except ValueError:
+            _READ_DELAY_US_PER_MB = 0.0
+    return _READ_DELAY_US_PER_MB

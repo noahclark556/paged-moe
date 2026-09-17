@@ -88,9 +88,8 @@ class _SlotLatch:
 
     A Future per component shipped first and was too expensive: nine
     components x ~250 misses/token is ~2300 Futures, each with a work item,
-    queue put, and lock. bench/mainthread_profile.py counted ~10700 lock
-    acquisitions/token; bench/gil_probe.py shows main-thread python costing
-    up to 74% of read bandwidth.
+    queue put, and lock. Profiling counted ~10700 lock acquisitions/token;
+    main-thread Python can cost up to 74% of read bandwidth.
 
     Nine reads share one counter; the single Future is the one `_inflight` /
     `add_done_callback` already need. First exception wins; later components
@@ -143,7 +142,7 @@ class _ReadPool:
         self.threads = max(1, int(threads))
         # Per-worker busy flag around the pread. An observer samples these
         # to tell "drive saturated" from "drive idle waiting on python"
-        # (bench/drive_idle.py). Only worker i writes busy[i], so no lock.
+        # Only worker i writes busy[i], so no lock.
         self.busy = bytearray(self.threads)
         for i in range(self.threads):
             threading.Thread(
@@ -172,8 +171,8 @@ class _ReadPool:
         self._q.put((fd, offset, mv, latch))
 
     def shutdown(self) -> None:
-        """Stop the workers. Unused in production (`ga` owns one process per
-        model), but tests that build caches in a loop need it to avoid leaks."""
+        """Stop the workers. Unused in production (one process per model), but
+        tests that build caches in a loop need it to avoid leaks."""
         for _ in range(self.threads):
             self._q.put(None)
 
@@ -246,7 +245,13 @@ def _release_raw(pool: BufferPool, raw: dict) -> None:
 
 
 def _materialize(raw: dict) -> dict:
-    """numpy -> mx. MUST run on the MLX/GPU thread (usually main)."""
+    """numpy -> mx. MUST run on the MLX/GPU thread (usually main).
+
+    The host copy shows up as a large fraction of incremental prefill wall
+    time in the accounting, but skipping it does not change total prefill
+    time: the same bytes still have to land in a contiguous GPU-usable array,
+    and MLX just does that copy lazily at eval under compute instead.
+    """
     if "__slot__" in raw:
         # Slab read: the bytes were pread straight into their final slot in
         # Metal-backed memory, so there is no copy to make and nothing to
@@ -379,6 +384,12 @@ class ExpertCache:
         self._slab_per_expert = 0
         self._slab_budget = 0
         self._slot_of: dict[tuple, int] = {}
+        # GPU-resident expert->slot tables (see enable_flow). None = flow off,
+        # and every call site below is a single None-check in that case.
+        self._flow_rows: dict[str, np.ndarray] | None = None
+        self._flow_tables: dict[str, mx.array] = {}
+        self._flow_dirty: set[str] = set()
+        self._flow_n = 0
         self._free_slots: list[int] = []
         # Slots the in-progress fetch depends on: they must survive eviction
         # for the duration of that fetch (see _alloc_slot).
@@ -412,12 +423,21 @@ class ExpertCache:
         # over the expert mass - the quantity prefill time is proportional to.
         self.prefill_layers = 0
         self.disk_wait_s = 0.0
+        # Host-side copy of read bytes into MLX arrays, on the calling thread.
+        # Tracked separately because it is neither disk wait nor GPU work, and
+        # at prefill volumes (a full pass over the expert mass) it is large.
+        self.materialize_s = 0.0
         # Route-prediction accounting (see PrefetchRing): how much speculative
         # I/O was actually used, and how much of the real demand it covered.
         self.pred_issued = 0
         self.pred_used = 0
         self.route_total = 0
         self.heur_used = 0
+        # Layer calls that reused the block's own router output instead of
+        # re-running the router (streaming._tapped_route). Anything below the
+        # MoE layer count per token means some family fell back to the re-run.
+        self.route_tapped = 0
+        self.route_calls = 0
         # Decode pruning accounting (see config.PRUNE / streaming.__call__).
         self.pruned_slots = 0
         self.demand_slots = 0
@@ -450,6 +470,74 @@ class ExpertCache:
     def expert_nbytes(self, layer_key: str) -> int:
         """Approximate bytes for one expert of this layer (for group sizing)."""
         return self._expert_nbytes[layer_key]
+
+    # ----------------------------------------------------- flow slot tables
+
+    def enable_flow(self, n_experts: int) -> bool:
+        """Publish expert->slot as a GPU table per layer. Returns True if on.
+
+        This is the mapping the per-layer sync exists to deliver: with it on the
+        device, a layer can build its gather indices and decide what is resident
+        without the routing ever reaching the CPU (see config.FLOW).
+
+        The table only ever names experts that are installed in the LRU, never
+        ones with a read in flight - a slot is assigned when the read is
+        submitted, so trusting `_slot_of` alone would compute with whatever the
+        slot held before.
+        """
+        if self.slab is None or n_experts <= 0 or not self._layouts:
+            return False
+        with self._lock:
+            self._flow_n = int(n_experts)
+            self._flow_rows = {
+                key: np.full(self._flow_n, -1, dtype=np.int32)
+                for key in self._layouts
+            }
+            self._flow_tables = {}
+            self._flow_dirty = set(self._flow_rows)
+            for (layer_key, eid), entry in self._lru.items():
+                slot = entry.get("__slot__")
+                row = self._flow_rows.get(layer_key)
+                if slot is not None and row is not None and eid < self._flow_n:
+                    row[eid] = slot
+        return True
+
+    def _flow_mark(self, key: tuple, slot: int | None) -> None:
+        """Assumes lock held. Record (or clear) one expert's slot for the table."""
+        if self._flow_rows is None:
+            return
+        layer_key, eid = key
+        row = self._flow_rows.get(layer_key)
+        if row is None or not (0 <= eid < self._flow_n):
+            return
+        row[eid] = -1 if slot is None else int(slot)
+        self._flow_dirty.add(layer_key)
+
+    def _flow_reset(self) -> None:
+        """Assumes lock held. Nothing is resident any more (slab released)."""
+        if self._flow_rows is None:
+            return
+        for layer_key, row in self._flow_rows.items():
+            row.fill(-1)
+            self._flow_dirty.add(layer_key)
+
+    def flow_table(self, layer_key: str):
+        """This layer's expert->slot table on the GPU, or None when flow is off.
+
+        Call on the MLX thread. Re-uploads only after residency changed; the row
+        is one int32 per expert (640 B on a 160-expert layer), so a rebuild is
+        cheaper than the sync it replaces even when it happens every layer.
+        """
+        if self._flow_rows is None:
+            return None
+        with self._lock:
+            row = self._flow_rows.get(layer_key)
+            if row is None:
+                return None
+            if layer_key in self._flow_dirty:
+                self._flow_dirty.discard(layer_key)
+                self._flow_tables[layer_key] = mx.array(row)
+            return self._flow_tables.get(layer_key)
 
     # --------------------------------------------------------- slab storage
 
@@ -600,6 +688,7 @@ class ExpertCache:
         slot = self._slot_of.pop(key, None)
         if slot is not None:
             self._free_slots.append(slot)
+        self._flow_mark(key, None)
 
     def _release_slot(self, key: tuple, entry: dict) -> None:
         """Assumes lock held. Hand back the slot of an entry we won't install.
@@ -858,7 +947,7 @@ class ExpertCache:
 
         For stacked checkpoints, experts first..last of each component tensor
         are one contiguous byte range, so the whole run costs a few large
-        sequential reads instead of len(ids) x the component count of small
+        sequential reads instead of len(ids) × the component count of small
         scattered ones. This is what lets prefill - which wants nearly every
         expert of every layer - run at the SSD's sequential bandwidth.
 
@@ -1181,6 +1270,7 @@ class ExpertCache:
         self.slab.release()
         self.slab = None
         self._slot_of.clear()
+        self._flow_reset()
         self._free_slots.clear()
         self._pinned.clear()
 
@@ -1301,6 +1391,7 @@ class ExpertCache:
             self._release_slot(key, entry)
             return  # no room; don't evict for prefill traffic
         self._lru[key] = entry
+        self._flow_mark(key, entry.get("__slot__"))
         self._entry_bytes[key] = nbytes
         self.resident_bytes += nbytes
         self.peak_resident_bytes = max(self.peak_resident_bytes, self.resident_bytes)
@@ -1433,6 +1524,10 @@ class ExpertCache:
                 busy += time.perf_counter() - m0
             # Only the un-overlapped remainder counts as waiting on disk.
             self.disk_wait_s += max(0.0, time.perf_counter() - t0 - busy)
+            # Materialize is a host-side copy of every byte read, on this
+            # thread. Excluding it from disk_wait is right, but leaving it
+            # unattributed made the prefill log call it compute.
+            self.materialize_s += busy
 
         if materialized:
             _eval_experts([e for _, e in materialized])
@@ -1700,6 +1795,7 @@ class ExpertCache:
             # this and read_gb is what speculation bought or wasted.
             "demand_gb": round(self.demand_miss_bytes / 1e9, 3),
             "disk_wait_s": round(self.disk_wait_s, 3),
+            "materialize_s": round(self.materialize_s, 3),
             "prefetch_pending": len(self._raw_ready),
             "staging_gb": round(self._raw_bytes / 1e9, 3),
             "staging_drops": self.staging_drops,
@@ -1735,6 +1831,13 @@ class ExpertCache:
             # Experts skipped instead of blocking the GPU on a read, and
             # prefetched for later tokens instead (see config.WAIT_ABOVE).
             "skipped_waits": self.skipped_waits,
+            # Share of layer calls that read the router's weights off the
+            # block's own gate call rather than re-running it.
+            "route_tap_rate": (
+                round(self.route_tapped / self.route_calls, 4)
+                if self.route_calls
+                else 0.0
+            ),
             "mx_active_gb": round(mx.get_active_memory() / 1e9, 3),
             "mx_cache_gb": round(mx.get_cache_memory() / 1e9, 3),
             "mx_peak_gb": round(mx.get_peak_memory() / 1e9, 3),

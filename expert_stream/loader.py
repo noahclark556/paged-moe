@@ -38,9 +38,18 @@ import mlx.core as mx
 from mlx_lm.utils import load_model, load_tokenizer
 
 from . import config, kvmem
+from .chat_compat import install_deepseek_v32_chat_template
+
+# Any load() path (server, CLI, callers) needs the DeepSeek template shim.
+install_deepseek_v32_chat_template()
 from .cache import ExpertCache
 from .safetensors_index import read_headers
-from .streaming import expert_tensor_names, find_switch_glus, patch_model
+from .streaming import (
+    expert_tensor_names,
+    find_switch_glus,
+    max_expert_count,
+    patch_model,
+)
 
 # Reserved for KV cache, activations, and Metal scratch (on top of what the
 # RAM_FRACTION budget already leaves for macOS + apps). Expert reads bypass
@@ -55,6 +64,30 @@ _HEADROOM_BYTES = 6 << 30
 # Prefill needs far more, which is why it hands the slab back rather than
 # budgeting for it here (see ExpertCache.enter_prefill).
 _ACTIVATION_BYTES = 3 << 30
+
+
+def _dense_enabled() -> bool:
+    """Whether this build can stream a *dense* checkpoint's layers from disk.
+
+    Two gates, both required. The env var is the switch; the spec lookup is
+    because the dense package is a development-only part of the tree, so a
+    build without it must degrade to the ordinary "does not fit" error rather
+    than an ImportError.
+    """
+    import importlib.util
+    import os
+
+    if os.environ.get("EXPERT_STREAM_DENSE", "").strip().lower() not in (
+        "1",
+        "on",
+        "true",
+        "yes",
+    ):
+        return False
+    try:
+        return importlib.util.find_spec("expert_stream.dense") is not None
+    except (ImportError, ValueError):
+        return False
 
 
 def resolve_model_path(path_or_repo: str) -> Path:
@@ -89,11 +122,21 @@ def resolve_model_path(path_or_repo: str) -> Path:
 _applied_limits = {"budget": 0, "pool": 0}
 
 
-def _set_memory_limits(active_budget_bytes: int, pool_bytes: int = 2 << 30):
+def _set_memory_limits(
+    active_budget_bytes: int,
+    pool_bytes: int = 2 << 30,
+    extra_bytes: int | None = None,
+):
     """Cap Metal so recycled buffers can't silently eat the other half of RAM.
 
     active_budget_bytes ≈ backbone + expert cache. We allow a little overhead
     for KV/activations, but refuse to let the MLX buffer pool grow unbounded.
+
+    extra_bytes is the Metal ceiling on top of the live weights. MoE leaves
+    this at the flat 6 GB headroom (KV was already taken out of the expert
+    cache, and enter_prefill can still hand the slab back). Dense residency
+    cannot be handed back, so it passes its KV reserve + activation
+    allowance instead of that flat figure.
 
     pool_bytes bounds the recycled-buffer pool. It must cover roughly one
     decode token's expert churn: expert tensors are uniform sizes, so a freed
@@ -102,7 +145,8 @@ def _set_memory_limits(active_budget_bytes: int, pool_bytes: int = 2 << 30):
     zero-fill page faults for memory the process just released.
     """
     _applied_limits["budget"] += int(active_budget_bytes)
-    memory = _applied_limits["budget"] + _HEADROOM_BYTES
+    extra = _HEADROOM_BYTES if extra_bytes is None else int(extra_bytes)
+    memory = _applied_limits["budget"] + extra
     pool = max(_applied_limits["pool"], int(pool_bytes))
     _applied_limits["pool"] = pool
     try:
@@ -210,7 +254,14 @@ def load(
 
     if mode == "auto":
         fits = total_bytes + headroom <= budget
-        mode = "resident" if (fits or not glus) else "streamed"
+        if fits:
+            mode = "resident"
+        elif glus:
+            mode = "streamed"
+        else:
+            # A dense checkpoint over budget. "dense" pages its layer weights;
+            # without that module the resident branch raises the size error.
+            mode = "dense" if _dense_enabled() else "resident"
 
     info = {
         "model_path": str(model_path),
@@ -227,11 +278,33 @@ def load(
 
     cache = None
     ring = None
-    if mode == "streamed":
-        if not glus:
+    dense_plan = None
+    dense_extra = None
+    if mode == "dense":
+        if not _dense_enabled():
             raise ValueError(
-                f"{model_path} has no streamable MoE layers; a dense model "
-                f"this size ({info['total_gb']} GB) cannot run on this machine"
+                "mode='dense' needs EXPERT_STREAM_DENSE=1 and the expert_stream"
+                ".dense package (development build only)"
+            )
+        from . import dense
+
+        dense_plan = dense.plan(model, cfg, tensor_index, total_bytes, ram)
+        info.update(dense_plan.info)
+        cache = dense.attach(dense_plan, verbose=verbose)
+        _neutralize_wired_limit()
+        cache_bytes = dense_plan.store_bytes
+        pool_bytes = 2 << 30
+        dense_extra = dense_plan.reserve_bytes + dense_plan.activation_bytes
+    elif mode == "streamed":
+        if not glus:
+            hint = (
+                "use mode='dense' to page its layer weights"
+                if _dense_enabled()
+                else f"a dense model this size ({info['total_gb']} GB) cannot "
+                "run on this machine"
+            )
+            raise ValueError(
+                f"{model_path} has no streamable MoE layers; {hint}"
             )
         if cache_gb is not None:
             requested = cache_bytes = int(cache_gb * 1e9)
@@ -282,13 +355,23 @@ def load(
                 else config.clear_bytes_auto(cache_bytes)
             ),
         )
-        # When the expert mass dwarfs the cache, decode is disk-bound by
-        # construction and route prediction always pays; skip the governor's
-        # minutes-long probe (which runs half its windows without prediction
-        # at a measured ~30% penalty) and just turn it on.
+        # Route prediction is left to the governor even when the expert mass
+        # dwarfs the cache. This used to force it on there, reasoning that a
+        # disk-bound model can only gain from prefetching. Measured on GLM-4.7
+        # (189 GB of experts against a 14.5 GB cache, so squarely in the case
+        # the shortcut was written for) prediction *loses*, at both prompt
+        # lengths tried and with or without lookup decode:
+        #
+        #   162-tok prompt   5.97 -> 7.30 tok/s with prediction off
+        #   972-tok prompt   5.55 -> 7.48 tok/s with prediction off
+        #
+        # Predictor precision is only 0.31-0.43, so it spends 0.36-0.75 GB per
+        # token on reads nothing asks for - and once the drive is saturated
+        # (measured: tok/s x GB/token pins at ~5.8 GB/s) a wasted prefetch is
+        # bandwidth taken directly from a read something is waiting on. Being
+        # disk-bound is the reason prediction cannot pay here, not the reason it
+        # must. The governor measures instead of assuming, so let it.
         predict_mode = None
-        if config.PREDICT == "auto" and expert_bytes > 3 * cache_bytes:
-            predict_mode = "on"
         ring = patch_model(
             model,
             cache,
@@ -335,10 +418,17 @@ def load(
         cache_bytes = 0
         pool_bytes = 2 << 30
 
-    _set_memory_limits(
-        backbone_bytes + (cache_bytes if mode == "streamed" else total_bytes),
-        pool_bytes,
-    )
+    if mode == "dense":
+        # Everything the dense engine actually holds: embeddings and norms, the
+        # tensor groups left resident as ordinary modules, and the page stores.
+        active_bytes = (
+            dense_plan.other_bytes + dense_plan.native_bytes + dense_plan.store_bytes
+        )
+    else:
+        active_bytes = backbone_bytes + (
+            cache_bytes if mode == "streamed" else total_bytes
+        )
+    _set_memory_limits(active_bytes, pool_bytes, extra_bytes=dense_extra)
 
     # Materialize whatever is left in the tree: everything (resident) or
     # just the backbone (streamed - experts were dropped un-read above).
@@ -356,15 +446,45 @@ def load(
             info["slab_slots"] = cache.slab.slots
             info["cache_gb"] = round(cache.budget_bytes / 1e9, 2)
             info["staging_gb"] = round(cache.staging_bytes / 1e9, 2)
+            # Flow decode needs the slab (slot-addressed experts) plus the
+            # expert count, which is only known once layers have registered.
+            if config.FLOW and cache.enable_flow(max_expert_count(cache)):
+                info["flow"] = True
+                info["flow_topm"] = config.FLOW_TOPM or "router top-k"
 
-    if mode == "streamed":
+    if mode == "streamed" and config.LOOKUP:
+        info["lookup"] = True
+        info["lookup_tokens"] = int(config.LOOKUP_TOKENS)
+        # Opt-in, and both caveats are easy to forget: it needs a high accept
+        # rate to beat plain decode, and it is only output-identical at PRUNE=0.
+        if config.PRUNE:
+            print(
+                "[expert-stream] lookup decode is on with "
+                f"PRUNE={config.PRUNE}: a k-token verify pass prunes on "
+                "different mass than single-token steps, so output will not "
+                "match a PRUNE-only run",
+                flush=True,
+            )
+
+    if mode in ("streamed", "dense"):
         # What the prompt-cache store may hold - computed here because it is
         # whatever the slab did *not* take, and the slab's real size is only
         # known once it is allocated. mlx-lm never applies --prompt-cache-bytes
         # on the sequential path streamed models are pinned to, so this is the
         # only bound there is; without it the store grows until Metal fails.
-        committed = cache.slab.nbytes if cache.slab is not None else cache.budget_bytes
-        store_budget = budget - backbone_bytes - committed - _ACTIVATION_BYTES
+        if mode == "dense":
+            store_budget = (
+                budget
+                - dense_plan.other_bytes
+                - dense_plan.native_bytes
+                - dense_plan.store_bytes
+                - dense_plan.activation_bytes
+            )
+        else:
+            committed = (
+                cache.slab.nbytes if cache.slab is not None else cache.budget_bytes
+            )
+            store_budget = budget - backbone_bytes - committed - _ACTIVATION_BYTES
         # Never below one conversation at the served context: evicting the prefix
         # the next turn resumes from trades a Metal OOM for a full re-prefill,
         # which on GLM-4.7 is 95 s. An over-committed slab can make the

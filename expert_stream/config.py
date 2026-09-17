@@ -89,7 +89,7 @@ Env vars:
                                 add ONE prediction per layer at this distance,
                                 for source layers past FAR_FROM of the stack.
                                 Default 0 (off). The window above is uniform
-                                over depth; bench/router_matrix.py shows that
+                                over depth; measured router agreement shows that
                                 is wrong - agreement decays with source depth,
                                 not distance, so the early layers that justify
                                 a short window are not the deep ones that could
@@ -481,8 +481,8 @@ PREDICT_DEPTH: int = _env("EXPERT_STREAM_PREDICT_DEPTH", 3, int)
 # knobs: see PrefetchRing.__init__.
 PREDICT_LEAD: int = _env("EXPERT_STREAM_PREDICT_LEAD", 0, int)
 # One extra prediction per layer, aimed this many layers ahead, for source
-# layers past PREDICT_FAR_FROM of the stack. bench/router_matrix.py shows
-# router agreement decays with SOURCE DEPTH rather than distance: on
+# layers past PREDICT_FAR_FROM of the stack. Measured router agreement decays
+# with SOURCE DEPTH rather than distance: on
 # Qwen3-235B, precision among cache misses from layer 0 dies by distance 4
 # (0.28) while from layer 24 it holds 0.73 at distance 32, against a net-win
 # bar of 0.5. 0 (default) keeps the shipped uniform-window behaviour; try
@@ -793,6 +793,73 @@ KEEP_FREE: bool = bool(_env("EXPERT_STREAM_KEEP_FREE", 1, int))
 # subsequent tokens rather than being lost.
 WAIT_ABOVE: float = _env("EXPERT_STREAM_WAIT_ABOVE", 0.0, float)
 
+# Flow decode: one sync per token instead of one per MoE layer.
+#
+# The per-layer sync exists because expert->slot lives in a Python dict, so
+# `_run_slab` cannot build its gather indices until the router's choices have
+# reached the CPU. Flow decode keeps that mapping in a GPU-resident table
+# instead, and does selection with mx ops, so a whole token is one graph. On
+# GLM-4.7 the per-layer round trip is 89 blocking evals: syncfree_probe puts
+# the removable part at 15.5 ms/token, and on top of that every blocking miss
+# is on the critical path (~41 ms/token measured).
+#
+# What it costs: the CPU no longer learns the routing in time to read for it,
+# so a layer computes with the experts that are already resident and zeroes the
+# rest - the reads still get issued, one token late. That is the same trade
+# WAIT_ABOVE already makes, taken to its limit, so this is a *fidelity* knob and
+# stays off by default. Selection is "the FLOW_TOPM highest-weight resident
+# experts of the router's top-k": every expert computed is one the router
+# picked, so this never substitutes.
+#
+# Needs the slab (uniform experts) and a recognized router; anything else falls
+# back to the per-layer path automatically.
+FLOW: bool = bool(_env("EXPERT_STREAM_FLOW", 0, int))
+# Experts computed per layer per token. Fixed, because a static shape is what
+# lets the gather be built without a sync. 0 = the router's own top-k (no
+# reduction, so the only saving is the sync itself). Below top-k it also cuts
+# GPU work: on GLM-4.7 each expert is ~13 MB of the ~14 GB a token reads.
+FLOW_TOPM: int = _env("EXPERT_STREAM_FLOW_TOPM", 0, int)
+# Decode tokens after each prefill that run the ordinary per-layer path before
+# flow takes over. Prefill installs loose arrays, not slots, so the slab is
+# empty when decode starts: a flow token there would find nothing resident and
+# compute almost nothing. These tokens block on their reads the usual way and
+# leave the slab holding exactly the working set the next token wants.
+FLOW_WARMUP: int = _env("EXPERT_STREAM_FLOW_WARMUP", 2, int)
+
+# N-gram self-draft decoding (expert_stream/lookup_decode.py).
+#
+# Off by default because it loses on agent traffic. Keep it that way unless a
+# measurement on the workload in question says otherwise.
+#
+# The idea: decode is disk-bandwidth-bound, so buy tokens per byte instead of
+# bytes per second by verifying k drafted tokens in one pass. A pass runs k+1
+# positions and pays all of their expert reads, so it wins only when most of
+# those positions turn into kept tokens.
+#
+# Accept rate is the whole ballgame, and it depends on the text, not the model.
+# An n-gram drafter can only copy something the context already contains:
+#   short self-repeating prompt   accept 0.55   5.44 -> 8.05 tok/s
+#   12k varied agent context      accept 0.09   2.77 -> 2.03 tok/s
+# The first is what this was originally tuned on, and it is not the workload.
+#
+# Not quality-neutral alongside PRUNE, either. Bit-identity holds at PRUNE=0
+# (tests/test_lookup.py), but prune drops experts per pass, and a k-token pass
+# prunes on different mass than k single-token steps, so the two paths diverge.
+# Every model in the catalog ships PRUNE > 0.
+#
+# The drafter itself is cheap and correct: an n-gram scan, no weights, no RAM
+# from the slab, ~3.6 ms/step at 13k context, and rejected drafts are trimmed
+# out of the KV cache. It is the read amplification that sinks it.
+LOOKUP: bool = bool(_env("EXPERT_STREAM_LOOKUP", 0, int))
+# Draft tokens per verify pass. The pass runs k+1 positions, which must stay
+# under streaming._DECODE_MAX_TOKENS to keep the streamed decode path. Higher k
+# shares more reads but wastes more work when the draft is wrong.
+LOOKUP_TOKENS: int = _env("EXPERT_STREAM_LOOKUP_TOKENS", 4, int)
+# Suffix lengths the drafter will match on, longest first. Longer is a more
+# specific context and a better bet; too short and it copies noise.
+LOOKUP_NGRAM_MAX: int = _env("EXPERT_STREAM_LOOKUP_NGRAM_MAX", 8, int)
+LOOKUP_NGRAM_MIN: int = _env("EXPERT_STREAM_LOOKUP_NGRAM_MIN", 3, int)
+
 # Rescale the surviving experts' contributions by 1/(their mixture mass) when
 # PRUNE, TOP_K or TOP_P drops a slot.
 #
@@ -903,12 +970,21 @@ GROUP_BYTES: int = _env("EXPERT_STREAM_GROUP_MB", 1024, int) * (1 << 20)
 PREFILL_RUN_BYTES: int = _env("EXPERT_STREAM_PREFILL_RUN_MB", 512, int) * (1 << 20)
 PREFILL_SLICE_BYTES: int = _env("EXPERT_STREAM_PREFILL_SLICE_MB", 8, int) * (1 << 20)
 
-# Query rows per attention call during fused prefill. Performance target;
-# Metal's score-matrix bound still applies on top (attention_sub_chunk takes
-# the min). Smaller C = less score work on a materialized causal mask
-# (overhead ~C/T). Floor is GEMM efficiency (~1k rows). Safe on DSA: the
-# indexer applies the causal mask before argpartition, so C changes cost
-# only, not which keys a query attends.
+# Query rows per attention call during fused prefill. This is a *performance*
+# target, not a safety bound - the Metal score-matrix bound still applies on top
+# (adaptive_prefill.attention_sub_chunk takes the min).
+#
+# Smaller is strictly less work. Prefilling T tokens in sub-chunks of C computes
+# ~T^2/2 + T*C/2 score pairs against a causal need of T^2/2, because a
+# materialized mask gives the kernel no way to skip the sub-chunk's own upper
+# triangle. The overhead fraction is therefore C/T: on a 14k prompt, C=9398 (the
+# old Metal-max sizing) computes 56% more score pairs than necessary, C=2048
+# computes 15%, C=1024 computes 7%. The floor is GEMM efficiency - below ~1k
+# query rows the score matmuls get too skinny to fill the GPU.
+#
+# Safe on DSA: the indexer applies the causal mask *before* argpartition, so a
+# query attends to the top-`index_topk` of its causally valid keys no matter
+# which sub-chunk it lands in. C changes cost, not the attended key set.
 ATTN_SUB_CHUNK: int = _env("EXPERT_STREAM_ATTN_SUB_CHUNK", 2048, int)
 
 # Residency budget while a large prefill chunk runs (see ExpertCache.enter_prefill).
@@ -990,7 +1066,20 @@ PREFILL_SHRINK_TOKENS: int = _env("EXPERT_STREAM_PREFILL_SHRINK_TOKENS", 8192, i
 
 
 def total_ram_bytes() -> int:
-    """Physical RAM (macOS + Linux)."""
+    """Physical RAM (macOS + Linux).
+
+    ``EXPERT_STREAM_SIMULATE_RAM_GB`` (device sandbox) overrides the sysctl so
+    auto cache math can pretend this is a smaller Mac. Metal still uses the
+    real GPU; only the budget envelope changes.
+    """
+    fake = os.environ.get("EXPERT_STREAM_SIMULATE_RAM_GB", "").strip()
+    if fake:
+        try:
+            gb = float(fake)
+            if gb > 0:
+                return int(gb * (1 << 30))
+        except ValueError:
+            pass
     try:
         return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES")
     except (ValueError, OSError):

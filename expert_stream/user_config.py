@@ -147,13 +147,8 @@ def sample_config_text(models_dir: str | Path | None = None) -> str:
 #                              Freeze sidecar weights after this many good hits.
 #                              "0" = keep learning (recommended).
 #
-# EXPERT_STREAM_SIDECAR_HEAD_*  "1"/"0" toggles for sidecar features:
-#   HEAD_WRAP      next-token expert prefetch (main speed win)
-#   HEAD_PREFILL   help during long prefills
-#   HEAD_RESIDENCY keep hot experts from being evicted
-#   HEAD_PRUNE     learn which prune decisions were safe
-# =============================================================================
-
+#
+#
 # Only stream models listed under models: (recommended).
 enable_all: false
 
@@ -173,7 +168,7 @@ models:
       EXPERT_STREAM_SIDECAR: "1"
       EXPERT_STREAM_SIDECAR_LOCK_HITS: "0"
       EXPERT_STREAM_SIDECAR_HEAD_WRAP: "1"
-      EXPERT_STREAM_SIDECAR_HEAD_PREFILL: "1"
+      EXPERT_STREAM_SIDECAR_HEAD_PREFILL: "0"
       EXPERT_STREAM_SIDECAR_HEAD_RESIDENCY: "1"
       EXPERT_STREAM_SIDECAR_HEAD_PRUNE: "1"
 
@@ -187,7 +182,7 @@ models:
       EXPERT_STREAM_SIDECAR_MIN_PRECISION: "0.22"
       EXPERT_STREAM_SIDECAR_LOCK_HITS: "0"
       EXPERT_STREAM_SIDECAR_HEAD_WRAP: "1"
-      EXPERT_STREAM_SIDECAR_HEAD_PREFILL: "1"
+      EXPERT_STREAM_SIDECAR_HEAD_PREFILL: "0"
       EXPERT_STREAM_SIDECAR_HEAD_RESIDENCY: "1"
       EXPERT_STREAM_SIDECAR_HEAD_PRUNE: "1"
 
@@ -202,7 +197,7 @@ models:
       EXPERT_STREAM_SIDECAR_MIN_PRECISION: "0.22"
       EXPERT_STREAM_SIDECAR_LOCK_HITS: "0"
       EXPERT_STREAM_SIDECAR_HEAD_WRAP: "1"
-      EXPERT_STREAM_SIDECAR_HEAD_PREFILL: "1"
+      EXPERT_STREAM_SIDECAR_HEAD_PREFILL: "0"
       EXPERT_STREAM_SIDECAR_HEAD_RESIDENCY: "1"
       EXPERT_STREAM_SIDECAR_HEAD_PRUNE: "1"
 
@@ -216,7 +211,7 @@ models:
       EXPERT_STREAM_SIDECAR_MIN_PRECISION: "0.22"
       EXPERT_STREAM_SIDECAR_LOCK_HITS: "0"
       EXPERT_STREAM_SIDECAR_HEAD_WRAP: "1"
-      EXPERT_STREAM_SIDECAR_HEAD_PREFILL: "1"
+      EXPERT_STREAM_SIDECAR_HEAD_PREFILL: "0"
       EXPERT_STREAM_SIDECAR_HEAD_RESIDENCY: "1"
       EXPERT_STREAM_SIDECAR_HEAD_PRUNE: "1"
 
@@ -237,7 +232,7 @@ models:
       EXPERT_STREAM_SIDECAR_MIN_PRECISION: "0.22"
       EXPERT_STREAM_SIDECAR_LOCK_HITS: "0"
       EXPERT_STREAM_SIDECAR_HEAD_WRAP: "1"
-      EXPERT_STREAM_SIDECAR_HEAD_PREFILL: "1"
+      EXPERT_STREAM_SIDECAR_HEAD_PREFILL: "0"
       EXPERT_STREAM_SIDECAR_HEAD_RESIDENCY: "1"
       EXPERT_STREAM_SIDECAR_HEAD_PRUNE: "1"
 """

@@ -320,7 +320,7 @@ class ExpertSidecar:
 
         ``_gap_ema`` is wall time between end_token calls (model+disk); ``_us_ema``
         is time spent inside the sidecar. Together they are one decode token.
-        Gaps >=5s are ignored so turn boundaries do not crush the EMA.
+        Gaps ≥5s are ignored so turn boundaries do not crush the EMA.
         """
         total = self._gap_ema + self._us_ema
         if total <= 0.0:

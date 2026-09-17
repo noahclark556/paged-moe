@@ -2,8 +2,8 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """The depth-dependent prediction schedule (PrefetchRing._distances).
 
-bench/router_matrix.py measured router agreement over every (source, target)
-layer pair and found the decay tracks SOURCE DEPTH, not distance: on
+Measured router agreement over every (source, target) layer pair shows the
+decay tracks SOURCE DEPTH, not distance: on
 Qwen3-235B, precision among cache misses from layer 0 is gone by distance 4
 (0.28), while from layer 24 it is still 0.73 at distance 32. PREDICT_FAR_LEAD
 turns that into one extra long-range prediction per deep layer.
