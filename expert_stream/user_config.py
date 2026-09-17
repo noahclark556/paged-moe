@@ -74,7 +74,7 @@ def _models_dir(models_dir: str | Path | None = None) -> Path:
 
 
 def sample_config_text(models_dir: str | Path | None = None) -> str:
-    """Shipped defaults for the four tested MoE checkpoints.
+    """Shipped defaults for the tested MoE checkpoints.
 
     Paths are absolute under the chosen models directory (default
     ``~/mlx-models/``). Engine knobs match the measured profiles from live use.
@@ -84,6 +84,7 @@ def sample_config_text(models_dir: str | Path | None = None) -> str:
     b235_path = root / "qwen3-235-4bit"
     glm47_path = root / "glm-47-4bit"
     c480_path = root / "qwen3-coder-480-4bit"
+    ds32_path = root / "deepseek-v32-4bit"
     return f"""\
 # =============================================================================
 # PagedMoE config  (~/paged-moe-config.yaml)
@@ -211,6 +212,27 @@ models:
     env:
       EXPERT_STREAM_PRUNE: "0.7"
       EXPERT_STREAM_WAIT_ABOVE: "0.2"
+      EXPERT_STREAM_SIDECAR: "1"
+      EXPERT_STREAM_SIDECAR_MIN_PRECISION: "0.22"
+      EXPERT_STREAM_SIDECAR_LOCK_HITS: "0"
+      EXPERT_STREAM_SIDECAR_HEAD_WRAP: "1"
+      EXPERT_STREAM_SIDECAR_HEAD_PREFILL: "1"
+      EXPERT_STREAM_SIDECAR_HEAD_RESIDENCY: "1"
+      EXPERT_STREAM_SIDECAR_HEAD_PRUNE: "1"
+
+  # --- DeepSeek-V3.2 4-bit ---------------------------------------------------
+  # ~378 GB MoE. Must be listed (or PAGED_MOE=1) - passthrough OOMs hard.
+  # DSA prefill: fused + adaptive so pe_scores fit Metal while MoE still runs
+  # once per step. Prune/wait match the MoEGate recipe used for GLM-4.7.
+  - path: {ds32_path}
+    env:
+      EXPERT_STREAM_PRUNE: "0.8"
+      EXPERT_STREAM_WAIT_ABOVE: "0.2"
+      EXPERT_STREAM_FUSED_PREFILL: "1"
+      EXPERT_STREAM_ADAPTIVE_PREFILL: "1"
+      EXPERT_STREAM_ADAPTIVE_PREFILL_MODE: "dsa"
+      EXPERT_STREAM_PREFILL_CHUNK: "16384"
+      EXPERT_STREAM_ADAPTIVE_PREFILL_MAX: "16384"
       EXPERT_STREAM_SIDECAR: "1"
       EXPERT_STREAM_SIDECAR_MIN_PRECISION: "0.22"
       EXPERT_STREAM_SIDECAR_LOCK_HITS: "0"

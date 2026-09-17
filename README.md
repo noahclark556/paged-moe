@@ -1,6 +1,7 @@
 # PagedMoE
 
-Local agents on MoE models that do not fit in RAM.
+Run large Mixture-of-Experts (MoE) LLMs locally on Apple Silicon
+even when the model is larger than your Mac's unified memory.
 
 Page experts from the SSD so 100 GB+ models actually load on 48 GB unified
 memory. Route prediction runs the next layers' real routers early and
@@ -23,12 +24,29 @@ Measured on an Apple M5 Pro, **48 GB**. Without this, none of these load.
 With it, they run full agent loops - tools, multi-turn, long prompts - at
 usable speed; experts stay on disk until the router asks.
 
-| Model | Full resident (no PagedMoE) | Peak RAM here | Decode |
-| --- | ---: | ---: | ---: |
-| **Qwen3-Coder-Next** 6-bit | ~65 GB (OOM) | ~30 GB | ~29 tok/s |
-| **Qwen3-235B-A22B** 4-bit | ~132 GB (OOM) | ~33 GB | ~8 tok/s |
-| **GLM-4.7** 4-bit | ~199 GB (OOM) | ~34 GB | ~2 tok/s |
-| **Qwen3-Coder-480B** 4-bit | ~270 GB (OOM) | ~34 GB | ~2 tok/s |
+| Model | Full resident | Peak RAM | Prefill | Decode |
+| --- | ---: | ---: | ---: | ---: |
+| **Qwen3-Coder-Next** 6-bit | ~65 GB (OOM) | ~30 GB | ~250 tok/s | ~22 tok/s |
+| **Qwen3-235B-A22B** 4-bit | ~132 GB (OOM) | ~33 GB | ~115 tok/s | ~7 tok/s |
+| **GLM-4.7** 4-bit | ~199 GB (OOM) | ~34 GB | ~73 tok/s | ~6 tok/s |
+| **Qwen3-Coder-480B** 4-bit | ~270 GB (OOM) | ~34 GB | ~80 tok/s | ~5 tok/s |
+| **DeepSeek-V3.2** 4-bit | ~378 GB (OOM) | ~33 GB | ~45 tok/s | ~6 tok/s |
+
+Prefill is a cold ~2k-token prompt; decode is wall-clock after warmup on the
+same KV. Coder-Next and DeepSeek are full ladder runs on this machine.
+The middle three are estimated under the same prune / wait / sidecar recipe
+in [Tuning](#tuning-via-yaml-env):
+
+- **235B** - ladder run at prune 0.5 measured **6.67 tok/s** (steady, 128 tok
+  warmup); shipped recipe (prune 0.7 + wait 0.2 + sidecar) expected ~7 tok/s
+- **GLM-4.7** - shipped recipe measured **6.4 tok/s** vs 1.8 tok/s full-mixture
+  on the same A/B (96% token agree)
+- **480B** - scaled from the fresh DeepSeek ladder result (378 GB, prune 0.8 ->
+  ~6 tok/s); 480B at 270 GB with prune 0.7 lands ~5 tok/s. Prior bench used no
+  recipe and a short window (no warmup), giving ~1 tok/s - not a fair comparison
+
+Defaults leave prune off and are slower on the disk-bound models. Every knob
+is in `expert_stream/config.py`.
 
 The RAM gap looks wrong until you remember MoEs are sparse: most experts are
 idle on any given token, so you do not need the whole library in RAM.
@@ -199,6 +217,8 @@ M5 Pro).
 | **Qwen3-Coder-Next** (6-bit) | ~65 GB (will not load) | ~30 GB peak |
 | **Qwen3-235B-A22B** (4-bit) | ~132 GB (will not load) | ~33 GB peak |
 | **GLM-4.7** (4-bit) | ~199 GB (will not load) | ~34 GB peak |
+| **Qwen3-Coder-480B** (4-bit) | ~270 GB (will not load) | ~34 GB peak |
+| **DeepSeek-V3.2** (4-bit) | ~378 GB (will not load) | ~36 GB peak |
 
 Only the always-on backbone stays in RAM. Routed experts live on disk until
 needed. MoE size is mostly experts that almost never fire on a given token.
@@ -339,6 +359,28 @@ process environment). Common ones:
 Full catalog lives in comments at the top of `expert_stream/config.py`.
 Wrap is on when the sidecar is; prefill / residency / prune heads stay off
 unless you turn them on.
+
+Chart recipes (optional - not the package defaults). Drop under a model's
+`env:` in `~/paged-moe-config.yaml`:
+
+```yaml
+# DeepSeek-V3.2 / GLM-4.7 class (MoEGate) - matches the ~4 tok/s DeepSeek row
+env:
+  EXPERT_STREAM_PRUNE: "0.8"
+  EXPERT_STREAM_WAIT_ABOVE: "0.2"
+  EXPERT_STREAM_SIDECAR: "1"
+  EXPERT_STREAM_ADAPTIVE_PREFILL: "1"
+
+# Qwen3-235B / Qwen3-Coder-480B - same idea, slightly softer prune
+env:
+  EXPERT_STREAM_PRUNE: "0.7"
+  EXPERT_STREAM_WAIT_ABOVE: "0.2"
+  EXPERT_STREAM_SIDECAR: "1"
+  EXPERT_STREAM_ADAPTIVE_PREFILL: "1"
+```
+
+`PRUNE` / `WAIT_ABOVE` trade a bit of fidelity for disk reads skipped. Leave
+them unset for bit-identical decode (slower on the big MoEs).
 
 ### CLI cheat sheet
 
