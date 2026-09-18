@@ -8,6 +8,20 @@ Format loosely follows Keep a Changelog. Versioning aims for SemVer.
 
 <!-- Nothing yet. -->
 
+## [0.2.5] - 2026-09-17
+
+### Added
+
+- Kimi-K2-Instruct support: sample yaml entry, server `trust_remote_code` by
+  default, transformers-5 tokenizer shim, and the `kimi_k2` tool parser when
+  the chat template uses `tool_declare`
+- Plain MLA (`kimi_k2` / `deepseek_v3`) keeps fp16 KV - mlx-lm's 8-bit KV
+  cache breaks that attention path after the first decode token
+
+### Changed
+
+- Install sample config lists Kimi alongside the other ladder checkpoints
+
 ## [0.2.4] - 2026-09-17
 
 ### Added

@@ -40,8 +40,25 @@ from mlx_lm.utils import load_model, load_tokenizer
 from . import config, kvmem
 from .chat_compat import install_deepseek_v32_chat_template
 
-# Any load() path (server, CLI, callers) needs the DeepSeek template shim.
+# Any load() path (server, CLI, benches) needs the DeepSeek template shim.
 install_deepseek_v32_chat_template()
+
+
+def _shim_bytes_to_unicode() -> None:
+    """Transformers 5 moved bytes_to_unicode off gpt2; Kimi remote code still imports it."""
+    try:
+        from transformers.models.gpt2 import tokenization_gpt2 as gpt2_tok
+
+        if hasattr(gpt2_tok, "bytes_to_unicode"):
+            return
+        from transformers.convert_slow_tokenizer import bytes_to_unicode
+
+        gpt2_tok.bytes_to_unicode = bytes_to_unicode
+    except Exception:
+        pass
+
+
+_shim_bytes_to_unicode()
 from .cache import ExpertCache
 from .safetensors_index import read_headers
 from .streaming import (
@@ -367,7 +384,7 @@ def load(
         #
         # Predictor precision is only 0.31-0.43, so it spends 0.36-0.75 GB per
         # token on reads nothing asks for - and once the drive is saturated
-        # (measured: tok/s x GB/token pins at ~5.8 GB/s) a wasted prefetch is
+        # (notes.md: tok/s x GB/token pins at ~5.8 GB/s) a wasted prefetch is
         # bandwidth taken directly from a read something is waiting on. Being
         # disk-bound is the reason prediction cannot pay here, not the reason it
         # must. The governor measures instead of assuming, so let it.
@@ -502,9 +519,15 @@ def load(
         model = load_adapters(model, adapter_path)
         model.eval()
 
+    # Match stock mlx-lm sharded_load: custom-code repos (Kimi tiktoken, etc.)
+    # need this. Server passes trust_remote_code=None unless --trust-remote-code
+    # is set; treat None as True so local checkpoints with tokenization_*.py load.
+    tok_cfg = dict(tokenizer_config or {})
+    if tok_cfg.get("trust_remote_code") is None:
+        tok_cfg["trust_remote_code"] = True
     tokenizer = load_tokenizer(
         model_path,
-        tokenizer_config or {},
+        tok_cfg,
         eos_token_ids=cfg.get("eos_token_id", None),
     )
 

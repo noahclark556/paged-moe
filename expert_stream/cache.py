@@ -88,8 +88,9 @@ class _SlotLatch:
 
     A Future per component shipped first and was too expensive: nine
     components x ~250 misses/token is ~2300 Futures, each with a work item,
-    queue put, and lock. Profiling counted ~10700 lock acquisitions/token;
-    main-thread Python can cost up to 74% of read bandwidth.
+    queue put, and lock. bench/mainthread_profile.py counted ~10700 lock
+    acquisitions/token; bench/gil_probe.py shows main-thread python costing
+    up to 74% of read bandwidth.
 
     Nine reads share one counter; the single Future is the one `_inflight` /
     `add_done_callback` already need. First exception wins; later components
@@ -142,7 +143,7 @@ class _ReadPool:
         self.threads = max(1, int(threads))
         # Per-worker busy flag around the pread. An observer samples these
         # to tell "drive saturated" from "drive idle waiting on python"
-        # Only worker i writes busy[i], so no lock.
+        # (bench/drive_idle.py). Only worker i writes busy[i], so no lock.
         self.busy = bytearray(self.threads)
         for i in range(self.threads):
             threading.Thread(
@@ -171,8 +172,8 @@ class _ReadPool:
         self._q.put((fd, offset, mv, latch))
 
     def shutdown(self) -> None:
-        """Stop the workers. Unused in production (one process per model), but
-        tests that build caches in a loop need it to avoid leaks."""
+        """Stop the workers. Unused in production (`ga` owns one process per
+        model), but tests that build caches in a loop need it to avoid leaks."""
         for _ in range(self.threads):
             self._q.put(None)
 
@@ -247,10 +248,15 @@ def _release_raw(pool: BufferPool, raw: dict) -> None:
 def _materialize(raw: dict) -> dict:
     """numpy -> mx. MUST run on the MLX/GPU thread (usually main).
 
-    The host copy shows up as a large fraction of incremental prefill wall
-    time in the accounting, but skipping it does not change total prefill
-    time: the same bytes still have to land in a contiguous GPU-usable array,
-    and MLX just does that copy lazily at eval under compute instead.
+    This copy looks like the obvious thing to remove - it is ~40% of an
+    incremental prefill's wall time (`bench/prefill_cost.py`), and reading
+    straight into MLX-backed buffers the way `slab.py` does makes it disappear
+    from the accounting entirely (16.7s -> 0.2s, measured, byte-identical).
+
+    It buys nothing. Total prefill time did not move (41.4s -> 42.2s): the bytes
+    still have to reach a contiguous GPU-usable array, so MLX just does the same
+    copy lazily at eval and it reappears under compute. Don't re-attempt this
+    without a plan for the underlying data movement, not its accounting.
     """
     if "__slot__" in raw:
         # Slab read: the bytes were pread straight into their final slot in

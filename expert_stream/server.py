@@ -118,7 +118,7 @@ def _json_tool_body_candidates(text: str) -> list[str]:
 
     Qwen2.5's shipped chat template prints the example as
     `{{"name": ..., "arguments": ...}}`. json.loads then fails at column 2
-    (`Expecting property name`) and the server drops the call, so the caller sees an
+    (`Expecting property name`) and the server drops the call, so ga sees an
     empty turn. Strip that extra brace pair; also try the outermost JSON
     object if the model wrapped it in junk.
     """
@@ -183,7 +183,7 @@ def _salvage_tool_call(text: str) -> dict | None:
     """Pull name (+ arguments when possible) out of broken tool JSON.
 
     mlx-lm's tool state machine never puts the raw markup into `content`, so a
-    failed parse is an empty turn for the caller. Returning a name with best-effort
+    failed parse is an empty turn for ga. Returning a name with best-effort
     args is better than dropping the call.
     """
     s = (text or "").strip()
@@ -308,6 +308,68 @@ def _install_deepseek_tool_parser(tokenizer) -> None:
     )
 
 
+def _looks_like_kimi_tools(tokenizer) -> bool:
+    """Kimi chat templates declare tools via tool_declare; response markers may
+    be absent from the jinja, so mlx-lm's template heuristic never attaches
+    kimi_k2."""
+    ct = getattr(tokenizer, "chat_template", None) or ""
+    if not isinstance(ct, str):
+        ct = str(ct)
+    return "tool_declare" in ct or "<|tool_calls_section_begin|>" in ct
+
+
+def _install_kimi_tool_parser(tokenizer) -> None:
+    if getattr(tokenizer, "has_tool_calling", False):
+        return
+    if not _looks_like_kimi_tools(tokenizer):
+        return
+    try:
+        from mlx_lm.tool_parsers import kimi_k2 as _kimi
+    except ImportError as e:
+        print(f"[paged-moe] kimi_k2 tool parser unavailable: {e!r}", flush=True)
+        return
+    start = getattr(_kimi, "tool_call_start", None)
+    end = getattr(_kimi, "tool_call_end", None)
+    if not start or not end:
+        return
+    tokenizer._tool_parser = _kimi.parse_tool_call
+    tokenizer._tool_call_start = start
+    tokenizer._tool_call_end = end
+    try:
+        tokenizer._tool_call_start_tokens = tuple(
+            tokenizer.encode(start, add_special_tokens=False)
+        )
+        tokenizer._tool_call_end_tokens = tuple(
+            tokenizer.encode(end, add_special_tokens=False)
+        )
+    except Exception as e:
+        print(f"[paged-moe] kimi_k2 tool tokens skipped: {e!r}", flush=True)
+        return
+    print(
+        f"[paged-moe] kimi_k2: installed tool parser (start={start!r})",
+        flush=True,
+    )
+
+
+def _plain_mla_kv_quantize_unsafe(model) -> bool:
+    """Plain deepseek_v3 / kimi MLA does pe_scores on update_and_fetch output.
+
+    QuantizedKVCache returns quantized (pack, scale, bias) tuples there, so
+    ``k_pe.swapaxes`` crashes after the first decode token. deepseek_v32 uses
+    CacheList via make_cache and is fine. MLA KV is already small; stay fp16.
+    """
+    if callable(getattr(model, "make_cache", None)):
+        return False
+    mt = getattr(getattr(model, "args", None), "model_type", None)
+    if mt in ("deepseek_v3", "kimi_k2", "joyai_llm_flash"):
+        return True
+    layers = getattr(model, "layers", None) or []
+    if not layers:
+        return False
+    attn = getattr(layers[0], "self_attn", None)
+    return type(attn).__name__ == "DeepseekV3Attention"
+
+
 def _clamp_prefill_step(provider, model) -> None:
     """Bound --prefill-step-size to what this model can actually run.
 
@@ -424,6 +486,8 @@ def _install_adaptive_prefill_generate() -> None:
         # wrapper even when adaptive prefill has nothing to contribute.
         # Dense multi-token verify is a separate switch (dense.lookup); MoE
         # LOOKUP stays alone so agent traffic on streamed MoE is unchanged.
+        if kv_bits is not None and _plain_mla_kv_quantize_unsafe(model):
+            kv_bits = None
         if (
             not adaptive_prefill.enabled()
             and not config.LOOKUP
@@ -589,6 +653,8 @@ def _install_adaptive_prefill_generate() -> None:
         kv_group_size: int = 64,
         quantized_kv_start: int = 0,
     ):
+        if kv_bits is not None and _plain_mla_kv_quantize_unsafe(model):
+            kv_bits = None
         if not adaptive_prefill.enabled():
             yield from _orig_sgs(
                 prompt,
@@ -1185,9 +1251,10 @@ def _snapshot_user_segment(model, kwargs) -> None:
 def install_patches(model=None):
     """Apply every mlx-lm patch a streamed model needs, and return nothing.
 
-    Split out of `main()` so callers can replay the real serving path -
-    prompt-cache handover, KV conversion, snapshotting, the memory guards -
-    without duplicating setup.
+    Split out of `main()` so `bench/session_memory.py` can replay the real
+    serving path - prompt-cache handover, KV conversion, snapshotting, the
+    memory guards - instead of an approximation of it. A memory benchmark that
+    measures a different code path than production is worse than no benchmark.
 
     `model` short-circuits the ModelProvider hook for callers that loaded the
     model themselves.
@@ -1211,6 +1278,9 @@ def install_patches(model=None):
         mt = getattr(getattr(model, "args", None), "model_type", None)
         if mt == "deepseek_v32":
             _install_deepseek_tool_parser(self.tokenizer)
+        else:
+            # No-op unless the chat template looks like Kimi (tool_declare).
+            _install_kimi_tool_parser(self.tokenizer)
         _install_json_tools_unwrap(self.tokenizer)
         # Idempotent: the PagedMoE loader already did this, but a model that
         # arrived through mlx-lm's own loader still needs it.
@@ -1283,31 +1353,43 @@ def install_patches(model=None):
 
     def _stream_generate(model, *args, **kwargs):
         if getattr(model, "_expert_stream_cache", None) is not None:
-            kwargs.setdefault("kv_bits", config.KV_BITS)
-            kwargs.setdefault("kv_group_size", config.KV_GROUP_SIZE)
-            # Quantize only once the prompt is in: a quantized KV cache drops
-            # attention onto mlx-lm's Python fallback, which materializes the
-            # whole [heads, chunk, keys] score matrix. That is fine for decode
-            # (one query row) and fatal for prefill - a 32k chunk against a 64k
-            # context asks Metal for ~68 GB against a ~28 GB max buffer size,
-            # which aborts the process. Prefill therefore stays on the fused
-            # causal kernel, and decode still gets the smaller cache.
-            # kwargs["prompt"] is only the uncached remainder, so the threshold
-            # has to be the whole context length.
-            prompt = kwargs.get("prompt")
-            ctx_len = max(
-                len(prompt) if prompt is not None else 0,
-                len(getattr(_req_ctx, "tokens", None) or ()),
-            )
-            if ctx_len:
-                # Below KV_FP16_CTX the cache stays fp16: quantized-KV
-                # attention adds per-layer graph ops whose encode cost lands
-                # on every one of the model's per-layer syncs (+8% decode on
-                # Qwen3-235B at short context). Past the threshold it
-                # quantizes mid-decode, one-time, and memory wins again.
-                kwargs.setdefault(
-                    "quantized_kv_start", max(ctx_len + 1, config.KV_FP16_CTX)
+            # Plain deepseek_v3 / Kimi MLA cannot consume QuantizedKVCache
+            # (pe_scores path). Keep fp16; MLA KV is already compact.
+            if _plain_mla_kv_quantize_unsafe(model):
+                kwargs["kv_bits"] = None
+                if not getattr(_stream_generate, "_mla_kv_noted", False):
+                    print(
+                        "[paged-moe] plain MLA (deepseek_v3/kimi): "
+                        "keeping fp16 KV (8-bit QuantizedKVCache breaks pe_scores)",
+                        flush=True,
+                    )
+                    _stream_generate._mla_kv_noted = True  # type: ignore[attr-defined]
+            else:
+                kwargs.setdefault("kv_bits", config.KV_BITS)
+                kwargs.setdefault("kv_group_size", config.KV_GROUP_SIZE)
+                # Quantize only once the prompt is in: a quantized KV cache drops
+                # attention onto mlx-lm's Python fallback, which materializes the
+                # whole [heads, chunk, keys] score matrix. That is fine for decode
+                # (one query row) and fatal for prefill - a 32k chunk against a 64k
+                # context asks Metal for ~68 GB against a ~28 GB max buffer size,
+                # which aborts the process. Prefill therefore stays on the fused
+                # causal kernel, and decode still gets the smaller cache.
+                # kwargs["prompt"] is only the uncached remainder, so the threshold
+                # has to be the whole context length.
+                prompt = kwargs.get("prompt")
+                ctx_len = max(
+                    len(prompt) if prompt is not None else 0,
+                    len(getattr(_req_ctx, "tokens", None) or ()),
                 )
+                if ctx_len:
+                    # Below KV_FP16_CTX the cache stays fp16: quantized-KV
+                    # attention adds per-layer graph ops whose encode cost lands
+                    # on every one of the model's per-layer syncs (+8% decode on
+                    # Qwen3-235B at short context). Past the threshold it
+                    # quantizes mid-decode, one-time, and memory wins again.
+                    kwargs.setdefault(
+                        "quantized_kv_start", max(ctx_len + 1, config.KV_FP16_CTX)
+                    )
         try:
             _snapshot_user_segment(model, kwargs)
         except Exception as e:  # snapshots are an optimization, never fatal
@@ -1368,6 +1450,10 @@ def main():
     for flag, value in _DEFAULT_ARGS.items():
         if flag not in sys.argv:
             sys.argv.extend([flag, value])
+
+    # store_true flag (no value). Needed for Kimi / Laguna custom tokenizers.
+    if "--trust-remote-code" not in sys.argv:
+        sys.argv.append("--trust-remote-code")
 
     install_patches()
     _mlx_server.main()

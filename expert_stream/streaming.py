@@ -293,7 +293,8 @@ class StreamedSwitchGLU(nn.Module):
         `lhs_indices` also avoids materializing the gathered activations.
 
         Bit-identical to `_run` on the same weights: same kernel, same
-        quantization parameters, just batched (verified in tests/test_stream.py).
+        quantization parameters, just batched (verified in tests/test_stream.py
+        and bench/slab_probe.py).
         """
         N, K = inds.shape
         flat = inds.reshape(-1)
@@ -1114,8 +1115,8 @@ class PrefetchRing:
         """Which layer distances to predict from `src`.
 
         The near band is the shipped behaviour. The far entry is the payoff
-        from measured router agreement over every (source, target) pair: the
-        decay is NOT a function of
+        from bench/router_matrix.py, which mapped router agreement over every
+        (source, target) pair and found the decay is NOT a function of
         distance but of SOURCE DEPTH: on Qwen3-235B, precision among cache
         misses from layer 0 is gone by distance 4 (0.28), while from layer 24
         it is still 0.73 at distance 32 - against a net-win bar of 0.5. Early

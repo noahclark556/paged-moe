@@ -12,8 +12,8 @@ which makes the decode path pay twice for the same bytes:
     (~65 ms/token on Qwen3-235B).
   * **Per-expert dispatch.** Separate arrays can only be fed to
     `quantized_matmul` one expert at a time: 3 calls x experts x layers is
-    ~1300 tiny kernels per token (~112 ms/token at 235B shapes, measured).
-    `mx.gather_qmm` does all of a layer's
+    ~1300 tiny kernels per token (~112 ms/token at 235B shapes, measured by
+    `bench/gather_qmm_probe.py`). `mx.gather_qmm` does all of a layer's
     experts in one call and is 5.3x faster - but it needs the experts stacked,
     and stacking them per call costs exactly what it saves.
 
@@ -33,8 +33,8 @@ The hack, and why it is safe
 ----------------------------
 Writing into MLX-owned memory through `np.asarray(slab)` is outside MLX's
 contract: it hands out a writeable view of unified memory and has no idea the
-contents changed. Three things make it work, all verified by tests (bit-identical
-`gather_qmm` output):
+contents changed. Three things make it work, all verified by
+`bench/slab_probe.py` (which asserts bit-identical `gather_qmm` output):
 
   1. Apple Silicon is unified memory, so a CPU write to the buffer is visible
      to the GPU with no transfer, and `pread` can target it directly.

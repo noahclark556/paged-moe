@@ -56,7 +56,7 @@ from . import config
 _store_budget: int = 0
 
 # Per-token KV cost of the loaded model, in bytes at the cache's decode-time
-# precision. Filled in by the loader, read by diagnostics and probes.
+# precision. Filled in by the loader, read by the bench/probe scripts.
 _kv_bytes_per_token: int = 0
 
 

@@ -17,7 +17,8 @@ off.
 
 **Jump:** [Quick start](#quick-start) | [Requirements](#requirements) |
 [Why it fits](#why-it-fits) | [Compatible models](#compatible-models) |
-[Extras](#extras) | [License](#license-dual) | [Citation](#citation) |
+[Extras](#extras) | [License](#license-dual) |
+[Commercial](#license-dual) | [Citation](#citation) |
 [Contact](#contact)
 
 Measured on an Apple M5 Pro, **48 GB**. Without this, none of these load.
@@ -31,11 +32,14 @@ usable speed; experts stay on disk until the router asks.
 | **GLM-4.7** 4-bit | ~199 GB (OOM) | ~34 GB | ~73 tok/s | ~6 tok/s |
 | **Qwen3-Coder-480B** 4-bit | ~270 GB (OOM) | ~34 GB | ~80 tok/s | ~5 tok/s |
 | **DeepSeek-V3.2** 4-bit | ~378 GB (OOM) | ~33 GB | ~45 tok/s | ~6 tok/s |
+| **Kimi-K2-Instruct** 4-bit | ~578 GB (OOM) | ~32 GB | ~27 tok/s | ~9 tok/s |
 
 Prefill is a cold ~2k-token prompt; decode is wall-clock after warmup on the
-same KV. Coder-Next and DeepSeek are full ladder runs on this machine.
+same KV. Coder-Next, DeepSeek, and Kimi are full ladder runs on this machine.
 The middle three are estimated under the same prune / wait / sidecar recipe
-in [Tuning](#tuning-via-yaml-env):
+in [Tuning](#tuning-via-yaml-env). Kimi is the top of the ladder: a 578 GB
+MoE that will not load resident, streamed under the same prune / wait /
+sidecar recipe as DeepSeek and GLM.
 
 - **235B** - ladder run at prune 0.5 measured **6.67 tok/s** (steady, 128 tok
   warmup); shipped recipe (prune 0.7 + wait 0.2 + sidecar) expected ~7 tok/s
@@ -44,6 +48,8 @@ in [Tuning](#tuning-via-yaml-env):
 - **480B** - scaled from the fresh DeepSeek ladder result (378 GB, prune 0.8 ->
   ~6 tok/s); 480B at 270 GB with prune 0.7 lands ~5 tok/s. Prior bench used no
   recipe and a short window (no warmup), giving ~1 tok/s - not a fair comparison
+- **Kimi-K2** - steady ladder at prune 0.8 measured **8.75 tok/s** decode
+  (peak **31.59 GB**; prefill ~27 tok/s). Largest SwitchGLU in the chart.
 
 Defaults leave prune off and are slower on the disk-bound models. Every knob
 is in `expert_stream/config.py`.
@@ -55,7 +61,7 @@ idle on any given token, so you do not need the whole library in RAM.
 the router picks them. LRU cache + route prediction (and an optional
 governed sidecar) keep agent turns warm.
 
-> **Status:** `v0.2.4` pre-release. The engine is in this repo and installs
+> **Status:** `v0.2.5` pre-release. The engine is in this repo and installs
 > from a clone. Not on PyPI yet. APIs may change before `v1.0`.
 >
 > **Naming:** product / repo / PyPI / CLI = **PagedMoE** (`paged-moe`).
@@ -97,8 +103,8 @@ paged-moe install --models-dir ~/mlx-models
 ### 2. Edit `~/paged-moe-config.yaml`
 
 This file is the control plane. Put real paths to the MoEs you want to
-stream. Install seeds four tested names under the models dir you chose
-(default `~/mlx-models/`) - fix the paths if yours differ.
+stream. Install seeds the tested checkpoint names under the models dir you
+chose (default `~/mlx-models/`) - fix the paths if yours differ.
 
 ```yaml
 enable_all: false
@@ -219,6 +225,7 @@ M5 Pro).
 | **GLM-4.7** (4-bit) | ~199 GB (will not load) | ~34 GB peak |
 | **Qwen3-Coder-480B** (4-bit) | ~270 GB (will not load) | ~34 GB peak |
 | **DeepSeek-V3.2** (4-bit) | ~378 GB (will not load) | ~36 GB peak |
+| **Kimi-K2-Instruct** (4-bit) | ~578 GB (will not load) | ~32 GB peak |
 
 Only the always-on backbone stays in RAM. Routed experts live on disk until
 needed. MoE size is mostly experts that almost never fire on a given token.
@@ -275,6 +282,7 @@ Anything mlx-lm loads whose MoE layers use `SwitchGLU`:
 | Qwen3-Next (hybrid attention) | Coder-Next, 30B-A3B |
 | GLM-4.x MoE | GLM-4.5-Air, GLM-4.7, etc. |
 | DeepSeek V2/V3/V3.2-style | Large checkpoints; decode is disk-bound on TB SSDs |
+| Kimi-K2 Instruct | ~578 GB class; listed in the sample yaml. Needs `tiktoken` |
 | Mixtral, OLMoE, others | If it is SwitchGLU, it should stream |
 
 No custom checkpoint format. Plain MLX safetensors.
@@ -402,12 +410,17 @@ them unset for bit-identical decode (slower on the big MoEs).
 | | |
 | --- | --- |
 | Open / research / AGPL use | [GNU Affero GPL v3](./LICENSE) |
-| Proprietary / closed product / SaaS without AGPL obligations | [Commercial license](./COMMERCIAL_LICENSE.md) |
+| Proprietary / closed product / SaaS / OEM | Commercial license - email `noah@qwertycode.org` |
 | Outside contributors | [CLA](./CLA.md) + [DCO](./DCO.md) (see [CONTRIBUTING.md](./CONTRIBUTING.md)) |
 
 Free under AGPL-3.0 for people and open projects. Companies shipping closed
-products (or AGPL-covered hosted services without source disclosure) should
-email for a commercial license. Details: [LICENSING.md](./LICENSING.md).
+products, hosted services, or appliances without AGPL source disclosure should
+email for a commercial license:
+
+**Noah Clark** - `noah@qwertycode.org`
+
+In-repo summaries: [LICENSING.md](./LICENSING.md),
+[COMMERCIAL_LICENSE.md](./COMMERCIAL_LICENSE.md).
 
 Copyright (c) 2026 Noah Clark.
 
@@ -429,5 +442,5 @@ If you use this in research or write about it, please cite the repository
 
 ## Contact
 
-- Licensing / commercial: `noah@qwertycode.org`
+- Commercial license / dual-license: `noah@qwertycode.org`
 - Bugs / features: GitHub issues

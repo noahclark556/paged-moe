@@ -85,6 +85,7 @@ def sample_config_text(models_dir: str | Path | None = None) -> str:
     glm47_path = root / "glm-47-4bit"
     c480_path = root / "qwen3-coder-480-4bit"
     ds32_path = root / "deepseek-v32-4bit"
+    kimi_path = root / "Kimi-K2-Instruct-4bit"
     return f"""\
 # =============================================================================
 # PagedMoE config  (~/paged-moe-config.yaml)
@@ -226,6 +227,27 @@ models:
       EXPERT_STREAM_FUSED_PREFILL: "1"
       EXPERT_STREAM_ADAPTIVE_PREFILL: "1"
       EXPERT_STREAM_ADAPTIVE_PREFILL_MODE: "dsa"
+      EXPERT_STREAM_PREFILL_CHUNK: "16384"
+      EXPERT_STREAM_ADAPTIVE_PREFILL_MAX: "16384"
+      EXPERT_STREAM_SIDECAR: "1"
+      EXPERT_STREAM_SIDECAR_MIN_PRECISION: "0.22"
+      EXPERT_STREAM_SIDECAR_LOCK_HITS: "0"
+      EXPERT_STREAM_SIDECAR_HEAD_WRAP: "1"
+      EXPERT_STREAM_SIDECAR_HEAD_PREFILL: "0"
+      EXPERT_STREAM_SIDECAR_HEAD_RESIDENCY: "1"
+      EXPERT_STREAM_SIDECAR_HEAD_PRUNE: "1"
+
+  # --- Kimi-K2-Instruct 4-bit ------------------------------------------------
+  # ~430-580 GB. mlx-lm remaps kimi_k2 -> deepseek_v3 (plain MLA, not DSA).
+  # Needs trust_remote_code (server default) + tiktoken. Keep prune/wait like
+  # GLM / DeepSeek. Engine forces fp16 KV for this arch (8-bit MLA pe_scores
+  # crash in mlx-lm). Disk-bound on 48 GB - keep the checkpoint internal.
+  - path: {kimi_path}
+    env:
+      EXPERT_STREAM_PRUNE: "0.8"
+      EXPERT_STREAM_WAIT_ABOVE: "0.2"
+      EXPERT_STREAM_FUSED_PREFILL: "1"
+      EXPERT_STREAM_ADAPTIVE_PREFILL: "1"
       EXPERT_STREAM_PREFILL_CHUNK: "16384"
       EXPERT_STREAM_ADAPTIVE_PREFILL_MAX: "16384"
       EXPERT_STREAM_SIDECAR: "1"

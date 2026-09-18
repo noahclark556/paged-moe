@@ -2,15 +2,15 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """N-gram self-draft decoding: more tokens per byte read.
 
-Decode on a big streamed checkpoint is disk-bandwidth-bound. Measured tok/s
-times GB/token comes out at the drive's ~5.8 GB/s no matter where PRUNE sits,
-and at PRUNE=0.8 the engine is already at ~91% of that bound. Reading bytes
-faster is not available and reading fewer bytes costs quality, so the only lever
-left is getting more tokens out of the same bytes.
+Decode on a big streamed checkpoint is disk-bandwidth-bound. The PRUNE sweep in
+notes.md pins it: tok/s times GB/token comes out at the drive's ~5.8 GB/s no
+matter where PRUNE sits, and at PRUNE=0.8 the engine is already at ~91% of that
+bound. Reading bytes faster is not available and reading fewer bytes costs
+quality, so the only lever left is getting more tokens out of the same bytes.
 
 Consecutive tokens route to heavily overlapping experts, so k tokens verified in
-one forward pass share their expert reads. On a GLM-4.7 decode trace, per-layer
-expert union per token:
+one forward pass share their expert reads. Measured on a GLM-4.7 decode trace
+(`bench/batch_union.py`), per-layer expert union per token:
 
     k=2  0.74x    k=4  0.54x    k=8  0.39x
 

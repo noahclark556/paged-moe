@@ -1,6 +1,6 @@
 # Copyright (C) 2026 Noah Clark
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""Chat-template shims so mlx-lm host kwargs match model-specific templates.
+"""Chat-template shims so mlx-lm / ga kwargs match model-specific templates.
 
 mlx-lm's TokenizerWrapper always injects ``enable_thinking``. DeepSeek-V3.2's
 Python template wants ``thinking_mode`` ("thinking"|"chat") instead, so without
@@ -9,7 +9,7 @@ this map every apply_chat_template dies with:
     encode_messages() got an unexpected keyword argument 'enable_thinking'
 
 Installed once at import from loader (and re-exported by the server) so CLI,
-server, and anything else that calls ``load()`` share the same path.
+server, and benches that call ``load()`` all get the same path.
 """
 
 from __future__ import annotations
@@ -39,7 +39,7 @@ def install_deepseek_v32_chat_template() -> None:
                 "thinking" if kwargs["enable_thinking"] else "chat"
             )
         kwargs.pop("enable_thinking", None)
-        # Host apps pass these for Jinja templates; this Python template does not.
+        # ga/mlx pass these for Jinja templates; this Python template does not.
         if "preserve_thinking" in kwargs:
             # drop_thinking=True is the template default (strip prior reasoning).
             kwargs.setdefault(
@@ -51,7 +51,7 @@ def install_deepseek_v32_chat_template() -> None:
 
         # Thinking mode asserts that every assistant turn after the last user
         # has reasoning_content or tool_calls. Host apps often park a bare ACK
-        # there (task-state acks). Give those a stub so the request does not 404.
+        # there (ga task_state). Give those a stub so the request does not 404.
         thinking_mode = kwargs.get("thinking_mode", "thinking")
         if thinking_mode == "thinking" and isinstance(messages, list):
             last_user = -1

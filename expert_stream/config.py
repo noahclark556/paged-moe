@@ -89,7 +89,7 @@ Env vars:
                                 add ONE prediction per layer at this distance,
                                 for source layers past FAR_FROM of the stack.
                                 Default 0 (off). The window above is uniform
-                                over depth; measured router agreement shows that
+                                over depth; bench/router_matrix.py shows that
                                 is wrong - agreement decays with source depth,
                                 not distance, so the early layers that justify
                                 a short window are not the deep ones that could
@@ -481,8 +481,8 @@ PREDICT_DEPTH: int = _env("EXPERT_STREAM_PREDICT_DEPTH", 3, int)
 # knobs: see PrefetchRing.__init__.
 PREDICT_LEAD: int = _env("EXPERT_STREAM_PREDICT_LEAD", 0, int)
 # One extra prediction per layer, aimed this many layers ahead, for source
-# layers past PREDICT_FAR_FROM of the stack. Measured router agreement decays
-# with SOURCE DEPTH rather than distance: on
+# layers past PREDICT_FAR_FROM of the stack. bench/router_matrix.py shows
+# router agreement decays with SOURCE DEPTH rather than distance: on
 # Qwen3-235B, precision among cache misses from layer 0 dies by distance 4
 # (0.28) while from layer 24 it holds 0.73 at distance 32, against a net-win
 # bar of 0.5. 0 (default) keeps the shipped uniform-window behaviour; try
