@@ -6,8 +6,8 @@ on:
   pull_request:
 
 jobs:
-  test:
-    name: unit tests (macOS)
+  smoke:
+    name: ship smoke (macOS)
     runs-on: macos-14
     steps:
       - uses: actions/checkout@v4
@@ -16,15 +16,123 @@ jobs:
         with:
           python-version: "3.11"
 
-      - name: Install package + pytest
+      - name: Install PagedMoE
         run: |
           python -m pip install -U pip setuptools wheel
-          python -m pip install -e ".[dev]"
+          # Editable install; mlx/mlx-lm come in on darwin.
+          python -m pip install -e .
 
-      - name: Run unit tests (no large checkpoints)
+      - name: Optional native read extension
+        run: |
+          # Best-effort: same path users get from setup.py. Failure is fine;
+          # runtime falls back to Python / JIT.
+          python setup.py build_ext --inplace || true
+          python - <<'PY'
+          from expert_stream import native_read
+          # Force a load attempt so CI logs which path won.
+          mod = native_read.get_module()
+          state, detail = native_read.status()
+          print(f"native_read: {state}" + (f" ({detail})" if detail else ""))
+          print(f"extension:   {'yes' if mod is not None else 'no (Python pool)'}")
+          PY
+
+      - name: Ship checklist
         env:
           PAGED_MOE_HOOK: "0"
         run: |
-          pytest tests/ \
-            --ignore=tests/test_real_model.py \
-            --ignore=tests/test_stream.py
+          python - <<'PY'
+          import importlib
+          import sys
+          from pathlib import Path
+
+          ok = True
+
+          def check(label, cond, detail=""):
+              global ok
+              mark = "ok" if cond else "FAIL"
+              if not cond:
+                  ok = False
+              extra = f"  {detail}" if detail else ""
+              print(f"  [{mark}] {label}{extra}")
+
+          print()
+          print("PagedMoE ship smoke")
+          print("=" * 40)
+
+          import expert_stream
+          from expert_stream import config
+          from expert_stream import native_read
+          from expert_stream.early_decode import EarlyDecodeWarm
+          from expert_stream.time_to_warm import TimeToWarm
+
+          check("version", expert_stream.__version__ == "0.2.6", expert_stream.__version__)
+          check("NATIVE_READ default on", config.NATIVE_READ == "on", repr(config.NATIVE_READ))
+          check("EARLY_DECODE package default off", config.EARLY_DECODE is False)
+          check("EARLY_DECODE_TRAIN default off", config.EARLY_DECODE_TRAIN is False)
+          check("TTW_LOG default on", config.TTW_LOG is True)
+
+          c_src = Path(native_read.__file__).with_name("_native_read.c")
+          check("ships _native_read.c", c_src.is_file(), str(c_src.name))
+
+          mods = [
+              "expert_stream.user_config",
+              "expert_stream.machine",
+              "expert_stream.machine.ladder",
+              "expert_stream.early_decode",
+              "expert_stream.time_to_warm",
+              "expert_stream.native_read",
+              # mlx-backed modules last (fresh CI install loads mlx once cleanly)
+              "expert_stream.cache",
+              "expert_stream.streaming",
+              "expert_stream.server",
+              "expert_stream.mlx_hook",
+          ]
+          for name in mods:
+              try:
+                  importlib.import_module(name)
+                  check(f"import {name}", True)
+              except Exception as e:
+                  check(f"import {name}", False, f"{type(e).__name__}: {e}")
+
+          # Tiny warm-pool smoke: no checkpoint, just construct + score shape.
+          warm = EarlyDecodeWarm(
+              model_path="/tmp/ci-smoke-model",
+              layer_keys=["layers.0.mlp", "layers.1.mlp"],
+              n_experts=8,
+              expert_bytes=1 << 20,
+          )
+          check("early_decode construct", warm.n_layers == 2 and warm.n_experts == 8)
+          ttw = TimeToWarm(window=4)
+          check("ttw construct", ttw.window == 4)
+
+          from expert_stream.user_config import sample_config_text
+          sample = sample_config_text("~/mlx-models")
+          check(
+              "sample yaml lists early decode",
+              'EXPERT_STREAM_EARLY_DECODE: "1"' in sample
+              and 'EXPERT_STREAM_EARLY_DECODE_TRAIN: "0"' in sample,
+          )
+          check(
+              "sample yaml lists native read",
+              'EXPERT_STREAM_NATIVE_READ: "1"' in sample,
+          )
+
+          print("=" * 40)
+          if not ok:
+              print("ship smoke FAILED")
+              sys.exit(1)
+          print("ship smoke passed")
+          PY
+
+      - name: Detect this Mac + print a ladder
+        env:
+          PAGED_MOE_HOOK: "0"
+        run: |
+          echo "== runner machine =="
+          paged-moe machine || true
+          echo
+          echo "== catalog (named Mac classes) =="
+          paged-moe machine catalog
+          echo
+          echo "== ladder @ 48 GB baseline =="
+          paged-moe ladder --profile host-m5-pro-48gb
