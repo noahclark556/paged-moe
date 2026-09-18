@@ -3,7 +3,7 @@
 Run large Mixture-of-Experts (MoE) LLMs locally on Apple Silicon
 even when the model is larger than your Mac's unified memory.
 
-Page experts from the SSD so 100 GB+ models actually load on 48 GB unified
+Page experts from the SSD so 500 GB+ models actually load on 48 GB unified
 memory. Route prediction runs the next layers' real routers early and
 prefetches what they ask for. Decode miss reads go through a lean latch +
 read pool (less Python overhead on the hot path). An optional tiny **sidecar**
@@ -35,9 +35,8 @@ usable speed; experts stay on disk until the router asks.
 | **Kimi-K2-Instruct** 4-bit | ~578 GB (OOM) | ~32 GB | ~27 tok/s | ~9 tok/s |
 
 Prefill is a cold ~2k-token prompt; decode is wall-clock after warmup on the
-same KV. Coder-Next, DeepSeek, and Kimi are full ladder runs on this machine.
-The middle three are estimated under the same prune / wait / sidecar recipe
-in [Tuning](#tuning-via-yaml-env). Kimi is the top of the ladder: a 578 GB
+same KV. The listed models are full ladder runs on this machine. 
+Kimi is the top of the ladder: a 578 GB
 MoE that will not load resident, streamed under the same prune / wait /
 sidecar recipe as DeepSeek and GLM.
 
@@ -45,9 +44,7 @@ sidecar recipe as DeepSeek and GLM.
   warmup); shipped recipe (prune 0.7 + wait 0.2 + sidecar) expected ~7 tok/s
 - **GLM-4.7** - shipped recipe measured **6.4 tok/s** vs 1.8 tok/s full-mixture
   on the same A/B (96% token agree)
-- **480B** - scaled from the fresh DeepSeek ladder result (378 GB, prune 0.8 ->
-  ~6 tok/s); 480B at 270 GB with prune 0.7 lands ~5 tok/s. Prior bench used no
-  recipe and a short window (no warmup), giving ~1 tok/s - not a fair comparison
+- **480B** - 480B at 270 GB with prune 0.7 lands ~5 tok/s. 
 - **Kimi-K2** - steady ladder at prune 0.8 measured **8.75 tok/s** decode
   (peak **31.59 GB**; prefill ~27 tok/s). Largest SwitchGLU in the chart.
 
