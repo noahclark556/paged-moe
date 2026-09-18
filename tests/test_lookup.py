@@ -32,7 +32,7 @@ from mlx_lm.models.cache import make_prompt_cache
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from test_stream import CONFIG, build_tiny_model, greedy_generate
+from tests.test_stream import CONFIG, build_tiny_model, greedy_generate
 
 from expert_stream import config as es_config
 from expert_stream import load, lookup_decode

@@ -30,7 +30,7 @@ import numpy as np
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from test_stream import CONFIG, build_tiny_model, greedy_generate
+from tests.test_stream import CONFIG, build_tiny_model, greedy_generate
 
 from expert_stream import config as es_config
 from expert_stream import get_stats, load
