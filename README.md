@@ -66,7 +66,7 @@ idle on any given token, so you do not need the whole library in RAM.
 the router picks them. LRU cache + route prediction (and an optional
 governed sidecar) keep agent turns warm.
 
-> **Status:** `v0.2.5` pre-release. The engine is in this repo and installs
+> **Status:** `v0.2.6` pre-release. The engine is in this repo and installs
 > from a clone. Not on PyPI yet. APIs may change before `v1.0`.
 >
 > **Naming:** product / repo / PyPI / CLI = **PagedMoE** (`paged-moe`).
