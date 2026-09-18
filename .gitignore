@@ -36,3 +36,7 @@ bench/memory_results/
 !.env.example
 *.pem
 credentials.json
+
+# Native extension build artifacts (rebuild via pip / JIT)
+*.so
+*.dylib

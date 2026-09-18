@@ -118,7 +118,7 @@ def _json_tool_body_candidates(text: str) -> list[str]:
 
     Qwen2.5's shipped chat template prints the example as
     `{{"name": ..., "arguments": ...}}`. json.loads then fails at column 2
-    (`Expecting property name`) and the server drops the call, so ga sees an
+    (`Expecting property name`) and the server drops the call, so the host sees an
     empty turn. Strip that extra brace pair; also try the outermost JSON
     object if the model wrapped it in junk.
     """

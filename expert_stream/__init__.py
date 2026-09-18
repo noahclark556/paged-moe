@@ -31,7 +31,7 @@ from typing import Any
 # device initializes, hence here. setdefault so a user override wins.
 os.environ.setdefault("MLX_METAL_FAST_SYNCH", "1")
 
-__version__ = "0.2.5"
+__version__ = "0.2.6"
 __all__ = [
     "load",
     "get_stats",

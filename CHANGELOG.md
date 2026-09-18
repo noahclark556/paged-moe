@@ -8,6 +8,31 @@ Format loosely follows Keep a Changelog. Versioning aims for SemVer.
 
 <!-- Nothing yet. -->
 
+## [0.2.6] - 2026-09-18
+
+### Added
+
+- Native C expert-read pool (`EXPERT_STREAM_NATIVE_READ`, default on): one
+  job per expert with the GIL released for the latch. Same bytes as the
+  Python pool; falls back automatically if the extension cannot load or
+  compile. Optional `setup.py` build; runtime JIT if needed.
+- Early-decode warm pool (`EXPERT_STREAM_EARLY_DECODE`): frequency table over
+  the first decode tokens after prefill, budgeted prefetch into the slab.
+  Prefetch-only (quality-safe). Not a sidecar head.
+- Cold bootstrap when early-decode is on and train is off: train until a
+  high cover/prec bar, then freeze to prefetch-only. Explicit
+  `EARLY_DECODE_TRAIN=1` keeps training. Cover/prec hold + count decay.
+- Greppable `[ttw]` time-to-warm lines (`EXPERT_STREAM_TTW_LOG`, default on)
+  for A/B'ing early-decode: first decode through the early window.
+- Sample yaml turns early-decode on (train off) for the sidecar models.
+- `expert_stream/machine/` (detect / ladder / envelope) shipped in the package
+  so `paged-moe machine` / `ladder` match the README.
+
+### Changed
+
+- Install path documents the optional native extension build.
+- Public tree no longer ships `tests/` (runtime does not need them).
+
 ## [0.2.5] - 2026-09-17
 
 ### Added

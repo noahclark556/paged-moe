@@ -633,6 +633,11 @@ class StreamedSwitchGLU(nn.Module):
             # Decode wants the full cache back: a big resident set is what
             # keeps per-token disk reads down (prefill shrinks it, below).
             self.cache.leave_prefill()
+            # First MoE layer of the first decode token after prefill: seed
+            # the rebuilt slab from the early-decode warm pool (prefetch only)
+            # and start the greppable [ttw] timer for A/B.
+            if self.ring_index == 0:
+                self.ring.mark_decode_warm_start()
             if self.predicted:
                 self.cache.pred_issued += len(self.predicted)
                 self.cache.pred_used += len(self.predicted.intersection(ids))
@@ -673,17 +678,19 @@ class StreamedSwitchGLU(nn.Module):
             self.ring.speculate(
                 self.ring_index, x_flat[-1:], cap if cap_on else K, positions=N
             )
-            # Last MoE layer of the token: close the sidecar's token window so
-            # it can train and prefetch the next token's early layers. Cheap
-            # None-check when sidecar is off.
+            # Last MoE layer of the token: close the sidecar / early-warm / ttw
+            # token window. Cheap None-check when all are off.
             if self.ring_index + 1 >= len(self.ring.layers):
-                # Hand over this position's hidden state too: it is what the LM
-                # head turns into the next token, so it is by far the strongest
-                # predictor of that token's early-layer routing. Already
-                # materialized, so this is a 1-row host copy.
-                self.ring.end_decode_token(
-                    hidden=x_flat[-1] if self.ring.sidecar is not None else None
-                )
+                if (
+                    self.ring.sidecar is not None
+                    or self.ring.early_warm is not None
+                    or self.ring.ttw is not None
+                ):
+                    self.ring.end_decode_token(
+                        hidden=(
+                            x_flat[-1] if self.ring.sidecar is not None else None
+                        )
+                    )
             slots = None
             if self.cache.slab is not None:
                 # Every expert must be slot-backed for one gather to address
@@ -714,6 +721,10 @@ class StreamedSwitchGLU(nn.Module):
             # chunk window; calling it per-layer left prefill_r stuck at 0/0.
             if self.ring.sidecar is not None and self.ring_index == 0:
                 self.ring.sidecar.drop_token()
+            if self.ring.early_warm is not None and self.ring_index == 0:
+                self.ring.early_warm.drop_token()
+            if self.ring.ttw is not None and self.ring_index == 0:
+                self.ring.ttw.reset()
             if N >= config.PREFILL_SHRINK_TOKENS:
                 self.cache.enter_prefill(int(config.PREFILL_CACHE_GB * (1 << 30)))
             # Prefill-union head: start-of-chunk prefetch (no-op when off).
@@ -818,6 +829,17 @@ class PrefetchRing:
         # below is gated on this so disabled models pay a single None-check.
         self.sidecar = None
         self._token_open = False
+        # Early-decode warm pool (None unless EARLY_DECODE or TRAIN). Prefetch
+        # only; independent of the sidecar master switch.
+        self.early_warm = None
+        # Greppable time-to-warm A/B ([ttw] lines). Independent of early_warm
+        # so disable/enable EARLY_DECODE still produces comparable warm lines.
+        self.ttw = None
+        if bool(config.TTW_LOG):
+            from .time_to_warm import TimeToWarm
+
+            win = int(config.TTW_TOKENS) or int(config.EARLY_DECODE_TOKENS)
+            self.ttw = TimeToWarm(win)
         # Flow decode: one token's lazy routing, read at the next token's start.
         self._flow_recs: list[tuple] = []
         self._flow_hidden = None
@@ -835,11 +857,38 @@ class PrefetchRing:
         else:
             self.cache._residency_advisor = None
 
-    def note_demand(self, layer_key: str, expert_ids: list[int]) -> None:
-        if self.sidecar is None:
+    def attach_early_warm(self, early) -> None:
+        self.early_warm = early
+
+    def mark_decode_warm_start(self) -> None:
+        """First MoE layer of first decode after prefill: start [ttw] + warm."""
+        early_on = (
+            self.early_warm is not None and bool(getattr(self.early_warm, "enabled", False))
+        )
+        if self.ttw is not None:
+            self.ttw.on_first_decode(self.cache, early=early_on)
+        self.maybe_early_warm()
+
+    def maybe_early_warm(self) -> None:
+        """Once per turn after leave_prefill: prefetch the early-decode pool."""
+        if self.early_warm is None:
             return
-        self.sidecar.note_demand(layer_key, expert_ids)
-        self._token_open = True
+        info = self.early_warm.maybe_warm(self.cache) or {}
+        if self.ttw is not None:
+            self.ttw.note_prefetch(
+                float(info.get("pref_ms", 0.0) or 0.0),
+                int(info.get("plan_n", 0) or 0),
+                actuated=bool(info.get("actuated", False)),
+            )
+
+    def note_demand(self, layer_key: str, expert_ids: list[int]) -> None:
+        if self.early_warm is not None:
+            self.early_warm.note_demand(layer_key, expert_ids)
+        if self.sidecar is not None:
+            self.sidecar.note_demand(layer_key, expert_ids)
+            self._token_open = True
+        elif self.early_warm is not None or self.ttw is not None:
+            self._token_open = True
 
     # --------------------------------------------------------- flow decode
 
@@ -917,8 +966,15 @@ class PrefetchRing:
         self._flow_tokens = 0
 
     def end_decode_token(self, hidden=None) -> None:
-        """Close a decode token for the sidecar."""
-        if self.sidecar is None or not self._token_open:
+        """Close a decode token for the sidecar / early-warm / ttw collectors."""
+        if self.early_warm is not None:
+            self.early_warm.end_token()
+        if self.ttw is not None:
+            self.ttw.end_token(self.cache)
+        if self.sidecar is None:
+            self._token_open = False
+            return
+        if not self._token_open:
             return
         self._token_open = False
         if hidden is not None:
@@ -1705,6 +1761,26 @@ def patch_model(
                     model_path or "unknown",
                     layer_keys,
                     n_experts,
+                )
+            )
+
+    if config.EARLY_DECODE or config.EARLY_DECODE_TRAIN:
+        from .early_decode import EarlyDecodeWarm
+
+        n_experts = max_expert_count(cache)
+        if n_experts > 0:
+            layer_keys = [glu.layer_key for glu in ring.layers]
+            expert_bytes = 0
+            if cache.slab is not None:
+                expert_bytes = int(getattr(cache.slab, "expert_bytes", 0) or 0)
+            if expert_bytes <= 0:
+                expert_bytes = int(getattr(cache, "_slab_per_expert", 0) or 0)
+            ring.attach_early_warm(
+                EarlyDecodeWarm(
+                    model_path or "unknown",
+                    layer_keys,
+                    n_experts,
+                    expert_bytes=expert_bytes,
                 )
             )
 

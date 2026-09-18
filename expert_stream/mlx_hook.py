@@ -299,7 +299,7 @@ def uninstall_sitecustomize_pth() -> bool:
 def status() -> dict[str, Any]:
     cfg = load_user_config()
     pth = pth_path()
-    return {
+    out = {
         "hook_installed_in_process": is_installed(),
         "hook_env_disabled": _hook_disabled(),
         "enable_all": _enable_all(),
@@ -311,6 +311,22 @@ def status() -> dict[str, Any]:
         "pth_present": bool(pth and pth.is_file()),
         "debug": _debug_enabled(),
     }
+    try:
+        from .machine import get_provider
+
+        p = get_provider()
+        out["machine"] = {
+            "catalog_id": p.catalog_id,
+            "chip": p.hardware.chip,
+            "ram_gb": p.hardware.ram_gb,
+            "perf_cores": p.hardware.perf_cores,
+            "disk_gb_s": p.hardware.disk_gb_s,
+            "max_cache_gb": p.envelope.max_cache_gb,
+            "near_baseline": p.envelope.near_baseline,
+        }
+    except Exception:
+        pass
+    return out
 
 
 def _pop_models_dir(argv: list[str]) -> str | None:
@@ -342,8 +358,8 @@ def main(argv: list[str] | None = None) -> int:
     if cmd in ("-h", "--help", "help"):
         print(
             "usage: paged-moe "
-            "[status|install|uninstall|ensure-config|which <model-path>] "
-            "[--models-dir PATH]"
+            "[status|install|uninstall|ensure-config|which <model-path>|"
+            "machine|ladder] [--models-dir PATH]"
         )
         return 0
 
@@ -378,6 +394,16 @@ def main(argv: list[str] | None = None) -> int:
                 for k in sorted(env):
                     print(f"  {k}={env[k]}")
         return 0
+
+    if cmd == "machine":
+        from .machine.cli import cmd_machine
+
+        return cmd_machine(argv[1:])
+
+    if cmd == "ladder":
+        from .machine.cli import cmd_ladder
+
+        return cmd_ladder(argv[1:])
 
     # status (default)
     import json

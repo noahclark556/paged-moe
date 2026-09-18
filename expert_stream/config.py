@@ -33,6 +33,45 @@ Env vars:
                                 decode slot-read pool queue depth.
                                 0 = auto (2x READ_THREADS), -1 = old executor
                                 path. Default 0.
+  EXPERT_STREAM_NATIVE_READ     1 (default) = prefer the C pread pool (one
+                                job per expert, GIL released for the latch).
+                                Same bytes as Python; falls back automatically
+                                if the extension cannot load or compile.
+                                0 = force Python. Sample configs leave this on
+                                for large streamed MoEs.
+  EXPERT_STREAM_EARLY_DECODE    0 (package default) = off. 1 = prefetch the
+                                early-decode warm pool after prefill
+                                (quality-safe). Sample / large-model recipes
+                                turn this on.
+  EXPERT_STREAM_EARLY_DECODE_TRAIN
+                                0 (default) = listed off on purpose. With
+                                EARLY_DECODE=1 and no warm-pool weights yet,
+                                cold-starts until a high cover/prec bar, then
+                                freezes train. 1 = continuous online learning.
+  EXPERT_STREAM_EARLY_DECODE_TOKENS
+                                early window length (default 64).
+  EXPERT_STREAM_EARLY_DECODE_GB max GB to prefetch from the warm pool
+                                (default 4).
+  EXPERT_STREAM_EARLY_DECODE_MIN_COVER / _MIN_PREC
+                                Hold prefetch when cover/prec EMAs fall below
+                                these after MIN_EPISODES (still trains). Defaults
+                                0.12 / 0.15.
+  EXPERT_STREAM_EARLY_DECODE_DECAY
+                                Per-episode count decay (default 0.97). Softens
+                                stale domains so the pool cannot lock onto an
+                                old traffic pattern forever.
+  EXPERT_STREAM_EARLY_DECODE_BOOTSTRAP_COVER / _PREC / _MIN_EP / _MAX_EP
+                                When EARLY_DECODE=1, TRAIN=0, and no warm-pool
+                                weights exist yet: train until cover/prec EMAs
+                                clear these high bars (defaults 0.40 / 0.22,
+                                min 48 episodes, max 256), then freeze train
+                                and keep prefetch-only. Explicit TRAIN=1 never
+                                auto-stops.
+  EXPERT_STREAM_TTW_LOG         1 (default) = print greppable [ttw] lines for
+                                time-to-warm A/B (first decode through early window).
+                                Not gated on SIDECAR_DEBUG.
+  EXPERT_STREAM_TTW_TOKENS      window length for [ttw] warm line; 0 = use
+                                EARLY_DECODE_TOKENS.
   EXPERT_STREAM_PREFETCH_DEPTH  speculative prefetch lookahead in layers. Default 8.
   EXPERT_STREAM_PREDICT         "auto" (default), "1" (always) or "0" (never):
                                 during decode, run the *next* layers' routers on
@@ -440,6 +479,68 @@ READ_THREADS: int = _env("EXPERT_STREAM_READ_THREADS", 16, int)
 # deeper than READ_THREADS.
 # 0 = auto (2x READ_THREADS); -1 disables and restores the ThreadPoolExecutor path.
 READ_POOL_THREADS: int = _env("EXPERT_STREAM_READ_POOL_THREADS", 0, int)
+
+# Native C pread pool (one job per expert, GIL released for the whole latch).
+# Bit-identical to the Python _ReadPool: same fds/offsets into the same slab
+# slots. 1 / auto = try native, silently fall back to Python on any load or
+# compile failure. 0 = force the Python pool. Default on for streamed models.
+def _native_read_mode(raw) -> str:
+    v = str(raw).strip().lower()
+    if v in ("0", "off", "false", "no"):
+        return "off"
+    if v in ("1", "on", "true", "yes", "auto"):
+        return "on"
+    return "on"
+
+NATIVE_READ: str = _native_read_mode(_env("EXPERT_STREAM_NATIVE_READ", "1", str))
+
+# Early-decode warm pool (independent of EXPERT_STREAM_SIDECAR). Prefetch-only
+# actuation; online frequency training from the first K decode tokens.
+EARLY_DECODE: bool = bool(_env("EXPERT_STREAM_EARLY_DECODE", 0, int))
+EARLY_DECODE_TRAIN: bool = bool(_env("EXPERT_STREAM_EARLY_DECODE_TRAIN", 0, int))
+EARLY_DECODE_TOKENS: int = _env("EXPERT_STREAM_EARLY_DECODE_TOKENS", 64, int)
+EARLY_DECODE_GB: float = _env("EXPERT_STREAM_EARLY_DECODE_GB", 4.0, float)
+# Hold prefetch when EMAs fall below these after MIN_EPISODES (still trains).
+EARLY_DECODE_MIN_COVER: float = _env("EXPERT_STREAM_EARLY_DECODE_MIN_COVER", 0.12, float)
+EARLY_DECODE_MIN_PREC: float = _env("EXPERT_STREAM_EARLY_DECODE_MIN_PREC", 0.15, float)
+EARLY_DECODE_MIN_EPISODES: int = _env("EXPERT_STREAM_EARLY_DECODE_MIN_EPISODES", 4, int)
+# Consecutive below-bar / above-bar episodes to hold or resume actuation.
+EARLY_DECODE_HOLD_STREAK: int = _env("EXPERT_STREAM_EARLY_DECODE_HOLD_STREAK", 2, int)
+EARLY_DECODE_CLEAR_STREAK: int = _env(
+    "EXPERT_STREAM_EARLY_DECODE_CLEAR_STREAK", 2, int
+)
+# Per-episode multiply on the count table (1 = no decay). Softens stale domains.
+EARLY_DECODE_DECAY: float = _env("EXPERT_STREAM_EARLY_DECODE_DECAY", 0.97, float)
+# Cold-start bootstrap (EARLY_DECODE on, TRAIN off, no existing pool weights):
+# train until cover/prec EMAs hit these high bars, then freeze. Explicit TRAIN
+# never auto-stops. Bars are intentionally high ("max gains") so a cold Mac
+# gets a strong first plan before settling to prefetch-only.
+EARLY_DECODE_BOOTSTRAP_COVER: float = _env(
+    "EXPERT_STREAM_EARLY_DECODE_BOOTSTRAP_COVER", 0.40, float
+)
+EARLY_DECODE_BOOTSTRAP_PREC: float = _env(
+    "EXPERT_STREAM_EARLY_DECODE_BOOTSTRAP_PREC", 0.22, float
+)
+EARLY_DECODE_BOOTSTRAP_MIN_EPISODES: int = _env(
+    "EXPERT_STREAM_EARLY_DECODE_BOOTSTRAP_MIN_EPISODES", 48, int
+)
+EARLY_DECODE_BOOTSTRAP_MAX_EPISODES: int = _env(
+    "EXPERT_STREAM_EARLY_DECODE_BOOTSTRAP_MAX_EPISODES", 256, int
+)
+# Plateau window: if cover EMA moves < this over the last N episodes *after*
+# MIN_EPISODES and cover is already near the bootstrap bar, treat as maxed.
+EARLY_DECODE_BOOTSTRAP_PLATEAU_N: int = _env(
+    "EXPERT_STREAM_EARLY_DECODE_BOOTSTRAP_PLATEAU_N", 12, int
+)
+EARLY_DECODE_BOOTSTRAP_PLATEAU_EPS: float = _env(
+    "EXPERT_STREAM_EARLY_DECODE_BOOTSTRAP_PLATEAU_EPS", 0.005, float
+)
+# Greppable time-to-warm A/B log: first decode through the early window.
+# Always prints `[ttw] ...` (not gated on SIDECAR_DEBUG). Tail with:
+#   grep '\[ttw\]' <server.log>
+TTW_LOG: bool = bool(_env("EXPERT_STREAM_TTW_LOG", 1, int))
+# 0 = same length as EARLY_DECODE_TOKENS (fair A/B window).
+TTW_TOKENS: int = _env("EXPERT_STREAM_TTW_TOKENS", 0, int)
 
 # Speculative inflight cap as a multiple of READ_THREADS. Too low leaves the
 # drive idle (drive_idle.py: ~19% idle while speculation skips ~200x/token).
@@ -921,6 +1022,15 @@ STAGING_BYTES: int | None = (
 )
 
 
+# Flat KV+scratch reserve used when RESERVE_CTX is 0. Machine provider scales
+# this down on 16 GB Macs (6 GB would eat the whole budget). 48 GB default.
+HEADROOM_GB: float = _env("EXPERT_STREAM_HEADROOM_GB", 6.0, float)
+# Decode activations + Metal recycled-buffer pool. Prefill yields the slab.
+ACTIVATION_GB: float = _env("EXPERT_STREAM_ACTIVATION_GB", 3.0, float)
+# Cap on staging_bytes_auto. Scaled with RAM by the machine provider.
+STAGING_CAP_GB: float = _env("EXPERT_STREAM_STAGING_CAP_GB", 6.0, float)
+
+
 def staging_bytes_auto(expert_nbytes: int) -> int:
     """Staging must hold the prefetch horizon in *experts*, not bytes.
 
@@ -931,7 +1041,8 @@ def staging_bytes_auto(expert_nbytes: int) -> int:
     deepest prefetch horizon (PREFETCH_DEPTH + PREDICT_DEPTH layers of top-k
     plus slack) with room for timing skew.
     """
-    return max(1 << 30, min(6 << 30, 256 * max(1, expert_nbytes)))
+    cap = int(float(STAGING_CAP_GB) * (1 << 30))
+    return max(1 << 30, min(cap, 256 * max(1, expert_nbytes)))
 
 
 # Bytes evicted between mx.clear_cache() calls. None = auto-scale with the

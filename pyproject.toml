@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "paged-moe"
-version = "0.2.5"
+version = "0.2.6"
 description = "PagedMoE: stream MoE experts from disk through mlx-lm on Apple silicon"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -38,12 +38,7 @@ paged-moe-pretrain = "expert_stream.pretrain_sidecar:main"
 include = ["expert_stream*"]
 
 [tool.setuptools.package-data]
-expert_stream = ["pretrained_sidecar/*"]
+expert_stream = ["pretrained_sidecar/*", "_native_read.c"]
 
 [tool.setuptools]
 license-files = ["LICENSE", "NOTICE", "LICENSING.md"]
-
-[tool.pytest.ini_options]
-testpaths = ["tests"]
-pythonpath = ["."]
-addopts = "-q"

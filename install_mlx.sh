@@ -81,6 +81,8 @@ echo "-> pip install -e PagedMoE  ($ES_PYTHON)"
 if [[ -f "$ROOT/requirements.txt" ]]; then
   "$ES_PYTHON" -m pip install -r "$ROOT/requirements.txt"
 fi
+# Native expert-read extension builds when a compiler is present; install
+# still succeeds without it (runtime JIT or Python pool fallback).
 "$ES_PYTHON" -m pip install -e "$ROOT"
 
 echo "-> import check"

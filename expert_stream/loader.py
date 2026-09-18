@@ -75,12 +75,16 @@ from .streaming import (
 # Used when we have no context length to size the KV cache from
 # (EXPERT_STREAM_RESERVE_CTX unset). With one, the reserve is computed per model
 # instead and this flat figure splits into activations-plus-scratch alone.
-_HEADROOM_BYTES = 6 << 30
+# Values come from config so the machine provider can scale them; 48 GB stays
+# at 6 GB / 3 GB.
 
-# Decode activations, Metal's recycled-buffer pool, and the sampler's scratch.
-# Prefill needs far more, which is why it hands the slab back rather than
-# budgeting for it here (see ExpertCache.enter_prefill).
-_ACTIVATION_BYTES = 3 << 30
+
+def _headroom_bytes() -> int:
+    return int(float(config.HEADROOM_GB) * (1 << 30))
+
+
+def _activation_bytes() -> int:
+    return int(float(config.ACTIVATION_GB) * (1 << 30))
 
 
 def _dense_enabled() -> bool:
@@ -162,7 +166,7 @@ def _set_memory_limits(
     zero-fill page faults for memory the process just released.
     """
     _applied_limits["budget"] += int(active_budget_bytes)
-    extra = _HEADROOM_BYTES if extra_bytes is None else int(extra_bytes)
+    extra = _headroom_bytes() if extra_bytes is None else int(extra_bytes)
     memory = _applied_limits["budget"] + extra
     pool = max(_applied_limits["pool"], int(pool_bytes))
     _applied_limits["pool"] = pool
@@ -231,6 +235,15 @@ def load(
       read_threads    parallel SSD readers (streamed mode)
       prefetch_depth  speculative prefetch lookahead in layers, 0 = off
     """
+    # Size capacity knobs for this Mac. No-op on the measured 48 GB class so
+    # config.py defaults stay as measured. Explicit EXPERT_STREAM_* env wins.
+    try:
+        from .machine import apply_machine_defaults
+
+        apply_machine_defaults()
+    except Exception:
+        pass
+
     mode = mode or config.MODE
     read_threads = read_threads or config.READ_THREADS
     prefetch_depth = (
@@ -264,10 +277,10 @@ def load(
     # This comes straight out of the expert cache's budget, so guessing it with
     # a flat allowance is how a full-attention model ends up committing a slab
     # it cannot keep: GLM-4.7 at 24k tokens needs 4.8 GB for KV where
-    # Qwen3-235B at the same length needs 2.5 GB, and _HEADROOM_BYTES has to
-    # cover activations and Metal scratch out of the same 6 GB.
+    # Qwen3-235B at the same length needs 2.5 GB, and headroom has to
+    # cover activations and Metal scratch out of the same reserve.
     kv_reserve = kvmem.kv_reserve_bytes(cfg, config.RESERVE_CTX)
-    headroom = _HEADROOM_BYTES if kv_reserve <= 0 else _ACTIVATION_BYTES + kv_reserve
+    headroom = _headroom_bytes() if kv_reserve <= 0 else _activation_bytes() + kv_reserve
 
     if mode == "auto":
         fits = total_bytes + headroom <= budget
@@ -276,8 +289,9 @@ def load(
         elif glus:
             mode = "streamed"
         else:
-            # A dense checkpoint over budget. "dense" pages its layer weights;
-            # without that module the resident branch raises the size error.
+            # Dense layer streaming is shelved (private/dense_shelved).
+            # Without that package this falls through to the ordinary
+            # "does not fit" error.
             mode = "dense" if _dense_enabled() else "resident"
 
     info = {
@@ -288,6 +302,9 @@ def load(
         "expert_gb": round(expert_bytes / 1e9, 2),
         "moe_layers": len(glus),
         "ram_budget_gb": round(budget / 1e9, 2),
+        "ram_gb": round(ram / (1 << 30), 2),
+        "max_cache_gb": float(config.MAX_CACHE_GB),
+        "headroom_gb": round(headroom / 1e9, 2),
     }
     if kv_reserve > 0:
         info["kv_reserve_gb"] = round(kv_reserve / 1e9, 2)
@@ -333,7 +350,7 @@ def load(
             # context has 4 GB spare that auto mode would leave idle - so honor
             # it, and only clamp to what the backbone and decode activations
             # physically leave. Auto mode is the safe, KV-aware default.
-            hard_cap = budget - backbone_bytes - _ACTIVATION_BYTES
+            hard_cap = budget - backbone_bytes - _activation_bytes()
             if hard_cap > 0:
                 cache_bytes = min(cache_bytes, hard_cap)
             kv_aware_cap = budget - backbone_bytes - headroom
@@ -357,10 +374,19 @@ def load(
             if cache_bytes > max_cache:
                 cache_bytes = max_cache
             if cache_bytes < (1 << 30):
-                raise ValueError(
+                msg = (
                     f"expert cache budget would be {cache_bytes / 1e9:.1f} GB - "
-                    f"backbone ({info['backbone_gb']} GB) leaves no room. "
-                    "Lower quantization bits or raise EXPERT_STREAM_RAM_FRACTION."
+                    f"backbone ({info['backbone_gb']} GB) leaves no room on a "
+                    f"{info['ram_budget_gb']} GB envelope. "
+                    "This would OOM on the target Mac."
+                )
+                from .machine.oom import EnvelopeOOM, envelope_strict
+
+                if envelope_strict():
+                    raise EnvelopeOOM(msg)
+                raise ValueError(
+                    msg + " Lower quantization bits or raise "
+                    "EXPERT_STREAM_RAM_FRACTION."
                 )
         cache = ExpertCache(
             cache_bytes,
@@ -401,9 +427,11 @@ def load(
         # Now that every layer is registered we know the expert size; scale
         # the buffers whose right size is "N experts", not "N bytes".
         per_expert = max(cache._expert_nbytes.values())
+        if getattr(ring, "early_warm", None) is not None:
+            ring.early_warm.set_expert_bytes(per_expert)
         if config.STAGING_BYTES is None:
             cache.staging_bytes = config.staging_bytes_auto(per_expert)
-        pool_bytes = max(2 << 30, min(6 << 30, 384 * per_expert))
+        pool_bytes = max(1 << 30, min(int(config.STAGING_CAP_GB * (1 << 30)), 384 * per_expert))
         info["cache_gb"] = round(cache_bytes / 1e9, 2)
         info["read_threads"] = read_threads
         info["prefetch_depth"] = prefetch_depth
@@ -427,7 +455,7 @@ def load(
         if config.SIDECAR and ring is not None and ring.sidecar is not None:
             info["sidecar"] = ring.sidecar.stats()
     else:
-        if total_bytes + _HEADROOM_BYTES > budget:
+        if total_bytes + _headroom_bytes() > budget:
             raise ValueError(
                 f"model is {info['total_gb']} GB but the RAM budget is "
                 f"{info['ram_budget_gb']} GB; use mode='streamed'"
@@ -463,6 +491,8 @@ def load(
             info["slab_slots"] = cache.slab.slots
             info["cache_gb"] = round(cache.budget_bytes / 1e9, 2)
             info["staging_gb"] = round(cache.staging_bytes / 1e9, 2)
+            if getattr(ring, "early_warm", None) is not None:
+                ring.early_warm.set_expert_bytes(int(cache.slab.expert_bytes))
             # Flow decode needs the slab (slot-addressed experts) plus the
             # expert count, which is only known once layers have registered.
             if config.FLOW and cache.enable_flow(max_expert_count(cache)):
@@ -501,7 +531,7 @@ def load(
             committed = (
                 cache.slab.nbytes if cache.slab is not None else cache.budget_bytes
             )
-            store_budget = budget - backbone_bytes - committed - _ACTIVATION_BYTES
+            store_budget = budget - backbone_bytes - committed - _activation_bytes()
         # Never below one conversation at the served context: evicting the prefix
         # the next turn resumes from trades a Metal OOM for a full re-prefill,
         # which on GLM-4.7 is 95 s. An over-committed slab can make the

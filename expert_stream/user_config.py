@@ -99,6 +99,26 @@ def sample_config_text(models_dir: str | Path | None = None) -> str:
 # file in its directory, or by setting PAGED_MOE=1 for every load.
 #
 # -----------------------------------------------------------------------------
+# Machine (optional)
+# -----------------------------------------------------------------------------
+# Auto-detect is the default. Capacity knobs (expert cache ceiling, reader
+# threads, headroom) scale from the measured 48 GB M5 Pro baseline. Fidelity
+# knobs (prune / wait / sidecar) stay per-model below.
+#
+# machine:
+#   auto: true
+#   # Optional overrides (any unset field is detected):
+#   # ram_gb: 16
+#   # perf_cores: 8
+#   # disk_gb_s: 6.0
+#   # storage_gb: 512
+#   # profile: mba-m2-2023-16gb   # named class; see `paged-moe machine catalog`
+#
+# paged-moe machine          # show what this Mac resolved to
+# paged-moe machine probe    # measure SSD + GPU cores
+# paged-moe ladder           # model fit table for this Mac
+#
+# -----------------------------------------------------------------------------
 # Top-level switches
 # -----------------------------------------------------------------------------
 # enable_all: true  -> stream every load (tiny models that fit in RAM still stay
@@ -148,6 +168,23 @@ def sample_config_text(models_dir: str | Path | None = None) -> str:
 #                              Freeze sidecar weights after this many good hits.
 #                              "0" = keep learning (recommended).
 #
+# EXPERT_STREAM_NATIVE_READ     "1" prefers the C expert-read pool (one job per
+#                              expert, GIL released for the latch). Same bytes
+#                              as the Python pool; falls back automatically if
+#                              the extension cannot load or compile. "0" forces
+#                              Python. Leave on for large streamed MoEs.
+#
+# EXPERT_STREAM_EARLY_DECODE    "1" prefetches experts that show up in the first
+#                              decode tokens after prefill (quality-safe; wrong
+#                              guesses only waste a read). On for large MoEs.
+# EXPERT_STREAM_EARLY_DECODE_TRAIN
+#                              Listed "0" on purpose. Cold start auto-trains
+#                              until a high cover/prec bar, then freezes train
+#                              and keeps prefetch-only. Set "1" only if you want
+#                              continuous online learning. Pool also holds
+#                              actuation when cover/prec fall off; counts decay
+#                              each train episode so stale domains fade.
+#
 #
 #
 # Only stream models listed under models: (recommended).
@@ -155,6 +192,15 @@ enable_all: false
 
 # Set true to see stream / passthrough decisions.
 debug: false
+
+# Auto-detect this Mac and size the expert cache from unified memory.
+# Uncomment to pin a named class or override a field.
+machine:
+  auto: true
+  # ram_gb: 16
+  # perf_cores: 8
+  # disk_gb_s: 6.0
+  # profile: mba-m2-2023-16gb
 
 # Optional shared defaults for every matched model:
 # defaults:
@@ -172,6 +218,11 @@ models:
       EXPERT_STREAM_SIDECAR_HEAD_PREFILL: "0"
       EXPERT_STREAM_SIDECAR_HEAD_RESIDENCY: "1"
       EXPERT_STREAM_SIDECAR_HEAD_PRUNE: "1"
+      # C pread pool when available (same bytes; silent Python fallback).
+      EXPERT_STREAM_NATIVE_READ: "1"
+      # Prefetch after prefill. TRAIN off = cold-bootstrap then freeze.
+      EXPERT_STREAM_EARLY_DECODE: "1"
+      EXPERT_STREAM_EARLY_DECODE_TRAIN: "0"
 
   # --- Qwen3-235B-A22B 4-bit -------------------------------------------------
   # Large MoE - prune + wait + sidecar keep decode practical on a laptop.
@@ -186,6 +237,9 @@ models:
       EXPERT_STREAM_SIDECAR_HEAD_PREFILL: "0"
       EXPERT_STREAM_SIDECAR_HEAD_RESIDENCY: "1"
       EXPERT_STREAM_SIDECAR_HEAD_PRUNE: "1"
+      EXPERT_STREAM_NATIVE_READ: "1"
+      EXPERT_STREAM_EARLY_DECODE: "1"
+      EXPERT_STREAM_EARLY_DECODE_TRAIN: "0"
 
   # --- GLM-4.7 4-bit ---------------------------------------------------------
   # Heavier KV - use a harder prune and always-8-bit KV so the cache still fits.
@@ -201,6 +255,9 @@ models:
       EXPERT_STREAM_SIDECAR_HEAD_PREFILL: "0"
       EXPERT_STREAM_SIDECAR_HEAD_RESIDENCY: "1"
       EXPERT_STREAM_SIDECAR_HEAD_PRUNE: "1"
+      EXPERT_STREAM_NATIVE_READ: "1"
+      EXPERT_STREAM_EARLY_DECODE: "1"
+      EXPERT_STREAM_EARLY_DECODE_TRAIN: "0"
 
   # --- Qwen3-Coder-480B 4-bit ------------------------------------------------
   # Very large checkpoint - same tuning as 235B; streaming is what makes it fit.
@@ -215,6 +272,9 @@ models:
       EXPERT_STREAM_SIDECAR_HEAD_PREFILL: "0"
       EXPERT_STREAM_SIDECAR_HEAD_RESIDENCY: "1"
       EXPERT_STREAM_SIDECAR_HEAD_PRUNE: "1"
+      EXPERT_STREAM_NATIVE_READ: "1"
+      EXPERT_STREAM_EARLY_DECODE: "1"
+      EXPERT_STREAM_EARLY_DECODE_TRAIN: "0"
 
   # --- DeepSeek-V3.2 4-bit ---------------------------------------------------
   # ~378 GB MoE. Must be listed (or PAGED_MOE=1) - passthrough OOMs hard.
@@ -236,6 +296,9 @@ models:
       EXPERT_STREAM_SIDECAR_HEAD_PREFILL: "0"
       EXPERT_STREAM_SIDECAR_HEAD_RESIDENCY: "1"
       EXPERT_STREAM_SIDECAR_HEAD_PRUNE: "1"
+      EXPERT_STREAM_NATIVE_READ: "1"
+      EXPERT_STREAM_EARLY_DECODE: "1"
+      EXPERT_STREAM_EARLY_DECODE_TRAIN: "0"
 
   # --- Kimi-K2-Instruct 4-bit ------------------------------------------------
   # ~430-580 GB. mlx-lm remaps kimi_k2 -> deepseek_v3 (plain MLA, not DSA).
@@ -257,6 +320,9 @@ models:
       EXPERT_STREAM_SIDECAR_HEAD_PREFILL: "0"
       EXPERT_STREAM_SIDECAR_HEAD_RESIDENCY: "1"
       EXPERT_STREAM_SIDECAR_HEAD_PRUNE: "1"
+      EXPERT_STREAM_NATIVE_READ: "1"
+      EXPERT_STREAM_EARLY_DECODE: "1"
+      EXPERT_STREAM_EARLY_DECODE_TRAIN: "0"
 """
 
 

@@ -184,7 +184,21 @@ def _pread_full(fd: int, offset: int, mv: memoryview) -> None:
     Separate from FilePool.read_into, which resolves path->fd and rebuilds a
     memoryview each call. The miss path already has both from the read plan,
     and this runs thousands of times per token.
+
+    Prefers the native helper when loaded (GIL released for the short-read
+    loop); otherwise os.preadv. Same bytes either way. I/O errors always
+    propagate; only a failed native *load* falls back to Python.
     """
+    if config.NATIVE_READ != "off":
+        try:
+            from . import native_read as _nr
+
+            if _nr.pread_full(fd, offset, mv):
+                return
+        except OSError:
+            raise
+        except Exception:  # noqa: BLE001 - native load/API failure only
+            pass
     while True:
         n = os.preadv(fd, [mv], offset)
         if n <= 0:
@@ -365,7 +379,10 @@ class ExpertCache:
         )
         # Decode slot reads go here once slabs + a read plan exist. None
         # disables the path so the executor lanes above stay A/B-able.
-        self._reads: _ReadPool | None = None
+        # May be _ReadPool or native_read.NativeReadPool (same submit surface
+        # plus optional submit_expert).
+        self._reads = None
+        self._native_reads = False
         want_pool = config.READ_POOL_THREADS
         self._read_pool_threads = (
             0 if want_pool < 0
@@ -681,7 +698,43 @@ class ExpertCache:
                 plans[layer_key] = tuple(entries)
         self._read_plan = plans if len(plans) == len(self._layouts) else {}
         if self._read_plan and self._reads is None and self._read_pool_threads > 0:
-            self._reads = _ReadPool(self._read_pool_threads)
+            self._reads = self._make_read_pool(self._read_pool_threads)
+
+    def _make_read_pool(self, threads: int):
+        """Prefer the native C pool; fall back to Python _ReadPool.
+
+        Never raises for a missing extension: decode must keep working on any
+        Mac that can run the rest of the engine.
+        """
+        self._native_reads = False
+        if config.NATIVE_READ != "off":
+            try:
+                from . import native_read as _nr
+
+                mod = _nr.get_module()
+                if mod is not None:
+                    pool = _nr.NativeReadPool(threads, mod=mod)
+                    self._native_reads = True
+                    state, detail = _nr.status()
+                    print(
+                        f"[paged-moe] native read pool: {state} ({detail}), "
+                        f"threads={pool.threads}",
+                        flush=True,
+                    )
+                    return pool
+                state, detail = _nr.status()
+                print(
+                    f"[paged-moe] native read pool unavailable "
+                    f"({state}: {detail}); using Python pool",
+                    flush=True,
+                )
+            except Exception as e:  # noqa: BLE001 - hard fallback
+                print(
+                    f"[paged-moe] native read pool error ({type(e).__name__}: {e}); "
+                    f"using Python pool",
+                    flush=True,
+                )
+        return _ReadPool(threads)
 
     def _evict_key(self, key: tuple) -> None:
         """Assumes lock held. Drop one resident entry, freeing its slot."""
@@ -879,8 +932,10 @@ class ExpertCache:
             self._inflight[key] = fut
             return fut
 
-        # Planned path: push component reads straight onto the read pool.
-        # No expert-level worker in between - it would only submit and block.
+        # Planned path: push reads onto the slot-read pool. Native path
+        # submits one job for the whole expert (GIL released for every
+        # component pread, single latch.done). Python path submits one job
+        # per component into _ReadPool. Same bytes either way.
         fut: Future = Future()
         fut.set_running_or_notify_cancel()
         entry = {"__nbytes__": self.slab.expert_bytes, "__slot__": slot}
@@ -892,11 +947,24 @@ class ExpertCache:
                 with self._lock:
                     self._writing[slot] -= 1
 
-        latch = _SlotLatch(len(plan), fut, entry, on_done)
         dests = self.slab.slot_dests[slot]
-        submit = self._reads.submit
-        for (fd, base, stride), mv in zip(plan, dests):
-            submit(fd, base + expert_id * stride, mv, latch)
+        if self._native_reads and hasattr(self._reads, "submit_expert"):
+            latch = _SlotLatch(1, fut, entry, on_done)
+            comps = [
+                (fd, base + expert_id * stride, mv)
+                for (fd, base, stride), mv in zip(plan, dests)
+            ]
+            try:
+                self._reads.submit_expert(comps, latch)
+            except Exception as e:  # noqa: BLE001 - never drop a miss
+                # Last-resort: finish on the calling thread so fetch still
+                # resolves instead of wedging the inflight table.
+                latch.done(e)
+        else:
+            latch = _SlotLatch(len(plan), fut, entry, on_done)
+            submit = self._reads.submit
+            for (fd, base, stride), mv in zip(plan, dests):
+                submit(fd, base + expert_id * stride, mv, latch)
         self._inflight[key] = fut
         return fut
 

@@ -1,6 +1,6 @@
 # Copyright (C) 2026 Noah Clark
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""Chat-template shims so mlx-lm / ga kwargs match model-specific templates.
+"""Chat-template shims so mlx-lm host kwargs match model-specific templates.
 
 mlx-lm's TokenizerWrapper always injects ``enable_thinking``. DeepSeek-V3.2's
 Python template wants ``thinking_mode`` ("thinking"|"chat") instead, so without
@@ -51,7 +51,7 @@ def install_deepseek_v32_chat_template() -> None:
 
         # Thinking mode asserts that every assistant turn after the last user
         # has reasoning_content or tool_calls. Host apps often park a bare ACK
-        # there (ga task_state). Give those a stub so the request does not 404.
+        # there (task_state ACK). Give those a stub so the request does not 404.
         thinking_mode = kwargs.get("thinking_mode", "thinking")
         if thinking_mode == "thinking" and isinstance(messages, list):
             last_user = -1
