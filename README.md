@@ -3,21 +3,11 @@
 Run large Mixture-of-Experts (MoE) LLMs locally on Apple Silicon
 even when the model is larger than your Mac's unified memory.
 
-<<<<<<< HEAD
-Page experts from the SSD so 500 GB+ models actually load on 48 GB unified
-memory. Route prediction runs the next layers' real routers early and
-prefetches what they ask for. Decode miss reads go through a lean latch +
-read pool (less Python overhead on the hot path). An optional tiny **sidecar**
-can learn from your traffic too; a net-time governor only lets it spend disk
-when decode actually gets faster. Same bit-identical output when pruning is
-off.
-=======
 Page experts from the SSD so models larger than your unified memory actually
 run. Works on any Apple Silicon Mac; on a 48 GB system it drove a full agentic
 loop against a ~570 GB Kimi checkpoint. Route prediction, a lean miss-read
 path, and an optional governed sidecar keep decode moving. Same bit-identical
 output when pruning is off.
->>>>>>> 4a4f02c (v0.2.6: native expert reads, early-decode warm pool, time-to-warm logs.)
 
 > **MLX / Apple Silicon.** Offloads MoE expert weights to the internal SSD
 > and pages them into Metal on demand - no CUDA, no NVIDIA, no separate
@@ -52,28 +42,17 @@ settings and ensure support.</sub>
 
 
 Prefill is a cold ~2k-token prompt; decode is wall-clock after warmup on the
-<<<<<<< HEAD
-same KV. The listed models are full ladder runs on this machine. 
-Kimi is the top of the ladder: a 578 GB
-MoE that will not load resident, streamed under the same prune / wait /
-sidecar recipe as DeepSeek and GLM.
-=======
 same KV. Every row is a measured ladder run on the baseline Mac under the
 prune / wait / sidecar recipe in [Tuning](#tuning-via-yaml-env). Kimi is the
 top of the ladder: a 578 GB MoE that will not load resident, streamed under
 the same recipe as DeepSeek and GLM.
->>>>>>> 4a4f02c (v0.2.6: native expert reads, early-decode warm pool, time-to-warm logs.)
 
 - **235B** - shipped recipe (prune 0.7 + wait 0.2 + sidecar) measured **~7 tok/s**
   decode; prune 0.5 ladder run hit **6.67 tok/s** (steady, 128 tok warmup)
 - **GLM-4.7** - shipped recipe measured **6.4 tok/s** vs 1.8 tok/s full-mixture
   on the same A/B (96% token agree)
-<<<<<<< HEAD
-- **480B** - 480B at 270 GB with prune 0.7 lands ~5 tok/s. 
-=======
 - **480B** - shipped recipe (prune 0.7) measured **~5 tok/s** decode at ~270 GB
   checkpoint size
->>>>>>> 4a4f02c (v0.2.6: native expert reads, early-decode warm pool, time-to-warm logs.)
 - **Kimi-K2** - steady ladder at prune 0.8 measured **8.75 tok/s** decode
   (peak **31.59 GB**; prefill ~27 tok/s). Largest SwitchGLU in the chart.
 
