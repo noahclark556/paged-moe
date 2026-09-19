@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "paged-moe"
-version = "0.2.6"
+version = "0.2.7"
 description = "PagedMoE: stream MoE experts from disk through mlx-lm on Apple silicon"
 readme = "README.md"
 requires-python = ">=3.10"

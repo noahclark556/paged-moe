@@ -8,6 +8,22 @@ Format loosely follows Keep a Changelog. Versioning aims for SemVer.
 
 <!-- Nothing yet. -->
 
+## [0.2.7] - 2026-09-18
+
+### Changed
+
+- Sidecar wrap head defaults **off** (opt-in). Public samples match.
+- Leaner default surface: route prediction, fused prefill, prune/wait recipes
+  remain the documented speed path; optional wrap is available when enabled.
+- Drop early-decode warm-pool path and related `[ttw]` helpers from the public
+  package so cold-start behavior stays simple and documented.
+
+### Removed
+
+- Public packaging of the early-decode warm pool modules.
+- Sidecar net-time actuation governor from the public package (ByteLedger
+  accounting remains for optional wrap).
+
 ## [0.2.6] - 2026-09-18
 
 ### Added

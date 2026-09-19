@@ -174,16 +174,6 @@ def sample_config_text(models_dir: str | Path | None = None) -> str:
 #                              the extension cannot load or compile. "0" forces
 #                              Python. Leave on for large streamed MoEs.
 #
-# EXPERT_STREAM_EARLY_DECODE    "1" prefetches experts that show up in the first
-#                              decode tokens after prefill (quality-safe; wrong
-#                              guesses only waste a read). On for large MoEs.
-# EXPERT_STREAM_EARLY_DECODE_TRAIN
-#                              Listed "0" on purpose. Cold start auto-trains
-#                              until a high cover/prec bar, then freezes train
-#                              and keeps prefetch-only. Set "1" only if you want
-#                              continuous online learning. Pool also holds
-#                              actuation when cover/prec fall off; counts decay
-#                              each train episode so stale domains fade.
 #
 #
 #
@@ -214,15 +204,12 @@ models:
     env:
       EXPERT_STREAM_SIDECAR: "1"
       EXPERT_STREAM_SIDECAR_LOCK_HITS: "0"
-      EXPERT_STREAM_SIDECAR_HEAD_WRAP: "1"
+      EXPERT_STREAM_SIDECAR_HEAD_WRAP: "0"
       EXPERT_STREAM_SIDECAR_HEAD_PREFILL: "0"
       EXPERT_STREAM_SIDECAR_HEAD_RESIDENCY: "1"
       EXPERT_STREAM_SIDECAR_HEAD_PRUNE: "1"
       # C pread pool when available (same bytes; silent Python fallback).
       EXPERT_STREAM_NATIVE_READ: "1"
-      # Prefetch after prefill. TRAIN off = cold-bootstrap then freeze.
-      EXPERT_STREAM_EARLY_DECODE: "1"
-      EXPERT_STREAM_EARLY_DECODE_TRAIN: "0"
 
   # --- Qwen3-235B-A22B 4-bit -------------------------------------------------
   # Large MoE - prune + wait + sidecar keep decode practical on a laptop.
@@ -233,13 +220,11 @@ models:
       EXPERT_STREAM_SIDECAR: "1"
       EXPERT_STREAM_SIDECAR_MIN_PRECISION: "0.22"
       EXPERT_STREAM_SIDECAR_LOCK_HITS: "0"
-      EXPERT_STREAM_SIDECAR_HEAD_WRAP: "1"
+      EXPERT_STREAM_SIDECAR_HEAD_WRAP: "0"
       EXPERT_STREAM_SIDECAR_HEAD_PREFILL: "0"
       EXPERT_STREAM_SIDECAR_HEAD_RESIDENCY: "1"
       EXPERT_STREAM_SIDECAR_HEAD_PRUNE: "1"
       EXPERT_STREAM_NATIVE_READ: "1"
-      EXPERT_STREAM_EARLY_DECODE: "1"
-      EXPERT_STREAM_EARLY_DECODE_TRAIN: "0"
 
   # --- GLM-4.7 4-bit ---------------------------------------------------------
   # Heavier KV - use a harder prune and always-8-bit KV so the cache still fits.
@@ -251,13 +236,11 @@ models:
       EXPERT_STREAM_SIDECAR: "1"
       EXPERT_STREAM_SIDECAR_MIN_PRECISION: "0.22"
       EXPERT_STREAM_SIDECAR_LOCK_HITS: "0"
-      EXPERT_STREAM_SIDECAR_HEAD_WRAP: "1"
+      EXPERT_STREAM_SIDECAR_HEAD_WRAP: "0"
       EXPERT_STREAM_SIDECAR_HEAD_PREFILL: "0"
       EXPERT_STREAM_SIDECAR_HEAD_RESIDENCY: "1"
       EXPERT_STREAM_SIDECAR_HEAD_PRUNE: "1"
       EXPERT_STREAM_NATIVE_READ: "1"
-      EXPERT_STREAM_EARLY_DECODE: "1"
-      EXPERT_STREAM_EARLY_DECODE_TRAIN: "0"
 
   # --- Qwen3-Coder-480B 4-bit ------------------------------------------------
   # Very large checkpoint - same tuning as 235B; streaming is what makes it fit.
@@ -268,13 +251,11 @@ models:
       EXPERT_STREAM_SIDECAR: "1"
       EXPERT_STREAM_SIDECAR_MIN_PRECISION: "0.22"
       EXPERT_STREAM_SIDECAR_LOCK_HITS: "0"
-      EXPERT_STREAM_SIDECAR_HEAD_WRAP: "1"
+      EXPERT_STREAM_SIDECAR_HEAD_WRAP: "0"
       EXPERT_STREAM_SIDECAR_HEAD_PREFILL: "0"
       EXPERT_STREAM_SIDECAR_HEAD_RESIDENCY: "1"
       EXPERT_STREAM_SIDECAR_HEAD_PRUNE: "1"
       EXPERT_STREAM_NATIVE_READ: "1"
-      EXPERT_STREAM_EARLY_DECODE: "1"
-      EXPERT_STREAM_EARLY_DECODE_TRAIN: "0"
 
   # --- DeepSeek-V3.2 4-bit ---------------------------------------------------
   # ~378 GB MoE. Must be listed (or PAGED_MOE=1) - passthrough OOMs hard.
@@ -292,13 +273,11 @@ models:
       EXPERT_STREAM_SIDECAR: "1"
       EXPERT_STREAM_SIDECAR_MIN_PRECISION: "0.22"
       EXPERT_STREAM_SIDECAR_LOCK_HITS: "0"
-      EXPERT_STREAM_SIDECAR_HEAD_WRAP: "1"
+      EXPERT_STREAM_SIDECAR_HEAD_WRAP: "0"
       EXPERT_STREAM_SIDECAR_HEAD_PREFILL: "0"
       EXPERT_STREAM_SIDECAR_HEAD_RESIDENCY: "1"
       EXPERT_STREAM_SIDECAR_HEAD_PRUNE: "1"
       EXPERT_STREAM_NATIVE_READ: "1"
-      EXPERT_STREAM_EARLY_DECODE: "1"
-      EXPERT_STREAM_EARLY_DECODE_TRAIN: "0"
 
   # --- Kimi-K2-Instruct 4-bit ------------------------------------------------
   # ~430-580 GB. mlx-lm remaps kimi_k2 -> deepseek_v3 (plain MLA, not DSA).
@@ -316,13 +295,11 @@ models:
       EXPERT_STREAM_SIDECAR: "1"
       EXPERT_STREAM_SIDECAR_MIN_PRECISION: "0.22"
       EXPERT_STREAM_SIDECAR_LOCK_HITS: "0"
-      EXPERT_STREAM_SIDECAR_HEAD_WRAP: "1"
+      EXPERT_STREAM_SIDECAR_HEAD_WRAP: "0"
       EXPERT_STREAM_SIDECAR_HEAD_PREFILL: "0"
       EXPERT_STREAM_SIDECAR_HEAD_RESIDENCY: "1"
       EXPERT_STREAM_SIDECAR_HEAD_PRUNE: "1"
       EXPERT_STREAM_NATIVE_READ: "1"
-      EXPERT_STREAM_EARLY_DECODE: "1"
-      EXPERT_STREAM_EARLY_DECODE_TRAIN: "0"
 """
 
 

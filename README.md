@@ -66,7 +66,7 @@ idle on any given token, so you do not need the whole library in RAM.
 the router picks them. LRU cache + route prediction (and an optional
 governed sidecar) keep agent turns warm.
 
-> **Status:** `v0.2.6` pre-release. The engine is in this repo and installs
+> **Status:** `v0.2.7` pre-release. The engine is in this repo and installs
 > from a clone. Not on PyPI yet. APIs may change before `v1.0`.
 >
 > **Naming:** product / repo / PyPI / CLI = **PagedMoE** (`paged-moe`).
@@ -271,11 +271,9 @@ Expert reads bypass the OS page cache so you are not double-spending memory
 on an invisible kernel copy of the same bytes.
 
 Route prediction asks upcoming layers what they want and starts those reads
-before the GPU stalls. That is the big disk-bound decode win. The optional
-sidecar can add next-token wrap prefetch on top; by default a governor A/Bs
-it and settles off unless decode tok/s actually improves. Early-decode is a
-separate warm pool for the first tokens after prefill (prefetch-only); sample
-configs turn it on with train off so a cold start bootstraps once.
+before the GPU stalls. That is the big disk-bound decode win. An optional
+sidecar can learn online prefetch hints on top; wrap stays off unless you
+turn it on so the default path stays lean and predictable.
 
 Miss reads prefer a small native C pool when it builds; same bytes as the
 Python path, with an automatic fallback.
@@ -387,7 +385,6 @@ process environment). Common ones:
 | Knob | Role |
 | --- | --- |
 | `EXPERT_STREAM_SIDECAR` | `1` = online sidecar; `0` = paging only |
-| `EXPERT_STREAM_SIDECAR_GOVERNOR` | `1` (default) = only actuate while decode is faster |
 | `EXPERT_STREAM_PREDICT` | `auto` / `1` / `0` - route-prediction prefetch |
 | `EXPERT_STREAM_FUSED_PREFILL` | `1` (default) = attention sub-chunks; MoE once per prompt chunk |
 | `EXPERT_STREAM_ATTN_SUB_CHUNK` | Query rows per attention call in fused prefill (default 2048) |
@@ -396,9 +393,6 @@ process environment). Common ones:
 | `EXPERT_STREAM_PREFILL_CHUNK` | Model-level step ceiling (default 32768) |
 | `EXPERT_STREAM_READ_POOL_THREADS` | Decode slot-read queue depth (`0` = auto, `-1` = old executor path) |
 | `EXPERT_STREAM_NATIVE_READ` | `1` (default) = C expert-read pool when available (same bytes; silent Python fallback). Leave on for large MoEs |
-| `EXPERT_STREAM_EARLY_DECODE` | Sample configs set `1` for large MoEs: prefetch early-window warm pool after prefill (quality-safe) |
-| `EXPERT_STREAM_EARLY_DECODE_TRAIN` | Sample configs list `0` on purpose: cold-bootstrap until the cover/prec bar, then freeze. `1` = keep training |
-| `EXPERT_STREAM_TTW_LOG` | `1` (default) = greppable `[ttw]` time-to-warm lines |
 | `EXPERT_STREAM_PRUNE` | Drop weak routed experts (speed vs fidelity) |
 | `EXPERT_STREAM_WAIT_ABOVE` | Only stall on high-weight disk misses |
 | `EXPERT_STREAM_FLOW` | `1` = one sync per token (GPU slot table); fidelity knob, off by default |
@@ -407,11 +401,9 @@ process environment). Common ones:
 | `EXPERT_STREAM_SIDECAR_DIR` | Where sidecar weights live |
 
 Full catalog lives in comments at the top of `expert_stream/config.py`.
-Wrap is on when the sidecar is; prefill / residency / prune heads stay off
-unless you turn them on. Early-decode is independent of the sidecar master
-switch; the sample configs turn it on with train listed off so a cold machine
-bootstraps once, then stays prefetch-only. Native read is on in those same
-recipes (falls back to Python if the extension cannot build).
+Wrap / prefill / residency / prune heads stay off unless you turn them on.
+Native read is on in the sample recipes (falls back to Python if the
+extension cannot build).
 
 Chart recipes (optional - not the package defaults). Drop under a model's
 `env:` in `~/paged-moe-config.yaml`:
@@ -423,8 +415,6 @@ env:
   EXPERT_STREAM_WAIT_ABOVE: "0.2"
   EXPERT_STREAM_SIDECAR: "1"
   EXPERT_STREAM_NATIVE_READ: "1"
-  EXPERT_STREAM_EARLY_DECODE: "1"
-  EXPERT_STREAM_EARLY_DECODE_TRAIN: "0"
   EXPERT_STREAM_ADAPTIVE_PREFILL: "1"
 
 # Qwen3-235B / Qwen3-Coder-480B - same idea, slightly softer prune
@@ -433,8 +423,6 @@ env:
   EXPERT_STREAM_WAIT_ABOVE: "0.2"
   EXPERT_STREAM_SIDECAR: "1"
   EXPERT_STREAM_NATIVE_READ: "1"
-  EXPERT_STREAM_EARLY_DECODE: "1"
-  EXPERT_STREAM_EARLY_DECODE_TRAIN: "0"
   EXPERT_STREAM_ADAPTIVE_PREFILL: "1"
 ```
 

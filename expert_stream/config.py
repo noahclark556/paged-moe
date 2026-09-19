@@ -538,7 +538,7 @@ EARLY_DECODE_BOOTSTRAP_PLATEAU_EPS: float = _env(
 # Greppable time-to-warm A/B log: first decode through the early window.
 # Always prints `[ttw] ...` (not gated on SIDECAR_DEBUG). Tail with:
 #   grep '\[ttw\]' <server.log>
-TTW_LOG: bool = bool(_env("EXPERT_STREAM_TTW_LOG", 1, int))
+TTW_LOG: bool = bool(_env("EXPERT_STREAM_TTW_LOG", 0, int))
 # 0 = same length as EARLY_DECODE_TOKENS (fair A/B window).
 TTW_TOKENS: int = _env("EXPERT_STREAM_TTW_TOKENS", 0, int)
 
@@ -713,7 +713,7 @@ def sync_from_environ() -> None:
 # Per-head enable bits. Master SIDECAR must be on; each head defaults off
 # except wrap (the original behaviour). Disabled head = no weights, no
 # hot-path work beyond a bool check on the façade.
-SIDECAR_HEAD_WRAP: bool = bool(_env("EXPERT_STREAM_SIDECAR_HEAD_WRAP", 1, int))
+SIDECAR_HEAD_WRAP: bool = bool(_env("EXPERT_STREAM_SIDECAR_HEAD_WRAP", 0, int))
 SIDECAR_HEAD_PREFILL: bool = bool(
     _env("EXPERT_STREAM_SIDECAR_HEAD_PREFILL", 0, int)
 )
@@ -738,7 +738,7 @@ SIDECAR_PREFILL_HOT_FRAC: float = _env(
 # shipped in exactly that state (-24% and -13% tok/s at positive `gain`).
 # So actuation is decided by an interleaved A/B on measured token time
 # instead, and the heads only get to spend bandwidth while it is winning.
-SIDECAR_GOVERNOR: bool = bool(_env("EXPERT_STREAM_SIDECAR_GOVERNOR", 1, int))
+SIDECAR_GOVERNOR: bool = bool(_env("EXPERT_STREAM_SIDECAR_GOVERNOR", 0, int))
 # Tokens per A/B window. Small, because the error bar on the comparison
 # shrinks with the number of *windows*, not the number of tokens - and short
 # windows also interleave the two states finely enough that both see the same

@@ -427,8 +427,6 @@ def load(
         # Now that every layer is registered we know the expert size; scale
         # the buffers whose right size is "N experts", not "N bytes".
         per_expert = max(cache._expert_nbytes.values())
-        if getattr(ring, "early_warm", None) is not None:
-            ring.early_warm.set_expert_bytes(per_expert)
         if config.STAGING_BYTES is None:
             cache.staging_bytes = config.staging_bytes_auto(per_expert)
         pool_bytes = max(1 << 30, min(int(config.STAGING_CAP_GB * (1 << 30)), 384 * per_expert))
@@ -491,8 +489,6 @@ def load(
             info["slab_slots"] = cache.slab.slots
             info["cache_gb"] = round(cache.budget_bytes / 1e9, 2)
             info["staging_gb"] = round(cache.staging_bytes / 1e9, 2)
-            if getattr(ring, "early_warm", None) is not None:
-                ring.early_warm.set_expert_bytes(int(cache.slab.expert_bytes))
             # Flow decode needs the slab (slot-addressed experts) plus the
             # expert count, which is only known once layers have registered.
             if config.FLOW and cache.enable_flow(max_expert_count(cache)):

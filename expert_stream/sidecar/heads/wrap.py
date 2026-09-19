@@ -8,7 +8,7 @@ the replay missed. Coverage cannot regress; a wrong extra only wastes a read.
 
 Issuance is probability-thresholded, byte-budgeted against demand-miss
 traffic, and idle-gated via cache.read_slack(). Promotion is owned by the
-net-time governor (governor.py), not by recall/gain.
+caller policy / head enable, not by recall/gain alone.
 """
 
 from __future__ import annotations
@@ -263,7 +263,7 @@ class WrapHead:
         state rather than the model's opinion. Scoring this against the demand
         that follows is a real precision measurement obtained for free, and it
         is what lets a head that has trained its way to usefulness ask the
-        governor for another look (see NetGovernor.request_probe).
+        caller for another look when a governor is attached.
         """
         out: dict[int, list[int]] = {}
         for i, scored in probs.items():
