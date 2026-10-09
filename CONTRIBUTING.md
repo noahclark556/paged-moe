@@ -1,5 +1,8 @@
 # Contributing
 
+This repo is no longer updated. Issues and pull requests will not be merged.
+The current runtime and benchmarks are at [globalagent.dev](https://globalagent.dev).
+
 Thanks for wanting to help. The public engine is dual-licensed (AGPL-3.0 +
 commercial). Outside contributions are only accepted under the
 [Contributor License Agreement](./CLA.md) so they can ship on **both** paths.

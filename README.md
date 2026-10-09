@@ -1,5 +1,9 @@
 # PagedMoE
 
+> **No longer updated.** This repo is an early version of the streaming engine. It is slower than [Global Agent](https://globalagent.dev), less safe, and not current with the latest implementations.
+>
+> Updated benchmarks, and the faster, safer, smoother runtime, are at [globalagent.dev](https://globalagent.dev).
+
 Run large Mixture-of-Experts (MoE) LLMs locally on Apple Silicon
 even when the model is larger than your Mac's unified memory.
 
@@ -66,8 +70,8 @@ idle on any given token, so you do not need the whole library in RAM.
 the router picks them. LRU cache + route prediction (and an optional
 governed sidecar) keep agent turns warm.
 
-> **Status:** `v0.2.7` pre-release. The engine is in this repo and installs
-> from a clone. Not on PyPI yet. APIs may change before `v1.0`.
+> **Status:** frozen at `v0.2.7`. This repo is no longer updated. Installs
+> from a clone still work. New work lives at [globalagent.dev](https://globalagent.dev).
 >
 > **Naming:** product / repo / PyPI / CLI = **PagedMoE** (`paged-moe`).
 > Python import stays `expert_stream`; env knobs stay `EXPERT_STREAM_*`.
