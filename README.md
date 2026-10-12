@@ -1,8 +1,9 @@
 # PagedMoE
 
-> **No longer updated.** This repo is an early version of the streaming engine. It is slower than [Global Agent](https://globalagent.dev), less safe, and not current with the latest implementations.
+> **This repo is no longer updated.** It's an early snapshot of PagedMoE.
 >
-> Updated benchmarks, and the faster, safer, smoother runtime, are at [globalagent.dev](https://globalagent.dev).
+> - **PagedMoE** is the engine. The current, full version is at [pagedmoe.com](https://pagedmoe.com).
+> - **Global Agent** is the implementation, a local coding IDE built on PagedMoE. Updated benchmarks and the faster, safer runtime are at [globalagent.dev](https://globalagent.dev).
 
 Run large Mixture-of-Experts (MoE) LLMs locally on Apple Silicon
 even when the model is larger than your Mac's unified memory.
