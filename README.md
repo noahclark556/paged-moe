@@ -12,6 +12,12 @@ I haven't benched it, but the largest model I've had running reliably as an
 agent on a 48 GB MacBook is **GLM-5.2, a 743B parameter model**, through the
 Global Agent app.
 
+Watch GLM-5.2 (743B) on 48 GB:
+[GLM-5.2](https://pagedmoe.com/videos/glm.mp4)
+
+Watch MiniMax M3 (426B) on 48 GB:
+[MiniMax M3](https://pagedmoe.com/videos/minimax.mp4)
+
 The trick is that MoE models are sparse. A token only uses a few percent of
 the weights. PagedMoE keeps the always-on backbone in memory and pages the
 routed experts in from the SSD when the router actually asks for them. Same
