@@ -9,5 +9,5 @@ include CITATION.cff
 include CHANGELOG.md
 include SECURITY.md
 include CODE_OF_CONDUCT.md
-graft expert_stream
+graft pagedmoe
 global-exclude *.py[cod] __pycache__ .DS_Store

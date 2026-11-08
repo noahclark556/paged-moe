@@ -20,16 +20,15 @@ jobs:
         run: |
           python -m pip install -U pip setuptools wheel
           # Editable install; mlx/mlx-lm come in on darwin.
-          python -m pip install -e .
+          python -m pip install -e ".[dev]"
 
       - name: Optional native read extension
         run: |
-          # Best-effort: same path users get from setup.py. Failure is fine;
+          # Best effort, same path users get from setup.py. Failure is fine,
           # runtime falls back to Python / JIT.
           python setup.py build_ext --inplace || true
           python - <<'PY'
-          from expert_stream import native_read
-          # Force a load attempt so CI logs which path won.
+          from pagedmoe import native_read
           mod = native_read.get_module()
           state, detail = native_read.status()
           print(f"native_read: {state}" + (f" ({detail})" if detail else ""))
@@ -59,33 +58,35 @@ jobs:
           print("PagedMoE ship smoke")
           print("=" * 40)
 
-          import expert_stream
-          from expert_stream import config
-          from expert_stream import native_read
-          from expert_stream.early_decode import EarlyDecodeWarm
-          from expert_stream.time_to_warm import TimeToWarm
+          import pagedmoe
+          from pagedmoe import config
+          from pagedmoe import native_read
 
-          check("version", expert_stream.__version__ == "0.2.6", expert_stream.__version__)
+          check("version", pagedmoe.__version__ == "0.3.0", pagedmoe.__version__)
+          check("PRUNE default off", config.PRUNE == 0.0, repr(config.PRUNE))
           check("NATIVE_READ default on", config.NATIVE_READ == "on", repr(config.NATIVE_READ))
-          check("EARLY_DECODE package default off", config.EARLY_DECODE is False)
-          check("EARLY_DECODE_TRAIN default off", config.EARLY_DECODE_TRAIN is False)
-          check("TTW_LOG default on", config.TTW_LOG is True)
+          check("VERIFY default on", config.VERIFY is True)
+          check("SIDECAR default off", config.SIDECAR is False)
+          check("SIDECAR_HEAD_PRUNE default off", config.SIDECAR_HEAD_PRUNE is False)
 
           c_src = Path(native_read.__file__).with_name("_native_read.c")
           check("ships _native_read.c", c_src.is_file(), str(c_src.name))
 
           mods = [
-              "expert_stream.user_config",
-              "expert_stream.machine",
-              "expert_stream.machine.ladder",
-              "expert_stream.early_decode",
-              "expert_stream.time_to_warm",
-              "expert_stream.native_read",
+              "pagedmoe.user_config",
+              "pagedmoe.machine",
+              "pagedmoe.machine.ladder",
+              "pagedmoe.early_decode",
+              "pagedmoe.time_to_warm",
+              "pagedmoe.native_read",
+              "pagedmoe.seal",
               # mlx-backed modules last (fresh CI install loads mlx once cleanly)
-              "expert_stream.cache",
-              "expert_stream.streaming",
-              "expert_stream.server",
-              "expert_stream.mlx_hook",
+              "pagedmoe.cache",
+              "pagedmoe.streaming",
+              "pagedmoe.verify_decode",
+              "pagedmoe.prefix_disk",
+              "pagedmoe.server",
+              "pagedmoe.mlx_hook",
           ]
           for name in mods:
               try:
@@ -94,35 +95,17 @@ jobs:
               except Exception as e:
                   check(f"import {name}", False, f"{type(e).__name__}: {e}")
 
-          # Tiny warm-pool smoke: no checkpoint, just construct + score shape.
-          warm = EarlyDecodeWarm(
-              model_path="/tmp/ci-smoke-model",
-              layer_keys=["layers.0.mlp", "layers.1.mlp"],
-              n_experts=8,
-              expert_bytes=1 << 20,
-          )
-          check("early_decode construct", warm.n_layers == 2 and warm.n_experts == 8)
-          ttw = TimeToWarm(window=4)
-          check("ttw construct", ttw.window == 4)
-
-          from expert_stream.user_config import sample_config_text
-          sample = sample_config_text("~/mlx-models")
-          check(
-              "sample yaml lists early decode",
-              'EXPERT_STREAM_EARLY_DECODE: "1"' in sample
-              and 'EXPERT_STREAM_EARLY_DECODE_TRAIN: "0"' in sample,
-          )
-          check(
-              "sample yaml lists native read",
-              'EXPERT_STREAM_NATIVE_READ: "1"' in sample,
-          )
-
           print("=" * 40)
           if not ok:
               print("ship smoke FAILED")
               sys.exit(1)
           print("ship smoke passed")
           PY
+
+      - name: Machine envelope tests (no GPU)
+        env:
+          PAGED_MOE_HOOK: "0"
+        run: python -m pytest tests/test_machine.py
 
       - name: Detect this Mac + print a ladder
         env:

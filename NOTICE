@@ -8,16 +8,16 @@ this software is licensed under the GNU Affero General Public License
 version 3 (see LICENSE).
 
 The public project name is PagedMoE (PyPI / GitHub: paged-moe). The Python
-import package remains `expert_stream`.
+import package is `pagedmoe`.
 
-Python sources in this package carry a short SPDX header:
+Source files in this repo carry a short SPDX header:
 
   # Copyright (C) 2026 Noah Clark
   # SPDX-License-Identifier: AGPL-3.0-or-later
 
 That marks Noah Clark authorship of those files under the AGPL grant (or a
 separate commercial license). It does not relicense mlx, mlx-lm, or other
-dependencies. `expert_stream/server.py` additionally notes portions adapted
+dependencies. `pagedmoe/server.py` additionally notes portions adapted
 from mlx-lm's MIT-licensed HTTP server.
 
 ---------------------------------------------------------------------------
@@ -25,13 +25,16 @@ Third-party dependencies (not relicensed by this project)
 
 This software depends on separately maintained packages, including:
 
-  - mlx             -  MIT License (Copyright © Apple Inc. / MLX Contributors)
-  - mlx-lm          -  MIT License (Copyright © MLX Contributors)
-  - huggingface_hub  -  Apache License 2.0
+  - mlx            - MIT License (Copyright (c) Apple Inc. / MLX Contributors)
+  - mlx-lm         - MIT License (Copyright (c) MLX Contributors)
+  - huggingface_hub - Apache License 2.0
+  - numpy          - BSD 3-Clause License (Copyright (c) NumPy Developers)
+  - tiktoken       - MIT License (Copyright (c) OpenAI)
 
-Those components remain under their original licenses. MIT and Apache-2.0
-are compatible with distribution alongside an AGPL-3.0 work; using them as
-dependencies does not place mlx / mlx-lm / huggingface_hub under AGPL.
+Those components remain under their original licenses. MIT, BSD and
+Apache-2.0 are compatible with distribution alongside an AGPL-3.0 work; using
+them as dependencies does not place mlx / mlx-lm / huggingface_hub / numpy /
+tiktoken under AGPL.
 
 Preserve their copyright and permission notices when you redistribute those
 components.

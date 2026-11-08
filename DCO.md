@@ -41,6 +41,6 @@ contribution under commercial terms.
 
 For **PagedMoE**, outside contributions also require the
 [Contributor License Agreement](./CLA.md), which is the dual-license grant.
-“The open source license indicated in the file” for DCO purposes is
+"The open source license indicated in the file" for DCO purposes is
 AGPL-3.0-or-later; commercial distribution of your Contribution by the
 maintainer is authorized by the CLA, not by this DCO text.

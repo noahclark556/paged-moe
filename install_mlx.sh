@@ -1,9 +1,11 @@
 #!/usr/bin/env bash
+# Copyright (C) 2026 Noah Clark
+# SPDX-License-Identifier: AGPL-3.0-or-later
 # Install PagedMoE as an mlx_lm drop-in for this machine.
 #
 # What it does:
 #   1. Regenerate requirements.txt from pyproject.toml (source of truth)
-#   2. pip install -e this tree into ~/.mlx-env (or $MLX_ENV / $EXPERT_STREAM_PYTHON)
+#   2. pip install -e this tree into ~/.mlx-env (or $MLX_ENV / $PAGED_MOE_PYTHON)
 #   3. Write a site-packages .pth so mlx_lm.load is wrapped automatically
 #   4. Create ~/paged-moe-config.yaml + ~/.paged_moe/sidecar (opt-in model list)
 #
@@ -12,7 +14,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MLX_ENV="${AGENT_MLX_ENV:-${MLX_ENV:-$HOME/.mlx-env}}"
-ES_PYTHON="${EXPERT_STREAM_PYTHON:-$MLX_ENV/bin/python}"
+ES_PYTHON="${PAGED_MOE_PYTHON:-$MLX_ENV/bin/python}"
 UNINSTALL=0
 NO_HOOK=0
 MODELS_DIR="${PAGED_MOE_MODELS_DIR:-}"
@@ -53,7 +55,7 @@ if [[ "$UNINSTALL" -eq 1 ]]; then
   if command -v paged-moe >/dev/null 2>&1; then
     paged-moe uninstall || true
   else
-    "$ES_PYTHON" -c "from expert_stream.mlx_hook import main; raise SystemExit(main(['uninstall']))" || true
+    "$ES_PYTHON" -c "from pagedmoe.mlx_hook import main; raise SystemExit(main(['uninstall']))" || true
   fi
   echo "Done. Package left in place (pip uninstall paged-moe to remove)."
   exit 0
@@ -86,10 +88,10 @@ fi
 "$ES_PYTHON" -m pip install -e "$ROOT"
 
 echo "-> import check"
-"$ES_PYTHON" -c "import expert_stream; print('  ok', expert_stream.__file__)"
+"$ES_PYTHON" -c "import pagedmoe; print('  ok', pagedmoe.__file__)"
 
 echo "-> seed pretrained sidecar weights (if shipped; skip existing files)"
-"$ES_PYTHON" -c "from expert_stream.user_config import install_pretrained_sidecars; n=install_pretrained_sidecars(); print(f'  wrote {len(n)} files' if n else '  none / already present')"
+"$ES_PYTHON" -c "from pagedmoe.user_config import install_pretrained_sidecars; n=install_pretrained_sidecars(); print(f'  wrote {len(n)} files' if n else '  none / already present')"
 
 # Ask where MLX checkpoints live so seeded config paths match this machine.
 if [[ -z "$MODELS_DIR" ]]; then
@@ -112,14 +114,14 @@ if [[ "$NO_HOOK" -eq 0 ]]; then
   if command -v paged-moe >/dev/null 2>&1; then
     paged-moe install "${HOOK_ARGS[@]}"
   else
-    "$ES_PYTHON" -c "from expert_stream.mlx_hook import main; raise SystemExit(main(['install', '--models-dir', r'''$MODELS_DIR''']))"
+    "$ES_PYTHON" -c "from pagedmoe.mlx_hook import main; raise SystemExit(main(['install', '--models-dir', r'''$MODELS_DIR''']))"
   fi
 else
   echo "-> skip auto-hook (--no-hook); ensuring ~/paged-moe-config.yaml"
   if command -v paged-moe >/dev/null 2>&1; then
     paged-moe ensure-config "${HOOK_ARGS[@]}"
   else
-    "$ES_PYTHON" -c "from expert_stream.mlx_hook import main; raise SystemExit(main(['ensure-config', '--models-dir', r'''$MODELS_DIR''']))"
+    "$ES_PYTHON" -c "from pagedmoe.mlx_hook import main; raise SystemExit(main(['ensure-config', '--models-dir', r'''$MODELS_DIR''']))"
   fi
 fi
 

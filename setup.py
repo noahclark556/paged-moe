@@ -3,7 +3,7 @@
 """Optional build hook for the native expert-read extension.
 
 A failed compile must not fail ``pip install``: decode falls back to the
-pure-Python read pool (see expert_stream.native_read).
+pure-Python read pool (see pagedmoe.native_read).
 """
 
 from __future__ import annotations
@@ -26,8 +26,8 @@ class optional_build_ext(build_ext):
 setup(
     ext_modules=[
         Extension(
-            "expert_stream._native_read",
-            sources=["expert_stream/_native_read.c"],
+            "pagedmoe._native_read",
+            sources=["pagedmoe/_native_read.c"],
             extra_compile_args=["-O2"],
         )
     ],

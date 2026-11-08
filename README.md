@@ -1,130 +1,155 @@
 # PagedMoE
 
-> **This repo is no longer updated.** It's an early snapshot of PagedMoE.
->
-> - **PagedMoE** is the engine. The current, full version is at [pagedmoe.com](https://pagedmoe.com).
-> - **Global Agent** is the implementation, a local coding IDE built on PagedMoE. Updated benchmarks and the faster, safer runtime are at [globalagent.dev](https://globalagent.dev).
+Run Mixture-of-Experts models that are way bigger than your Mac's RAM.
+Not as a demo, as a real coding agent: tools, multi-turn, long prompts.
 
-Run large Mixture-of-Experts (MoE) LLMs locally on Apple Silicon
-even when the model is larger than your Mac's unified memory.
+On a 48 GB MacBook Pro this runs a **578 GB Kimi-K2 at ~9 tok/s** with a
+32 GB memory peak (with its prune recipe, details below). It prefills a **31,500-token prompt in 34 seconds**. And
+after the first turn, an agent's next turn usually starts in **under 2
+seconds**, not a minute.
 
-Page experts from the SSD so models larger than your unified memory actually
-run. Works on any Apple Silicon Mac; on a 48 GB system it drove a full agentic
-loop against a ~570 GB Kimi checkpoint. Route prediction, a lean miss-read
-path, and an optional governed sidecar keep decode moving. Same bit-identical
-output when pruning is off.
+I haven't benched it, but the largest model I've had running reliably as an
+agent on a 48 GB MacBook is **GLM-5.2, a 743B parameter model**, through the
+Global Agent app.
 
-> **MLX / Apple Silicon.** Offloads MoE expert weights to the internal SSD
-> and pages them into Metal on demand - no CUDA, no NVIDIA, no separate
-> server or quantization pass required.
+The trick is that MoE models are sparse. A token only uses a few percent of
+the weights. PagedMoE keeps the always-on backbone in memory and pages the
+routed experts in from the SSD when the router actually asks for them. Same
+checkpoints you already have (plain mlx-community safetensors), same mlx-lm
+underneath, and the output is bit-identical to a fully resident run unless
+you turn on pruning.
 
-**Jump:** [Quick start](#quick-start) | [Your Mac](#what-your-mac-can-run) |
-[Results by Mac](#results-by-mac) | [Requirements](#requirements) |
-[Why it fits](#why-it-fits) | [Compatible models](#compatible-models) |
-[Extras](#extras) | [License](#license-dual) |
-[Commercial](#license-dual) | [Citation](#citation) |
-[Contact](#contact)
+> **Status:** `v0.3.0` pre-release. Installs from a clone, not on PyPI yet.
+> APIs can still change before `v1.0`.
 
-Baseline below is an M5 Pro, **48 GB** - the machine the recipes were tuned
-on. Smaller and larger Macs scale from it; see [Your Mac](#what-your-mac-can-run).
-Without PagedMoE, none of these load. With it, they run full agent loops -
-tools, multi-turn, long prompts - at usable speed; experts stay on disk until
-the router asks.
+**Fastest way to see it run:** download [Global Agent](https://globalagent.dev/)
+and pick a model. Global Agent is my local coding IDE (VSCodium-based, MLX under
+the hood) and this engine is built into it. It detects your Mac, picks the
+settings for that model and runs it right there in the app. No clone, no env
+vars. The download is free.
 
-<sub>PagedMoE auto-detects your system specs to apply the correct configuration
-settings and ensure support.</sub>
+Another app built on the same engine is the
+[PagedMoE Assistant](https://pagedmoe.com/assistant), a private AI assistant
+that runs on your Mac.
 
-| Model | Full resident | Peak RAM | Headroom | Prefill | Decode |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| **Qwen3-Coder-Next** 6-bit | ~65 GB (OOM) | ~30 GB | **+35 GB** | ~250 tok/s | ~22 tok/s |
-| **Qwen3-235B-A22B** 4-bit | ~132 GB (OOM) | ~33 GB | **+99 GB** | ~115 tok/s | ~7 tok/s |
-| **GLM-4.7** 4-bit | ~199 GB (OOM) | ~34 GB | **+165 GB** | ~73 tok/s | ~6 tok/s |
-| **Qwen3-Coder-480B** 4-bit | ~270 GB (OOM) | ~34 GB | **+236 GB** | ~80 tok/s | ~5 tok/s |
-| **DeepSeek-V3.2** 4-bit | ~378 GB (OOM) | ~33 GB | **+345 GB** | ~45 tok/s | ~6 tok/s |
-| **Kimi-K2-Instruct** 4-bit | ~578 GB (OOM) | ~32 GB | **+546 GB** | ~27 tok/s | ~9 tok/s |
-
-<sub>Looking for <a href="#what-your-mac-can-run">your Mac</a>?</sub>
-
-
-Prefill is a cold ~2k-token prompt; decode is wall-clock after warmup on the
-same KV. Every row is a measured ladder run on the baseline Mac under the
-prune / wait / sidecar recipe in [Tuning](#tuning-via-yaml-env). Kimi is the
-top of the ladder: a 578 GB MoE that will not load resident, streamed under
-the same recipe as DeepSeek and GLM.
-
-- **235B** - shipped recipe (prune 0.7 + wait 0.2 + sidecar) measured **~7 tok/s**
-  decode; prune 0.5 ladder run hit **6.67 tok/s** (steady, 128 tok warmup)
-- **GLM-4.7** - shipped recipe measured **6.4 tok/s** vs 1.8 tok/s full-mixture
-  on the same A/B (96% token agree)
-- **480B** - shipped recipe (prune 0.7) measured **~5 tok/s** decode at ~270 GB
-  checkpoint size
-- **Kimi-K2** - steady ladder at prune 0.8 measured **8.75 tok/s** decode
-  (peak **31.59 GB**; prefill ~27 tok/s). Largest SwitchGLU in the chart.
-
-Defaults leave prune off and are slower on the disk-bound models. Every knob
-is in `expert_stream/config.py`.
-
-The RAM gap looks wrong until you remember MoEs are sparse: most experts are
-idle on any given token, so you do not need the whole library in RAM.
-
-**PagedMoE** keeps the always-on backbone in memory and pages experts when
-the router picks them. LRU cache + route prediction (and an optional
-governed sidecar) keep agent turns warm.
-
-> **Status:** frozen at `v0.2.7`. This repo is no longer updated. Installs
-> from a clone still work. New work lives at [globalagent.dev](https://globalagent.dev).
->
-> **Naming:** product / repo / PyPI / CLI = **PagedMoE** (`paged-moe`).
-> Python import stays `expert_stream`; env knobs stay `EXPERT_STREAM_*`.
+**Jump:** [Numbers](#numbers) | [What's new in 0.3](#whats-new-in-03) |
+[Quick start](#quick-start) | [Agents](#built-for-agent-loops) |
+[Exact tokens](#exact-tokens-where-they-matter) |
+[Your Mac](#results-by-mac) | [The hard parts](#the-hard-parts) |
+[Fidelity](#what-is-exact-and-what-isnt) | [Models](#compatible-models) |
+[Config](#config) | [Upgrading](#upgrading-from-02x) | [License](#license-dual)
 
 ---
 
-## What your Mac can run
+## Numbers
 
-Pick your Mac. Each link jumps to a measured chart in the same format as the
-baseline table above - models that stock MLX will not load, with peak RAM,
-headroom, prefill, and decode.
+Baseline is an M5 Pro with 48 GB, checkpoints on the internal SSD. None of
+these load with stock mlx-lm on this machine. The RAM budget is about 35 GB,
+so the smallest one is already 1.8x over and Kimi is 16x over.
 
-**Macs:**
-[16 GB Air / M2 Pro](#mac-16-gb) |
-[18 GB M3 Pro](#mac-18-gb) |
-[24 GB M4 Pro](#mac-24-gb) |
-[32 GB](#mac-32-gb) |
-[48 GB](#mac-48-gb) |
-[64 GB](#mac-64-gb) |
-[128 GB](#mac-128-gb)
+| Model | Checkpoint | Peak RAM | Prefill | Decode | Setting |
+| --- | ---: | ---: | ---: | ---: | --- |
+| **Qwen3-Coder-Next** 6-bit | 65 GB | 30.7 GB | 235 tok/s | **20.6 tok/s** | exact (no prune) |
+| **Qwen3-235B-A22B** 4-bit | 132 GB | 30.6 GB | 99 tok/s | **7.9 tok/s** | prune 0.7, wait 0.2 |
+| **GLM-4.7** 4-bit | 199 GB | 31.8 GB | 73 tok/s | **5.9 tok/s** | prune 0.8, wait 0.2 |
+| **DeepSeek-V3.2** 4-bit | 378 GB | 33.2 GB | 45 tok/s | **5.7 tok/s** | prune 0.8, wait 0.2 |
+| **Kimi-K2-Instruct** 4-bit | 578 GB | 31.6 GB | 27 tok/s | **8.8 tok/s** | prune 0.8, wait 0.2 |
 
-```bash
-paged-moe machine      # show what this Mac resolves to
-paged-moe ladder       # full fit table for this Mac
-```
+How these were measured: cold ~2k-token prompt, 128 warmup tokens on the same
+KV (not counted), then 512 timed greedy tokens with EOS ignored. Decode is
+wall clock. Kimi's last quarter of the run held 10.2 tok/s. The "Setting"
+column matters: prune trades a bit of fidelity for fewer disk reads, more on
+that [here](#what-is-exact-and-what-isnt). With prune off everything is
+bit-identical and the big ones decode slower.
+
+This ladder was last run in September. A lot landed since then, mostly on
+the prefill and agent-turn side, and each of those was measured on its own
+(below). `bench/memory_benchmark.sh <tier>` reruns it on your machine. It runs
+exact unless you say otherwise, so export the Setting column first to match a
+row, e.g. `PAGED_MOE_PRUNE=0.8 PAGED_MOE_WAIT_ABOVE=0.2 ./bench/memory_benchmark.sh 3`
+for GLM-4.7.
+
+The headline isn't "fastest tokens on earth." It's that a 199 GB or 578 GB
+model on a laptop goes from a hard no to something you can actually work with.
+
+---
+
+## What's new in 0.3
+
+This release is the whole engine, the same build I run every day. 0.2.7 held a
+few things back to keep the public surface small. They're all in now, along
+with about seven weeks of work since. Highlights:
+
+**Prefill got a lot faster.** A prompt chunk routes to basically every expert,
+so prefill cost is set by how many times you read the expert mass, not by
+FLOPs. The engine now does one pass per prompt where it can: attention is
+sub-chunked inside each layer and the MoE runs once, and the expert cache
+shrinks out of the way while a big chunk runs.
+
+| Qwen3-Coder-Next 6-bit, 31,510-token cold prompt | Prefill | Read | Peak |
+| --- | ---: | ---: | ---: |
+| 2048-token chunks (mlx-lm's default step) | 420 tok/s | | |
+| four 8192-token passes (0.2.x) | 541 tok/s | 85 GB | 31.6 GB |
+| **one pass (0.3)** | **937 tok/s** (34 s) | **44 GB** | **28.7 GB** |
+
+Faster and a lower memory peak at the same time. On top of that, each layer now
+starts the next layer's reads before it's done (Qwen3-235B, 512 tokens on
+seeded KV: 9.1 s to 6.0 s), and prefill misses read straight into a staging
+slab with the native reader, no host copy (tool rounds on a 16k context:
+31.0 s to 26.7 s).
+
+**Agent turns don't re-prefill the conversation.** On a real coding-agent
+session (~13.5k tokens) turn 1 prefills once, then every later turn reuses
+12.4k to 13.3k tokens and prefills only the 340 to 1,115 new ones, in **0.3 to
+2 seconds**. Hybrid-attention models (Qwen3-Next style) can branch back to an
+earlier message now too, which used to mean prefilling from token 0. And the
+system prompt plus tool schemas survive a restart on disk, so a fresh engine
+doesn't pay ~40 s for them again.
+
+**Exact multi-token decode.** When the model is copying something from context
+(editing a file, repeating a path in a tool call) the engine drafts what comes
+next and checks it in one pass. Every emitted token is still the model's own
+pick. With prune off that's **2.26x** on a file edit. Details
+[below](#exact-tokens-where-they-matter).
+
+**Decode misses use the whole drive.** Each expert miss used to be read by one
+worker in 1 MB pieces, so with about one miss per layer the SSD sat at queue
+depth 1. Misses are now split across every idle reader. MiniMax-M3 4-bit went
+from 5.65 to 9.31 tok/s and Qwen3.8-Flash-Next from 5.92 to 8.66 on the same
+prompts.
+
+**More models.** GLM-5.2 and DeepSeek-V3.2 (DSA sparse attention, with a sparse
+prefill path that takes ~110 s off a cold 32k prefill on GLM-5.2), MiniMax-M3
+(sigmoid routers, its XML tool format and think tags), Qwen3.8-Flash-Next, and
+image input for resident Qwen VL chat.
+
+**It doesn't freeze your Mac.** Expert reads bypass the page cache with every
+read capped where macOS still honors that, a trimmer drops whatever leaks
+anyway, the slab shrinks when other apps need memory and grows back when they
+don't, and a watchdog kills a hung engine instead of letting it sit there
+holding 40 GB.
+
+Full list in the [CHANGELOG](./CHANGELOG.md).
 
 ---
 
 ## Quick start
 
-Three steps. After that, use mlx / mlx-lm / mlx-openai-server the way you
-already do - no new load API required.
-
-1. **Install** PagedMoE into your mlx venv (hooks `mlx_lm.load`)
-2. **Edit** `~/paged-moe-config.yaml` and list the MoE checkpoints to stream
-3. **Use mlx as normal** - loads of those paths go through PagedMoE automatically
+Three steps. After that you use mlx-lm / mlx-openai-server the way you
+already do.
 
 ### 1. Install
 
 ```bash
 git clone https://github.com/noahclark556/paged-moe.git
 cd paged-moe
-chmod +x install_mlx.sh
 ./install_mlx.sh
 # or: ./install_mlx.sh --python /path/to/venv/bin/python
 # or: ./install_mlx.sh --models-dir ~/mlx-models
 ```
 
-That installs the package, enables the auto-hook, and writes
-`~/paged-moe-config.yaml` (asks which directory holds your MLX checkpoints).
-
-Manual equivalent:
+That installs the package into your mlx venv, turns on the `mlx_lm.load` hook,
+and writes `~/paged-moe-config.yaml`. By hand:
 
 ```bash
 source ~/.mlx-env/bin/activate
@@ -132,425 +157,404 @@ pip install -e .
 paged-moe install --models-dir ~/mlx-models
 ```
 
-### 2. Edit `~/paged-moe-config.yaml`
+### 2. List the models to stream
 
-This file is the control plane. Put real paths to the MoEs you want to
-stream. Install seeds the tested checkpoint names under the models dir you
-chose (default `~/mlx-models/`) - fix the paths if yours differ.
+`~/paged-moe-config.yaml` decides what streams. Put the real paths in:
 
 ```yaml
 enable_all: false
-debug: false
 machine:
   auto: true
 models:
   - path: /Users/you/mlx-models/qwen3-next
-    env:
-      EXPERT_STREAM_SIDECAR: "1"
   - path: /Users/you/mlx-models/qwen3-235-4bit
     env:
-      EXPERT_STREAM_SIDECAR: "1"
+      PAGED_MOE_PRUNE: "0.7"
+      PAGED_MOE_WAIT_ABOVE: "0.2"
 ```
 
-Only paths listed under `models:` stream (unless you set `enable_all: true`).
-Everything else stays stock mlx-lm. Edit this file anytime; no reinstall.
+Only listed paths stream. Everything else stays stock mlx-lm. Edit it any
+time, no reinstall. You can also drop a `.paged_moe` file in a checkpoint
+folder, or `export PAGED_MOE=1` to stream every load. Kill switch:
+`PAGED_MOE_HOOK=0`.
 
-Optional instead of yaml: drop a `.paged_moe` marker in the checkpoint folder,
-or `export PAGED_MOE=1` for every load. Kill switch: `PAGED_MOE_HOOK=0`.
-
-If you use mlx-openai-server, the `path` here should match `model_path` in
-`~/mlx-config.yaml`.
-
-### 3. Use mlx as normal
+### 3. Use mlx like normal
 
 ```python
 from mlx_lm import load, stream_generate
 
-# Same call as always. If the path is in ~/paged-moe-config.yaml, it streams.
-model, tokenizer = load("~/mlx-models/qwen3-235-4bit")
+model, tokenizer = load("~/mlx-models/qwen3-235-4bit")   # streams if listed
 for chunk in stream_generate(model, tokenizer, prompt, max_tokens=200):
- print(chunk.text, end="", flush=True)
+    print(chunk.text, end="", flush=True)
 ```
 
-```bash
-# Same idea for a local OpenAI-compatible server:
-python -m expert_stream.server --model ~/mlx-models/qwen3-235-4bit --port 8080
-# Point your agent at http://127.0.0.1:8080/v1
-```
-
-Check a path:
-
-```bash
-paged-moe status
-paged-moe which /path/to/model
-PAGED_MOE_DEBUG=1 # stderr: [paged-moe] stream via ... / passthrough ...
-```
-
-| Path | Role |
-| --- | --- |
-| `~/paged-moe-config.yaml` | Which models stream (+ optional env knobs) |
-| `./install_mlx.sh` / `paged-moe install` | Install + auto-hook |
-| `~/.paged_moe/sidecar/` | Sidecar weights (created automatically) |
-| `paged-moe` CLI | `status` / `which` / `install` / `uninstall` |
-
-### Who this is for
-
-- Qwen / GLM / DeepSeek-class MoEs on Apple Silicon without a 128-512 GB box
- (tunable outside that range too)
-- Agent loops (tools, multi-turn, long prompts), not just one-shot chat
-- Plain mlx-community (or converted) checkpoints, not a special "streaming
- edition" of two curated models
-
-### Who this is not for
-
-- Absolute minimum RAM footprint (~3 GB active). Other stacks optimize for
- tiny resident sets; this one spends unified memory on a large expert cache
- so agent turns stay warm
-- NVIDIA / CUDA servers. This is an MLX / Mac tool
-- Models that already fit in RAM. Stock `mlx_lm.load` is enough
-
-### What you get
-
-1. Drop-in for `mlx_lm.load` on SwitchGLU MoEs - checkpoint can be 2x or 5x RAM
-2. An OpenAI-compatible server your agent already knows how to talk to
-3. Bit-identical output to a fully resident run when expert pruning is off
-4. Agent-session hardening: prompt-prefix reuse (one prefill, then fork
- snapshots on trimmable KV), memory that yields to long prefills instead of
- OOMing Metal
-
-Under the hood, mlx-lm routes MoE expert compute through `SwitchGLU`. This
-replaces that with a disk-backed version and keeps attention, KV cache,
-templates, and sampling. LRU + route prediction + optional slabs hide as much
-disk latency as the SSD allows.
-
-Built for coding agents on Apple Silicon - Air through Ultra - against models
-the platform normally will not start.
-
----
-
-## Requirements
-
-| | |
-| --- | --- |
-| OS | macOS on Apple Silicon |
-| Python | **3.10+** (built and tested on 3.10 / 3.11) |
-| MLX | `mlx>=0.32` |
-| mlx-lm | `mlx-lm>=0.31.3` |
-
-Any OpenAI-compatible client (including mlx-openai-server) can talk to
-`python -m expert_stream.server`. That stack is optional; it is not a hard
-install dependency.
-
-Pins live in `pyproject.toml` (source of truth). `./install_mlx.sh`
-regenerates `requirements.txt` from those deps before `pip install`.
-
----
-
-## Why it fits
-
-On a normal load these MoEs want roughly their full checkpoint in RAM.
-PagedMoE keeps a working set resident and frees the rest as headroom - often
-+50 to +180 GB versus a full resident load, depending on the Mac and the
-model. Numbers below are the 48 GB baseline; your Mac's peaks and headroom
-are under [Results by Mac](#results-by-mac).
-
-| Model | Normally (full resident) | With PagedMoE | Headroom |
-| --- | ---: | ---: | ---: |
-| **Qwen3-Coder-Next** (6-bit) | ~65 GB (will not load) | ~30 GB peak | **+35 GB** |
-| **Qwen3-235B-A22B** (4-bit) | ~132 GB (will not load) | ~33 GB peak | **+99 GB** |
-| **GLM-4.7** (4-bit) | ~199 GB (will not load) | ~34 GB peak | **+165 GB** |
-| **Qwen3-Coder-480B** (4-bit) | ~270 GB (will not load) | ~34 GB peak | **+236 GB** |
-| **DeepSeek-V3.2** (4-bit) | ~378 GB (will not load) | ~36 GB peak | **+342 GB** |
-| **Kimi-K2-Instruct** (4-bit) | ~578 GB (will not load) | ~32 GB peak | **+546 GB** |
-
-Only the always-on backbone stays in RAM. Routed experts live on disk until
-needed. MoE size is mostly experts that almost never fire on a given token.
-
-Experts are fetched from the SSD on demand into a working set that can be
-dropped later. The model never has to be fully materialized.
-
-A large in-memory expert cache keeps recently used experts warm under your
-RAM budget.
-
-Expert reads bypass the OS page cache so you are not double-spending memory
-on an invisible kernel copy of the same bytes.
-
-Route prediction asks upcoming layers what they want and starts those reads
-before the GPU stalls. That is the big disk-bound decode win. An optional
-sidecar can learn online prefetch hints on top; wrap stays off unless you
-turn it on so the default path stays lean and predictable.
-
-Miss reads prefer a small native C pool when it builds; same bytes as the
-Python path, with an automatic fallback.
-
-Optional decode pruning skips weak experts so fewer SSD reads happen per
-token (you trade a bit of fidelity for speed).
-
-Memory is reserved for context (KV) so a long conversation does not steal the
-expert cache mid-session.
-
-Long prefills can temporarily shrink the expert footprint so Metal does not
-OOM, then warm back up for decode.
-
-Prefill is priced in expert bytes, not FLOPs. A chunk that routes widely
-streams essentially the whole expert mass once. Layer-fused prefill (on by
-default) sub-chunks attention inside each decoder layer and runs the MoE once
-per prompt chunk, so a long agent prompt can be one pass over the experts
-instead of one pass per attention-sized step. Attention sub-chunk size is
-`EXPERT_STREAM_ATTN_SUB_CHUNK` (default 2048); the Metal score-matrix bound
-still caps it. Watch stderr for `[prefill] ... passes over the mass ...
-blocked on disk ... compute`.
-
-Agent turns reuse the prompt prefix instead of redoing the whole history each
-tool round. On trimmable KV caches (DeepSeek / Qwen3-MoE / GLM and friends)
-the cold path prefills once, then forks prefix snapshots with deepcopy+trim.
-Hybrid / non-trimmable stacks still stop mid-prefill at snapshot boundaries.
-
-If the model already fits, it can run fully resident. Streaming is the escape
-hatch for oversized MoEs. Same API either way.
-
----
-
-## Compatible models
-
-Anything mlx-lm loads whose MoE layers use `SwitchGLU`:
-
-| Family | Notes |
-| --- | --- |
-| Qwen3-MoE / Coder / 235B / 480B | Workhorse; 235B-A22B is the mid-range stress test |
-| Qwen3-Next (hybrid attention) | Coder-Next, 30B-A3B |
-| GLM-4.x MoE | GLM-4.5-Air, GLM-4.7, etc. |
-| DeepSeek V2/V3/V3.2-style | Large checkpoints; decode is disk-bound on TB SSDs |
-| Kimi-K2 Instruct | ~578 GB class; listed in the sample yaml. Needs `tiktoken` |
-| Mixtral, OLMoE, others | If it is SwitchGLU, it should stream |
-
-No custom checkpoint format. Plain MLX safetensors.
-
----
-
-## Extras
-
-Things beyond install -> yaml -> chat. Optional; the Quick start path works
-without them.
-
-### Sidecar offline pretrain
-
-Online learning already runs during normal decode when
-`EXPERT_STREAM_SIDECAR=1`. For a faster warm-start from a prompt corpus
-(before or instead of a long agent session):
-
-```bash
-# Fast warm-start (short decode, few prompts, many fit epochs)
-paged-moe-pretrain --quick \
- --model ~/mlx-models/qwen3-235-4bit \
- --corpus /path/to/prompts.jsonl
-
-# Same module form:
-python -m expert_stream.pretrain_sidecar --quick \
- --model ~/mlx-models/qwen3-235-4bit \
- --corpus /path/to/prompts.jsonl
-```
-
-Corpus can be a directory of `.txt` / `.md` / `.jsonl`, or one `.jsonl` with
-`prompt` / `text` / chat `messages` fields. Weights land under
-`~/.paged_moe/sidecar/` (override with `EXPERT_STREAM_SIDECAR_DIR`).
-
-Useful variants:
-
-```bash
-# Dense-fit only from a wrap bank already filled by live use or a prior run
-paged-moe-pretrain --fit-only --epochs 12 --model ~/mlx-models/qwen3-235-4bit
-
-# Clear lock bits so online training resumes (no MoE load)
-paged-moe-pretrain --unlock-all
-
-# Ctrl+C saves progress; re-run the same command to continue.
-# --fresh / --force wipes slot weights + progress and starts over.
-```
-
-Shipped builds may also seed a small pretrained bundle under
-`expert_stream/pretrained_sidecar/` on install when that allowlist is filled
-for a release.
-
-### OpenAI-compatible server
+Or run the OpenAI-compatible server and point your agent at it:
 
 ```bash
 paged-moe-server --model ~/mlx-models/qwen3-235-4bit --port 8080
-# or: python -m expert_stream.server --model <path> --port 8080
+# http://127.0.0.1:8080/v1, any API key
 ```
 
-Same streaming load path as `mlx_lm.load`. Point any OpenAI-compatible client
-at `http://127.0.0.1:8080/v1`.
+Quick checks:
 
-### Tuning via yaml `env`
-
-Per-model knobs go under each entry in `~/paged-moe-config.yaml` (or the
-process environment). Common ones:
-
-| Knob | Role |
-| --- | --- |
-| `EXPERT_STREAM_SIDECAR` | `1` = online sidecar; `0` = paging only |
-| `EXPERT_STREAM_PREDICT` | `auto` / `1` / `0` - route-prediction prefetch |
-| `EXPERT_STREAM_FUSED_PREFILL` | `1` (default) = attention sub-chunks; MoE once per prompt chunk |
-| `EXPERT_STREAM_ATTN_SUB_CHUNK` | Query rows per attention call in fused prefill (default 2048) |
-| `EXPERT_STREAM_ADAPTIVE_PREFILL` | `1` = resize the model-level step each pass |
-| `EXPERT_STREAM_ADAPTIVE_PREFILL_MODE` | `auto` / `dsa` / `fused` / `off` |
-| `EXPERT_STREAM_PREFILL_CHUNK` | Model-level step ceiling (default 32768) |
-| `EXPERT_STREAM_READ_POOL_THREADS` | Decode slot-read queue depth (`0` = auto, `-1` = old executor path) |
-| `EXPERT_STREAM_NATIVE_READ` | `1` (default) = C expert-read pool when available (same bytes; silent Python fallback). Leave on for large MoEs |
-| `EXPERT_STREAM_PRUNE` | Drop weak routed experts (speed vs fidelity) |
-| `EXPERT_STREAM_WAIT_ABOVE` | Only stall on high-weight disk misses |
-| `EXPERT_STREAM_FLOW` | `1` = one sync per token (GPU slot table); fidelity knob, off by default |
-| `EXPERT_STREAM_LOOKUP` | `1` = n-gram self-draft (more tokens per disk pass); off by default |
-| `EXPERT_STREAM_CACHE_GB` | Pin expert-cache size (else auto under RAM budget) |
-| `EXPERT_STREAM_SIDECAR_DIR` | Where sidecar weights live |
-
-Full catalog lives in comments at the top of `expert_stream/config.py`.
-Wrap / prefill / residency / prune heads stay off unless you turn them on.
-Native read is on in the sample recipes (falls back to Python if the
-extension cannot build).
-
-Chart recipes (optional - not the package defaults). Drop under a model's
-`env:` in `~/paged-moe-config.yaml`:
-
-```yaml
-# DeepSeek-V3.2 / GLM-4.7 class (MoEGate) - matches the ~4 tok/s DeepSeek row
-env:
-  EXPERT_STREAM_PRUNE: "0.8"
-  EXPERT_STREAM_WAIT_ABOVE: "0.2"
-  EXPERT_STREAM_SIDECAR: "1"
-  EXPERT_STREAM_NATIVE_READ: "1"
-  EXPERT_STREAM_ADAPTIVE_PREFILL: "1"
-
-# Qwen3-235B / Qwen3-Coder-480B - same idea, slightly softer prune
-env:
-  EXPERT_STREAM_PRUNE: "0.7"
-  EXPERT_STREAM_WAIT_ABOVE: "0.2"
-  EXPERT_STREAM_SIDECAR: "1"
-  EXPERT_STREAM_NATIVE_READ: "1"
-  EXPERT_STREAM_ADAPTIVE_PREFILL: "1"
+```bash
+paged-moe status                 # hook, config, detected Mac
+paged-moe which /path/to/model   # will this stream?
+paged-moe machine                # what this Mac resolves to
+paged-moe ladder                 # what fits on this Mac
+python run.py --model <path> --chat
 ```
 
-`PRUNE` / `WAIT_ABOVE` trade a bit of fidelity for disk reads skipped. Leave
-them unset for bit-identical decode (slower on the big MoEs).
+There's also a direct Python API (`from pagedmoe import load, get_stats`) and
+a zero-dependency Node wrapper in `node/` that spawns the server, waits for it
+and kills it when you're done.
 
-### CLI cheat sheet
+### Who it's for
 
-| Command | Purpose |
-| --- | --- |
-| `paged-moe status` | Hook + config paths + detected Mac |
-| `paged-moe which <model>` | Will this path stream? |
-| `paged-moe machine` | Hardware + derived cache / threads / headroom |
-| `paged-moe ladder` | Per-Mac model fit table (OOM / streamed / resident) |
-| `paged-moe install` / `uninstall` | Auto-hook for `mlx_lm.load` |
-| `paged-moe-pretrain ...` | Sidecar corpus warm-start / fit / unlock |
-| `paged-moe-server ...` | Local OpenAI-compatible HTTP |
-| `python run.py --model ... --chat` | Quick interactive REPL (clone only) |
+- Qwen / GLM / DeepSeek / Kimi / MiniMax class MoEs on a Mac that can't hold
+  them
+- Agent loops, not just one-shot chat
+- Plain MLX checkpoints. No converted format, no second copy on disk
+
+### Who it's not for
+
+- Models that already fit in RAM. Stock mlx-lm is enough (PagedMoE just
+  loads those resident anyway)
+- The smallest possible memory footprint. This spends RAM on a big expert
+  cache on purpose, so agent turns stay warm
+- NVIDIA / CUDA
+
+---
+
+## How it works
+
+mlx-lm sends all MoE expert compute through one module, `SwitchGLU`. PagedMoE
+loads the model lazily, swaps every `SwitchGLU` for a disk-backed version, and
+only materializes the backbone. Attention, KV cache, chat templates and
+sampling are mlx-lm's own. Experts are read from the unmodified checkpoint,
+kept in a byte-budgeted cache, and prefetched ahead of time. Since the math is
+the same, the output is the same.
+
+The parts that make it fast enough to use:
+
+- **Route prediction.** Each layer's router is a small resident matrix, so
+  the engine runs the next few layers' routers on the current hidden state and
+  starts those reads early. On a disk-bound test (64-expert MoE with an
+  external-SSD read delay) that was 10.6 to 19.0 tok/s. On a model the cache
+  already holds it costs a few percent, so a governor measures both ways and
+  keeps whichever wins.
+- **Slab storage.** Cached experts live in fixed GPU slots and compute takes
+  views into them. +11% decode on Qwen3-235B, +20% on Qwen3-Next.
+- **Native reads.** A small C pool does the reads with the GIL released,
+  split across readers, with demand misses ahead of speculation. Falls back to
+  Python if it can't build.
+- **Frequency-aware eviction.** Hot experts get a second chance, so one
+  prefill sweep can't flush the working set.
+- **Memory that behaves.** KV is priced up front, 8-bit for long contexts,
+  and dequantized one layer at a time when a stored conversation is resumed.
+- **An optional sidecar.** A tiny online model that learns which experts come
+  next and prefetches them. It only acts while decode is measurably faster
+  with it on.
+
+None of the speed work changes which experts run. A wrong guess wastes a read,
+that's it. The full walkthrough is in [docs/DESIGN.md](./docs/DESIGN.md), and
+[docs/why-it-fits.md](./docs/why-it-fits.md) is the short version.
+
+---
+
+## Built for agent loops
+
+Most of the pain with big local models in an agent isn't decode speed, it's
+the wait between turns. On a streamed MoE every prefill is a pass over the
+expert weights, so re-prefilling a 30k conversation costs 60 to 80 seconds.
+The server works hard to never do that.
+
+- **Prefix reuse that survives real clients.** Agent clients rewrite things:
+  thinking text that never gets replayed, reminders parked at the tail,
+  blocks edited near the front. The server snapshots the KV at the last point
+  a prompt diverged from the one before it, so it learns each client's stable
+  and volatile parts from real traffic. `PAGED_MOE_PREFIX_DEBUG=1` logs how
+  much each request reused and where it diverged.
+- **Stable front matter.** Send `stable_prefix_messages: N` and the first N
+  messages are pinned. History compaction after that only prefills the new
+  history.
+- **Front matter on disk.** The pinned prefix (system prompt, tools, codebase
+  map, memory) is written to disk and loaded after a restart. A file only
+  loads if the weights, config, engine numerics, settings and token ids all
+  match and its CRC checks out. Otherwise it's a normal prefill. Hosts that
+  encrypt their data can hand the engine a key over a pipe and the files are
+  sealed at rest.
+- **Branching on hybrid caches.** Linear-attention layers can't be trimmed,
+  so a retry or an edited message used to prefill from scratch. The engine
+  keeps the small recurrent state at each turn's resume point and restores it
+  in about a millisecond, bit-identical to a fresh prefill.
+- **Replay with the real ids.** When a turn comes back as text and
+  re-tokenizes differently than what decode produced, the engine splices the
+  original ids back in so the stored cache still matches.
+- **`warm_prefix`.** POST a message list with `max_tokens: 0` and
+  `warm_prefix: true` and it gets prefilled and cached without decoding.
+  Handy after a task finishes and you collapse history to a summary.
+- **Cache breakpoints.** `cache_control` on a message, `cache_breaks: [...]`
+  on the request, or `<|cache_break|>` in the text.
+
+All of this is plain OpenAI-compatible JSON. Fields the server doesn't know
+are ignored by other servers, so they're safe to send. The host side of the
+contract (what not to rewrite, how to compact) is in
+[docs/CLIENT_CONTEXT.md](./docs/CLIENT_CONTEXT.md).
+
+---
+
+## Exact tokens where they matter
+
+More tokens per byte read is the one decode lever that doesn't fight the SSD.
+Decode on a streamed MoE runs through a verify loop: when the last few tokens
+show up earlier in the context, it drafts what followed and checks the draft
+in a single pass that shares its expert reads across up to nine positions. With
+prune off the model can also draft itself with a cheap step, and checkpoints
+with a multi-token-prediction head get a third drafter. Drafts never reach the
+output unchecked, and a timing governor only drafts where drafting has
+actually measured faster, per span.
+
+Qwen3.8-Flash-Next, greedy, 256 tokens, same warm cache:
+
+| Config | Edit a file | Explain a file |
+| --- | --- | --- |
+| prune 0, plain | 5.9 tok/s | 7.1 tok/s |
+| **prune 0, verify + self-draft** | **13.4 tok/s (2.26x)** | 8.3 tok/s (1.16x) |
+| prune 0.7 + flow, plain | 9.8 tok/s | 12.1 tok/s |
+| prune 0.7 + flow, exact verify | 15.6 tok/s (1.60x), 99% exact tokens | 12.0 tok/s (governor kept it off) |
+
+Copying a method back verbatim on the same model, at a speed-leaning prune
+setting, went from about 15 to **48.8 tok/s**. `bench/verify_ab.py` and `bench/copy_decode_ab.py`
+reproduce these. Each reply logs a `[verify] done` line with passes, accept
+rate and what the governor is going by.
 
 ---
 
 ## Results by Mac
 
-**Bold** is the daily-driver pick. Only models that stream (will not load
-resident) are listed. [Back to Mac links](#what-your-mac-can-run).
+Measured in a sandbox that holds the engine to each Mac's RAM, cache budget,
+reader count and SSD speed. The GPU is still the M5 Pro, so on a real chip of
+that class tok/s can be a bit off. The 64 GB and 128 GB rows are IO-scaled
+estimates, not runs. Prune / wait match the table above.
 
-> Each chart is either sandbox-tested or run on a real machine. Sandbox
-> matches that Mac's RAM, cache budget, and SSD delay on the baseline host,
-> so tok/s can be slightly off a native chip of the same RAM class.
+| Mac | Model | Checkpoint | Peak RAM | Prefill | Decode |
+| --- | --- | ---: | ---: | ---: | ---: |
+| 16 GB Air (M2 / M3 / M4) | Qwen3-Coder-Next 6-bit | 65 GB | 8.4 GB | 172 tok/s | 10.8 tok/s |
+| 16 GB Air (M2 / M3 / M4) | KAT-Coder-V2.5 6-bit | 30 GB | 10.7 GB | 450 tok/s | 20.1 tok/s |
+| 18 GB M3 Pro | Qwen3-235B-A22B 4-bit | 132 GB | 8.3 GB | 119 tok/s | 8.6 tok/s |
+| 24 GB M4 Pro | Qwen3-235B-A22B 4-bit | 132 GB | 12.6 GB | 108 tok/s | 9.1 tok/s |
+| 32 GB M2 Pro | GLM-4.7 4-bit | 199 GB | 18.3 GB | 77 tok/s | 6.5 tok/s |
+| 36 GB M3 Pro | GLM-4.7 4-bit | 199 GB | 21.0 GB | 75 tok/s | 7.3 tok/s |
+| 48 GB M4 Pro / M4 Max | Qwen3-Coder-Next 6-bit | 65 GB | 30.7 GB | 220 tok/s | 23.4 tok/s |
+| 48 GB M4 Pro / M4 Max | Qwen3-235B-A22B 4-bit | 132 GB | 28.6 GB | 103 tok/s | 9.0 tok/s |
+| 64 GB M5 Pro (est.) | GLM-4.7 4-bit | 199 GB | ~45 GB | ~73 tok/s | ~7.9 tok/s |
+| 128 GB M5 Max (est.) | Qwen3-235B-A22B 4-bit | 132 GB | ~85 GB | ~115 tok/s | ~9.5 tok/s |
 
-### Mac: 16 GB
+Yes, that's a 132 GB model on an 18 GB envelope. The expert cache there is 1.6
+GB, so it leans entirely on the SSD, and it still decodes. 16 / 18 / 24 GB
+can't fit GLM-4.7's backbone plus headroom, so it starts at 32 GB.
 
-M2 / M3 / M4 Air, and M2 Pro (16 GB). 235B and GLM will not load.
+`paged-moe ladder` prints the fit table for your Mac, and `paged-moe machine`
+shows the cache, threads and headroom it picked.
 
-- [x] Sandbox tested
-- [ ] On-device
+---
 
-| Model | Full resident | Peak RAM | Headroom | Prefill | Decode |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| KAT-Coder-V2.5 6-bit | ~30 GB (OOM) | ~11 GB | **+20 GB** | ~450 tok/s | ~20 tok/s |
-| **Qwen3-Coder-Next** 6-bit | ~65 GB (OOM) | ~8 GB | **+56 GB** | ~172 tok/s | ~11 tok/s |
+## The hard parts
 
-### Mac: 18 GB
+This didn't come out of the box working. Some of what it took, and what's
+still rough.
 
-M3 Pro (18 GB). GLM will not load.
+- **The 235B started at about 2 tok/s.** Profiling got it to 2.6 at identical
+  output. Slab storage, route prediction and the read path got it to 6 and up.
+  It's still disk-bound: a token needs ~8 GB of expert weights and misses
+  ~1.5 GB of it, so the SSD sets the pace.
+- **It froze the machine.** First it was mlx-lm wiring nearly all of RAM. Then
+  mmap reads double-counting every expert in the page cache. Then `F_NOCACHE`,
+  which macOS quietly ignores for reads over 1 MB, so a long prefill filled the
+  file cache and the kernel started compressing the slab (a 16 second system
+  stall). Each one is fixed and has a guard now.
+- **Long prompts crashed.** A 67,586-token prompt used to take the server
+  down. It prefills in three chunks now (91 s) with the server alive.
+- **A quantized KV reuse bug produced confident, fluent, off-topic text.** That
+  one was nasty because nothing errored. There's a regression bench for it.
+- **Speculative decoding with a draft model is a 2 to 3x regression on the
+  235B.** A verify batch needs each layer's expert union, which thrashes the
+  cache. N-gram drafting won on a synthetic prompt and lost on agent traffic.
+  What finally worked is the governed verify loop above, which only drafts
+  where it measures faster.
+- **Pruning can break text.** Aggressive settings on the 235B once produced
+  garbage, and GLM-5.2 at its fastest setting can fall into a loop. The engine
+  now runs tool calls and turn starts at stricter settings, gates critical
+  misses, and has a loop rescue. It's still a fidelity knob, not a free
+  speedup.
+- **The GPU hung.** A Metal wait that never returned held 40 GB with no error,
+  and once a killed process left 30 GB held by the driver until a reboot. The
+  watchdog exits on stalls, and load checks for memory the driver is still
+  holding before it plans a budget.
+- **Small prefills are still expensive.** A few hundred tokens of tool result
+  routes to ~60% of the expert mass, so on Qwen3.8-Flash-Next even a short
+  result reads 46 to 82 GB. It's at the drive's speed now, but it's the main
+  thing between turns that's left.
+- **Some ideas just didn't pay.** The sidecar's prefill head, lookup decode on
+  agent traffic, batched prefill gathers, aligned reads. Measured, left off.
+- **The very biggest are slow at full fidelity.** Qwen3-Coder-480B with prune
+  off ran at about 1 tok/s in September. It runs. I wouldn't call it usable.
 
-- [x] Sandbox tested
-- [ ] On-device
+---
 
-| Model | Full resident | Peak RAM | Headroom | Prefill | Decode |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| KAT-Coder-V2.5 6-bit | ~30 GB (OOM) | ~12 GB | **+18 GB** | ~455 tok/s | ~21 tok/s |
-| **Qwen3-Coder-Next** 6-bit | ~65 GB (OOM) | ~10 GB | **+55 GB** | ~198 tok/s | ~12 tok/s |
-| Qwen3-235B-A22B 4-bit | ~132 GB (OOM) | ~8 GB | **+124 GB** | ~119 tok/s | ~9 tok/s |
+## What is exact and what isn't
 
-### Mac: 24 GB
+- **Default (prune off): bit-identical** to a fully resident load. Prefetch,
+  prediction, the sidecar, slabs, staging and verify drafts only change timing,
+  never which experts a layer computes with. The tests check this against
+  resident runs, including a starved cache.
+- **`PAGED_MOE_PRUNE` / `PAGED_MOE_WAIT_ABOVE`** skip low-weight experts when
+  they'd cost a disk read. Faster, and an approximation. Tool calls and the
+  first 64 tokens of a turn run stricter on their own.
+- **Verify** samples from the same model plain decode does at whatever prune
+  you set. `PAGED_MOE_VERIFY_FIDELITY=exact` makes every emitted token the
+  exact model's pick even with prune on, at the cost of heavier passes.
+- **The sidecar's prune head** is the only head that changes logits, and it's
+  off by default.
 
-M4 Pro (24 GB). GLM will not load. 235B becomes the daily pick.
+---
 
-- [x] Sandbox tested
-- [ ] On-device
+## Compatible models
 
-| Model | Full resident | Peak RAM | Headroom | Prefill | Decode |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| KAT-Coder-V2.5 6-bit | ~30 GB (OOM) | ~15 GB | **+15 GB** | ~428 tok/s | ~24 tok/s |
-| Qwen3-Coder-Next 6-bit | ~65 GB (OOM) | ~14 GB | **+50 GB** | ~202 tok/s | ~15 tok/s |
-| **Qwen3-235B-A22B** 4-bit | ~132 GB (OOM) | ~13 GB | **+120 GB** | ~108 tok/s | ~9 tok/s |
+Anything mlx-lm loads whose MoE layers use `SwitchGLU`, which is nearly all of
+them:
 
-### Mac: 32 GB
+| Family | Notes |
+| --- | --- |
+| Qwen3-MoE / Coder / 235B / 480B | 235B-A22B is the everyday stress test |
+| Qwen3-Next, Qwen3.8-Flash-Next | Hybrid attention, branching and replay handled |
+| GLM-4.5 / 4.6 / 4.7 | GLM-4.5-Air is a great fit for 48 GB |
+| GLM-5.2, DeepSeek-V3.2 | DSA sparse attention, sparse prefill path |
+| DeepSeek-V2 / V3, Kimi-K2 | MLA. Kimi needs `tiktoken` (installed by default) |
+| MiniMax-M2 / M3 | Sigmoid routers, XML tool calls, `<mm:think>` tags |
+| Mixtral, OLMoE, others | If it's SwitchGLU it should stream |
 
-M2 Pro / M3 Max class (32 GB). GLM joins.
+When a checkpoint ships an architecture file mlx-lm doesn't have yet (MiniMax-M3
+does), the engine registers it for that process instead of asking you to copy
+it into mlx-lm.
 
-- [x] Sandbox tested
-- [ ] On-device
+No custom format. Keep the checkpoints on the internal SSD when you can.
+Decode is mostly disk bandwidth, and Thunderbolt drives are several times
+slower.
 
-| Model | Full resident | Peak RAM | Headroom | Prefill | Decode |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| KAT-Coder-V2.5 6-bit | ~30 GB (OOM) | ~20 GB | **+10 GB** | ~418 tok/s | ~30 tok/s |
-| Qwen3-Coder-Next 6-bit | ~65 GB (OOM) | ~20 GB | **+45 GB** | ~201 tok/s | ~18 tok/s |
-| **Qwen3-235B-A22B** 4-bit | ~132 GB (OOM) | ~18 GB | **+114 GB** | ~105 tok/s | ~9 tok/s |
-| GLM-4.7 4-bit | ~199 GB (OOM) | ~18 GB | **+180 GB** | ~77 tok/s | ~6.5 tok/s |
+---
 
-### Mac: 48 GB
+## Config
 
-M4 Pro / M4 Max / M5 Pro (48 GB). 480B, DeepSeek, and Kimi are in the
-baseline table at the top.
+Per-model knobs go under `env:` in `~/paged-moe-config.yaml`, or in the
+process environment. Every knob is documented at the top of its block in
+`pagedmoe/config.py`. The ones worth knowing:
 
-- [x] Sandbox tested
-- [x] On-device
+| Knob | Default | What it does |
+| --- | --- | --- |
+| `PAGED_MOE_PRUNE` | `0` | skip weak experts that would need a read (fidelity knob) |
+| `PAGED_MOE_WAIT_ABOVE` | `0` | only stall on misses above this mixture weight |
+| `PAGED_MOE_CACHE_GB` / `_MAX_CACHE_GB` | auto / `26` | expert cache size and its ceiling |
+| `PAGED_MOE_PREDICT` | `auto` | route-prediction prefetch, governor picks on or off |
+| `PAGED_MOE_VERIFY` | `1` | verify decode on streamed models |
+| `PAGED_MOE_VERIFY_FIDELITY` | `plain` | `exact` = every token is the exact model's pick |
+| `PAGED_MOE_SELF_DRAFT` | `auto` | self-drafting, only when prune is 0 |
+| `PAGED_MOE_MTP` | `1` | MTP head as a drafter when the checkpoint has one |
+| `PAGED_MOE_FUSED_PREFILL` | `1` | attention sub-chunks, one MoE pass per chunk |
+| `PAGED_MOE_PREFILL_CHUNK` | `32768` | max tokens per prefill pass |
+| `PAGED_MOE_PREFILL_AHEAD` | `1` | start the next layer's prefill reads early |
+| `PAGED_MOE_PREFIX_DISK` | `1` | pinned front matter KV on disk |
+| `PAGED_MOE_HYBRID_CKPT` | `1` | recurrent-state checkpoints for branching |
+| `PAGED_MOE_NATIVE_READ` | `1` | C read pool, falls back to Python |
+| `PAGED_MOE_NOCACHE` | `1` | bypass the page cache. Leave it on |
+| `PAGED_MOE_MEM_PRESSURE` | `1` | shrink and regrow the slab with macOS memory pressure |
+| `PAGED_MOE_WATCHDOG` | `1` | exit on a stalled request or sustained critical pressure |
+| `PAGED_MOE_SIDECAR` | `0` | the online prefetch sidecar (wrap head on once enabled) |
+| `PAGED_MOE_EARLY_DECODE` | `0` | prefetch experts common right after prefill |
+| `PAGED_MOE_DOWNLOAD_DIR` | `~/models/paged-moe` | where HF repo ids download to |
 
-| Model | Full resident | Peak RAM | Headroom | Prefill | Decode |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| KAT-Coder-V2.5 6-bit | ~30 GB (OOM) | ~30 GB | **+0.5 GB** | ~420 tok/s | ~33 tok/s |
-| Qwen3-Coder-Next 6-bit | ~65 GB (OOM) | ~31 GB | **+34 GB** | ~218 tok/s | ~23 tok/s |
-| **Qwen3-235B-A22B** 4-bit | ~132 GB (OOM) | ~29 GB | **+104 GB** | ~92 tok/s | ~9 tok/s |
-| GLM-4.7 4-bit | ~199 GB (OOM) | ~29 GB | **+170 GB** | ~72 tok/s | ~7 tok/s |
+Recipes used for the table up top:
 
-### Mac: 64 GB
+```yaml
+# Qwen3-235B / Qwen3-Coder-480B
+env:
+  PAGED_MOE_PRUNE: "0.7"
+  PAGED_MOE_WAIT_ABOVE: "0.2"
+  PAGED_MOE_SIDECAR: "1"
 
-M4 Max / M5 Pro (64 GB). KAT is cache-resident at this size. Numbers are
-IO-scaled from the 48 GB on-device row (not loaded here).
+# GLM-4.7 / DeepSeek-V3.2 / Kimi-K2
+env:
+  PAGED_MOE_PRUNE: "0.8"
+  PAGED_MOE_WAIT_ABOVE: "0.2"
+  PAGED_MOE_SIDECAR: "1"
+```
 
-- [ ] Sandbox tested
-- [ ] On-device
+Leave prune unset for bit-identical decode.
 
-| Model | Full resident | Peak RAM | Headroom | Prefill | Decode |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| Qwen3-Coder-Next 6-bit | ~65 GB (OOM) | ~42 GB | **+22 GB** | ~250 tok/s | ~27 tok/s |
-| **Qwen3-235B-A22B** 4-bit | ~132 GB (OOM) | ~44 GB | **+88 GB** | ~115 tok/s | ~8 tok/s |
-| GLM-4.7 4-bit | ~199 GB (OOM) | ~45 GB | **+154 GB** | ~73 tok/s | ~8 tok/s |
+### Sidecar warm-start
 
-### Mac: 128 GB
+The sidecar learns online during normal decode. To warm it from a prompt
+corpus first:
 
-M5 Max (128 GB). Coder-Next and KAT are resident; 235B and GLM still stream.
-Numbers are IO-scaled from the 48 GB on-device row (not loaded here).
+```bash
+paged-moe-pretrain --quick --model ~/mlx-models/qwen3-235-4bit --corpus prompts.jsonl
+paged-moe-pretrain --fit-only --model ~/mlx-models/qwen3-235-4bit   # refit from what live use recorded
+paged-moe-pretrain --unlock-all
+```
 
-- [ ] Sandbox tested
-- [ ] On-device
+Weights live under `~/.paged_moe/sidecar/` (`PAGED_MOE_SIDECAR_DIR` to move
+them). More in [docs/tinymodel-improvements.md](./docs/tinymodel-improvements.md).
 
-| Model | Full resident | Peak RAM | Headroom | Prefill | Decode |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| **Qwen3-235B-A22B** 4-bit | ~132 GB (OOM) | ~85 GB | **+48 GB** | ~115 tok/s | ~10 tok/s |
-| GLM-4.7 4-bit | ~199 GB (OOM) | ~88 GB | **+111 GB** | ~73 tok/s | ~9 tok/s |
+### CLI
+
+| Command | Does |
+| --- | --- |
+| `paged-moe status` | hook, config paths, detected Mac |
+| `paged-moe which <model>` | will this path stream |
+| `paged-moe machine` | hardware plus derived cache / threads / headroom |
+| `paged-moe ladder` | per-Mac fit table |
+| `paged-moe install` / `uninstall` | the `mlx_lm.load` hook |
+| `paged-moe-server ...` | OpenAI-compatible server |
+| `paged-moe-pretrain ...` | sidecar warm-start / fit / unlock |
+| `python run.py --model ... --chat` | quick REPL from a clone |
+
+---
+
+## Upgrading from 0.2.x
+
+The import package is `pagedmoe` now (was `expert_stream`) and every env knob is
+`PAGED_MOE_*` (was `EXPERT_STREAM_*`). Old names are not read, so rename them
+in `~/paged-moe-config.yaml` or they're silently ignored.
+
+```bash
+paged-moe uninstall            # old hook, before the package goes away
+pip uninstall -y paged-moe
+git pull
+./install_mlx.sh
+sed -i '' 's/EXPERT_STREAM_/PAGED_MOE_/g' ~/paged-moe-config.yaml
+```
+
+If you skip the first line, Python prints an error about
+`zz_paged_moe_hook.pth` at startup until the reinstall rewrites it. Harmless,
+just noisy.
+
+---
+
+## Tests and benches
+
+```bash
+pip install -e ".[dev]"
+python -m pytest                   # most run in seconds on a tiny synthetic MoE
+python tests/test_real_model.py    # real MoE, ~4 GB download the first time
+```
+
+Tests that need a specific checkpoint skip when it isn't there. Run them with
+no `PAGED_MOE_*` exported, since a pruning setting makes decode approximate on
+purpose. `bench/` has the probes behind the numbers in this README.
+
+`walkthrough/tour.py` runs one real request and drops you into pdb at each
+major engine stage, if you want to see it work from the inside.
 
 ---
 
@@ -558,38 +562,29 @@ Numbers are IO-scaled from the 48 GB on-device row (not loaded here).
 
 | | |
 | --- | --- |
-| Open / research / AGPL use | [GNU Affero GPL v3](./LICENSE) |
-| Proprietary / closed product / SaaS / OEM | Commercial license - email `noah@qwertycode.org` |
-| Outside contributors | [CLA](./CLA.md) + [DCO](./DCO.md) (see [CONTRIBUTING.md](./CONTRIBUTING.md)) |
+| Open source / research / AGPL use | [GNU Affero GPL v3](./LICENSE) |
+| Closed product / SaaS / OEM | Commercial license, email `noah@qwertycode.org` |
+| Contributors | [CLA](./CLA.md) + [DCO](./DCO.md), see [CONTRIBUTING.md](./CONTRIBUTING.md) |
 
-Free under AGPL-3.0 for people and open projects. Companies shipping closed
-products, hosted services, or appliances without AGPL source disclosure should
-email for a commercial license:
-
-**Noah Clark** - `noah@qwertycode.org`
-
-In-repo summaries: [LICENSING.md](./LICENSING.md),
-[COMMERCIAL_LICENSE.md](./COMMERCIAL_LICENSE.md).
+Free under AGPL-3.0 for people and open projects. If you're shipping a closed
+product, a hosted service or an appliance and don't want to publish your source
+under the AGPL, email me for a commercial license. More in
+[LICENSING.md](./LICENSING.md) and [COMMERCIAL_LICENSE.md](./COMMERCIAL_LICENSE.md).
 
 Copyright (c) 2026 Noah Clark.
 
----
-
 ## Citation
-
-If you use this in research or write about it, please cite the repository
-(see [CITATION.cff](./CITATION.cff)):
 
 ```bibtex
 @software{clark_paged_moe,
- author = {Clark, Noah},
- title = {PagedMoE: Page MoE experts from disk on Apple Silicon},
- year = {2026},
- url = {https://github.com/noahclark556/paged-moe}
+  author = {Clark, Noah},
+  title = {PagedMoE: Page MoE experts from disk on Apple Silicon},
+  year = {2026},
+  url = {https://github.com/noahclark556/paged-moe}
 }
 ```
 
 ## Contact
 
-- Commercial license / dual-license: `noah@qwertycode.org`
-- Bugs / features: GitHub issues
+- Commercial / dual license: `noah@qwertycode.org`
+- Bugs and features: GitHub issues

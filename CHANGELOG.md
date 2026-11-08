@@ -8,6 +8,96 @@ Format loosely follows Keep a Changelog. Versioning aims for SemVer.
 
 <!-- Nothing yet. -->
 
+## [0.3.0] - 2026-11-07
+
+The full engine, same build as the one I run every day. 0.2.7 held a few
+pieces back from the public package. Those are back, plus everything since.
+
+### Breaking
+
+- Import package renamed `expert_stream` -> `pagedmoe`.
+- Env knobs renamed `EXPERT_STREAM_*` -> `PAGED_MOE_*`. Old names are not
+  read. Rename them in `~/paged-moe-config.yaml`. See "Upgrading from 0.2.x"
+  in the README.
+
+### Back in the package
+
+- Sidecar net-time governor (the sidecar only acts while decode is measurably
+  faster with it on).
+- Wrap head defaults on again once the sidecar is enabled.
+- Early-decode warm pool and the `[ttw]` time-to-warm lines.
+
+### Prefill
+
+- One pass over the expert mass per prompt where it fits. The expert cache
+  shrinks out of the way while a big chunk runs. Qwen3-Coder-Next, 31.5k-token
+  cold prompt: 541 -> 937 tok/s, 85 -> 44 GB read, lower peak.
+- Prefill lookahead (`PREFILL_AHEAD`): each layer starts the next layer's
+  reads. Qwen3-235B, 512 tokens on seeded KV: 9.1 s -> 6.0 s.
+- Prefill stage (`PREFILL_STAGE`): misses read through the native pool into a
+  temporary slab, no host copy.
+- Short chunks read misses straight into free slab slots.
+- The last decoder layer is skipped during prefill when nothing reads its
+  output. KV is bit-identical.
+- Prefill no longer reorders the decode working set.
+
+### Agent turns
+
+- Prompt-cache snapshots at the last divergence point, the think tail and
+  message boundaries. Agent turns reuse the conversation and prefill only the
+  new tokens (0.3 to 2 s on a 13.5k session).
+- `stable_prefix_messages`, `warm_prefix` and cache breakpoints.
+- Front matter KV on disk (`PREFIX_DISK`), with a fingerprint over weights,
+  config, engine numerics and settings. Head and shared files so a memory edit
+  or a new workspace doesn't start cold. Optional sealing at rest (AES-256-CTR
+  + HMAC-SHA256, key passed on a pipe).
+- Recurrent-state checkpoints (`HYBRID_CKPT`) so hybrid models can branch back
+  to an earlier message. Bit-identical to a fresh prefill, about 1 ms.
+- Replay splice: a returned assistant turn keeps the ids decode produced.
+
+### Decode
+
+- Verify decode (`VERIFY`, on): n-gram, self-draft and MTP drafters, one
+  pass per draft, per-span timing governor. 2.26x on a file edit with prune
+  off. Passes run at the same fidelity as plain decode by default,
+  `VERIFY_FIDELITY=exact` for exact-model tokens.
+- Row truncation and route replay keep verify passes cheap on big models.
+- Native reads split each expert across idle readers, demand misses first.
+  MiniMax-M3: 5.65 -> 9.31 tok/s. Qwen3.8-Flash-Next: 5.92 -> 8.66.
+- Hits early: slab-resident experts start on the GPU before the misses land.
+- Fidelity spans: tool calls and turn starts decode stricter under prune.
+  Critical-miss gate and loop rescue for aggressive settings.
+- Live `PRUNE` / `WAIT_ABOVE` changes without a restart.
+
+### Memory and stability
+
+- Every pread capped at 1 MB (past that macOS ignores `F_NOCACHE`) plus a page
+  cache trimmer. A long prefill used to fill the file cache and stall the
+  whole machine.
+- Slab follows macOS memory pressure down and regrows when it clears.
+- Resumed turns dequantize stored 8-bit KV one layer at a time (`KV_LAZY`).
+- Watchdog: a stalled request or sustained critical pressure exits with code
+  70 instead of hanging.
+- Load checks for GPU memory still held by the driver after a crash.
+- KV priced per architecture, including DSA caches.
+
+### Models
+
+- GLM-5.2 and DeepSeek-V3.2 through shared DSA classes, sparse prefill
+  attention (~110 s off a cold 32k prefill on GLM-5.2).
+- MiniMax-M2 / M3: sigmoid-bias routers, XML tool parser, `<mm:think>` tags,
+  checkpoint-shipped architecture files registered per process.
+- Qwen3.8-Flash-Next (`qwen4_exp`).
+- MTP heads as verify drafters, fetched when the conversion dropped them.
+- Image input for resident Qwen VL chat.
+- Kimi-K2 tokenizer needs `tiktoken`, now a dependency.
+
+### Repo
+
+- `tests/`, `bench/`, `docs/`, the Node client and a pdb walkthrough ship
+  again.
+- README rewritten around current numbers.
+
 ## [0.2.7] - 2026-09-18
 
 ### Changed

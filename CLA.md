@@ -1,19 +1,19 @@
 # Contributor License Agreement (CLA)
 
-**Version 1.0  -  PagedMoE**
+**Version 1.0 - PagedMoE**
 
-This Contributor License Agreement (“Agreement”) applies to any Contribution
-you submit to the **PagedMoE** project (the “Project”), maintained by
-**Noah Clark** (“Maintainer,” “we,” “us”).
+This Contributor License Agreement ("Agreement") applies to any Contribution
+you submit to the **PagedMoE** project (the "Project"), maintained by
+**Noah Clark** ("Maintainer," "we," "us").
 
 By submitting a Contribution (including via pull request, patch, issue with
 code, or other channel we accept), you accept this Agreement.
 
 ## 1. Definitions
 
-**“You”** means the individual or legal entity submitting a Contribution.
+**"You"** means the individual or legal entity submitting a Contribution.
 
-**“Contribution”** means any original work of authorship, including
+**"Contribution"** means any original work of authorship, including
 modifications or additions to existing work, that you intentionally submit
 to the Project for inclusion.
 
@@ -33,7 +33,7 @@ Contribution under:
 and under any future licenses the Maintainer chooses for the Project, so long
 as an AGPL-3.0-or-later (or successor OSI-approved strong copyleft that
 preserves network copyleft intent) public edition of the Project continues to
-be offered for the Contribution’s lineage unless you and the Maintainer agree
+be offered for the Contribution's lineage unless you and the Maintainer agree
 otherwise in writing.
 
 You retain copyright ownership of your Contribution. This is a **license
@@ -86,12 +86,12 @@ doing **both**:
    I have read and agree to the PagedMoE CLA (CLA.md).
    ```
 
-When `cla-assistant` (or equivalent) is enabled, checking “I agree” once per
+When `cla-assistant` (or equivalent) is enabled, checking "I agree" once per
 GitHub identity satisfies item 2 for future PRs from that identity.
 
 ## 7. Disclaimer
 
-Contributions are provided “AS IS”, without warranties of any kind.
+Contributions are provided "AS IS", without warranties of any kind.
 
 ---
 

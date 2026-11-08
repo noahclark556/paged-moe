@@ -28,6 +28,8 @@ venv/
 models/
 mlx-models/
 bench/memory_results/
+bench/mass_cover_results/
+bench/sandbox_ladder_results/
 *.gguf
 
 # Secrets
@@ -40,3 +42,5 @@ credentials.json
 # Native extension build artifacts (rebuild via pip / JIT)
 *.so
 *.dylib
+
+DO_NOT_UPDATE.md

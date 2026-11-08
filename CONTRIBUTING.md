@@ -1,8 +1,5 @@
 # Contributing
 
-This repo is no longer updated. Issues and pull requests will not be merged.
-The current runtime and benchmarks are at [globalagent.dev](https://globalagent.dev).
-
 Thanks for wanting to help. The public engine is dual-licensed (AGPL-3.0 +
 commercial). Outside contributions are only accepted under the
 [Contributor License Agreement](./CLA.md) so they can ship on **both** paths.
@@ -17,7 +14,8 @@ commercial). Outside contributions are only accepted under the
 
 **CLA:** explicit dual-license grant to the maintainer. This is what keeps
 commercial licensing viable after the first outside PR. Read
-[CLA.md](./CLA.md). Until GitHub CLA tooling is wired up, put this in every PR:
+[CLA.md](./CLA.md). Until GitHub CLA tooling is wired up, every PR needs this
+line in its description (the PR template has it as a checkbox, just tick it):
 
 ```
 I have read and agree to the PagedMoE CLA (CLA.md).

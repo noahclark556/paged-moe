@@ -4,8 +4,8 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "paged-moe"
-version = "0.2.7"
-description = "PagedMoE: stream MoE experts from disk through mlx-lm on Apple silicon"
+version = "0.3.0"
+description = "PagedMoE: run MoE models bigger than your Mac's RAM by paging experts from the SSD through mlx-lm"
 readme = "README.md"
 requires-python = ">=3.10"
 license = { text = "AGPL-3.0-or-later OR LicenseRef-PagedMoE-Commercial" }
@@ -16,6 +16,8 @@ dependencies = [
   "huggingface_hub>=0.24",
   "mlx>=0.32; sys_platform == 'darwin'",
   "mlx-lm>=0.31.3; sys_platform == 'darwin'",
+  # Kimi K2 ships a tiktoken tokenizer (tokenization_kimi.py).
+  "tiktoken>=0.7",
 ]
 
 [project.optional-dependencies]
@@ -30,15 +32,20 @@ Issues = "https://github.com/noahclark556/paged-moe/issues"
 License = "https://github.com/noahclark556/paged-moe/blob/main/LICENSING.md"
 
 [project.scripts]
-paged-moe = "expert_stream.mlx_hook:main"
-paged-moe-server = "expert_stream.server:main"
-paged-moe-pretrain = "expert_stream.pretrain_sidecar:main"
+paged-moe = "pagedmoe.mlx_hook:main"
+paged-moe-server = "pagedmoe.server:main"
+paged-moe-pretrain = "pagedmoe.pretrain_sidecar:main"
 
 [tool.setuptools.packages.find]
-include = ["expert_stream*"]
+include = ["pagedmoe*"]
 
 [tool.setuptools.package-data]
-expert_stream = ["pretrained_sidecar/*", "_native_read.c"]
+pagedmoe = ["pretrained_sidecar/*", "_native_read.c"]
 
 [tool.setuptools]
 license-files = ["LICENSE", "NOTICE", "LICENSING.md"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-q"

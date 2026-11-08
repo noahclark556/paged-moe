@@ -12,7 +12,7 @@ MoE model.
     python run.py --model <path-or-repo> --prompt ... --stats
 
 Useful flags: --mode resident|streamed, --cache-gb N, --max-tokens N.
-For an HTTP API instead, use: python -m expert_stream.server --model ...
+For an HTTP API instead, use: python -m pagedmoe.server --model ...
 """
 
 import argparse
@@ -22,7 +22,7 @@ import sys
 from mlx_lm import stream_generate
 from mlx_lm.sample_utils import make_sampler
 
-from expert_stream import config, get_stats, load, relieve_pressure
+from pagedmoe import config, get_stats, load, relieve_pressure
 
 
 def build_prompt(tokenizer, messages):
@@ -46,9 +46,9 @@ def generate(
     prompt = build_prompt(tokenizer, messages)
     sampler = make_sampler(temp=temp)
     kwargs = {}
-    if getattr(model, "_expert_stream_cache", None) is not None:
+    if getattr(model, "_pagedmoe_cache", None) is not None:
         # Streamed models are memory-starved by definition: keep the KV cache
-        # at 8-bit (≈half the fp16 footprint, no meaningful quality loss).
+        # at 8-bit (~half the fp16 footprint, no meaningful quality loss).
         kwargs = {"kv_bits": 8, "kv_group_size": 64}
         # Each prefill chunk activates ~every expert, so it reads ~the whole
         # uncached expert mass. Fewer, bigger chunks = fewer passes over disk

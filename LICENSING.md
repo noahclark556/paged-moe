@@ -4,10 +4,10 @@
 
 | Path | Who it's for | Terms |
 | --- | --- | --- |
-| **AGPL-3.0** | individuals, researchers, open projects, evaluation | Free to use, study, modify, and share under AGPL-3.0  -  see [`LICENSE`](./LICENSE) |
-| **Commercial** | companies that need proprietary / closed-source use | Paid license from the copyright holder  -  see [`COMMERCIAL_LICENSE.md`](./COMMERCIAL_LICENSE.md) |
+| **AGPL-3.0** | individuals, researchers, open projects, evaluation | Free to use, study, modify, and share under AGPL-3.0 - see [`LICENSE`](./LICENSE) |
+| **Commercial** | companies that need proprietary / closed-source use | Paid license from the copyright holder - see [`COMMERCIAL_LICENSE.md`](./COMMERCIAL_LICENSE.md) |
 
-Copyright © 2026 Noah Clark. Dual licensing does **not** transfer copyright.
+Copyright (c) 2026 Noah Clark. Dual licensing does **not** transfer copyright.
 It gives you a choice of which grant applies to your use.
 
 ## What AGPL-3.0 allows (the open path)
@@ -22,7 +22,7 @@ You may:
 If you **distribute** a modified version, or offer a modified version as a
 **network service** (SaaS / hosted API / product backend), AGPL-3.0 generally
 requires you to provide the corresponding source to users under AGPL-3.0
-(see AGPL §13).
+(see AGPL section 13).
 
 ## What AGPL-3.0 does *not* silently allow
 
@@ -35,18 +35,18 @@ You may **not**, under the AGPL grant alone:
 
 ### Internal use (read carefully)
 
-“Just running it inside our company” is **not** a bright-line safe harbor
+"Just running it inside our company" is **not** a bright-line safe harbor
 under AGPL the way it often is under MIT/Apache.
 
 - Unmodified, single-user / local use is the low-friction case.
 - The network clause is aimed at remote interaction with a **modified**
   program. How that applies to large orgs (other teams hitting an internal
   service, contractors, subsidiaries) is **genuinely debated** among counsel.
-- If you’re unsure whether your setup triggers source obligations, that
+- If you're unsure whether your setup triggers source obligations, that
   uncertainty is exactly what a [commercial license](./COMMERCIAL_LICENSE.md)
   removes.
 
-When in doubt, get a commercial license  -  or get your own lawyer’s opinion.
+When in doubt, get a commercial license - or get your own lawyer's opinion.
 
 ## What the commercial license is for
 
@@ -72,8 +72,8 @@ straightforward; the CLA is what keeps that true after the first outside PR.
 
 ## Third-party dependencies
 
-Runtime dependencies such as **mlx**, **mlx-lm**, and **huggingface_hub**
-are under permissive licenses (MIT / Apache-2.0). Those licenses are
+Runtime dependencies (**mlx**, **mlx-lm**, **huggingface_hub**, **numpy**,
+**tiktoken**) are under permissive licenses (MIT / BSD / Apache-2.0). Those licenses are
 compatible with including them alongside an AGPL-licensed work. They remain
 under their own terms; PagedMoE does not relicense them. See
 [`NOTICE`](./NOTICE).
@@ -82,7 +82,7 @@ under their own terms; PagedMoE does not relicense them. See
 
 Commercial licensing and dual-license questions:
 
-**Noah Clark**  -  `noah@qwertycode.org`
+**Noah Clark** - `noah@qwertycode.org`
 
 Please include: company name, intended use (embedded product / SaaS / internal
 tooling), and whether you need support.

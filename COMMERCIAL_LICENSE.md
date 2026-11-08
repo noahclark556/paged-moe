@@ -6,7 +6,7 @@ copyright holder.
 
 ## Why buy one
 
-PagedMoE’s public grant is [AGPL-3.0](./LICENSE). That is intentionally
+PagedMoE's public grant is [AGPL-3.0](./LICENSE). That is intentionally
 strong: it keeps the project inspectable and contribution-friendly while
 blocking silent closed-source commercialization of the engine.
 
@@ -42,7 +42,7 @@ Email **Noah Clark** at `noah@qwertycode.org` with:
 
 1. Company / product name  
 2. Use case (local product, cloud API, internal tooling, OEM, ...)  
-3. Approximate scale (seats, nodes, or API volume  -  rough is fine)  
+3. Approximate scale (seats, nodes, or API volume - rough is fine)  
 4. Whether you need support or custom work  
 
 Subject line suggestion: `PagedMoE commercial license inquiry`
@@ -51,7 +51,7 @@ Subject line suggestion: `PagedMoE commercial license inquiry`
 
 **PagedMoE** (and the repo / PyPI name `paged-moe`) refers to the official
 project maintained by Noah Clark. Commercial licensees may describe
-integration (“powered by PagedMoE”) as allowed in the signed agreement; do
+integration ("powered by PagedMoE") as allowed in the signed agreement; do
 not imply endorsement or claim to be the upstream project without written
 permission.
 
