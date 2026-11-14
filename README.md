@@ -9,10 +9,10 @@ after the first turn, an agent's next turn usually starts in **under 2
 seconds**, not a minute.
 
 I haven't benched it, but the largest model I've had running reliably as an
-agent on a 48 GB MacBook is **GLM-5.2, a 743B parameter model**, through the
+agent on a 48 GB MacBook is **GLM-5.2, a 744B parameter model**, through the
 Global Agent app.
 
-Watch GLM-5.2 (743B) on 48 GB:
+Watch GLM-5.2 (744B) on 48 GB:
 [GLM-5.2](https://pagedmoe.com/videos/glm.mp4)
 
 Watch MiniMax M3 (426B) on 48 GB:
