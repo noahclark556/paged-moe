@@ -62,7 +62,9 @@ def test_scan_counts_quantized_and_routed(tmp_path):
 def test_inspect_reads_moe_shape(tmp_path):
     ck = autotune.inspect(str(_write_checkpoint(tmp_path / "m")))
     assert ck.moe and ck.bits == 4 and ck.model_type == "fake_moe"
-    assert ck.fits_resident
+    # RAM comes from the host, and CI runners have about 7 GB.
+    assert replace(ck, ram_gb=48.0).fits_resident
+    assert not replace(ck, ram_gb=48.0, disk_gb=200.0).fits_resident
 
 
 def test_inspect_needs_a_local_checkpoint(tmp_path):
