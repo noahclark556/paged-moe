@@ -155,7 +155,9 @@ cd paged-moe
 ```
 
 That installs the package into your mlx venv, turns on the `mlx_lm.load` hook,
-and writes `~/paged-moe-config.yaml`. By hand:
+and writes `~/paged-moe-config.yaml`.
+
+Or if you'd rather do it by hand:
 
 ```bash
 source ~/.mlx-env/bin/activate
@@ -183,6 +185,15 @@ Only listed paths stream. Everything else stays stock mlx-lm. Edit it any
 time, no reinstall. You can also drop a `.paged_moe` file in a checkpoint
 folder, or `export PAGED_MOE=1` to stream every load. Kill switch:
 `PAGED_MOE_HOOK=0`.
+
+Or if you'd rather do a quick test first, `run.py` in the repo root streams any
+checkpoint without touching the config:
+
+```bash
+python run.py --model ~/mlx-models/qwen38-coder-flash \
+  --mode streamed --stats --max-tokens 200 \
+  --prompt "Write a Python function that merges two sorted lists."
+```
 
 ### 3. Use mlx like normal
 

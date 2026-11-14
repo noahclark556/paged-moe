@@ -62,7 +62,9 @@ jobs:
           from pagedmoe import config
           from pagedmoe import native_read
 
-          check("version", pagedmoe.__version__ == "0.3.0", pagedmoe.__version__)
+          import tomllib
+          want = tomllib.loads(Path("pyproject.toml").read_text())["project"]["version"]
+          check("version", pagedmoe.__version__ == want, f"{pagedmoe.__version__} (pyproject {want})")
           check("PRUNE default off", config.PRUNE == 0.0, repr(config.PRUNE))
           check("NATIVE_READ default on", config.NATIVE_READ == "on", repr(config.NATIVE_READ))
           check("VERIFY default on", config.VERIFY is True)
