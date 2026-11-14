@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "paged-moe"
-version = "0.3.0"
+version = "0.3.1"
 description = "PagedMoE: run MoE models bigger than your Mac's RAM by paging experts from the SSD through mlx-lm"
 readme = "README.md"
 requires-python = ">=3.10"

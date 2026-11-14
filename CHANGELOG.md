@@ -8,6 +8,13 @@ Format loosely follows Keep a Changelog. Versioning aims for SemVer.
 
 <!-- Nothing yet. -->
 
+## [0.3.1] - 2026-11-14
+
+Fixed loading checkpoints that ship their own model file (Qwen Flash with
+qwen4_exp.py, MiniMax-M3, etc.) on mlx-lm 0.32. Newer mlx-lm won't build those
+without trust_remote_code, so the loader now passes it through the same way the
+tokenizer already did. Older mlx-lm still works.
+
 ## [0.3.0] - 2026-11-07
 
 The full engine, same build as the one I run every day. 0.2.7 held a few

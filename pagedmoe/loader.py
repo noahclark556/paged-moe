@@ -31,6 +31,7 @@ chat templates) works unchanged.
 
 from __future__ import annotations
 
+import inspect
 import time
 from pathlib import Path
 
@@ -345,12 +346,24 @@ def load(
     from .dsa_shared import get_model_classes
     from .local_arch import register as register_local_arch
 
+    # Match stock mlx-lm sharded_load: custom-code repos (Kimi tiktoken, etc.)
+    # need this. Server passes trust_remote_code=None unless --trust-remote-code
+    # is set; treat None as True so local checkpoints with tokenization_*.py load.
+    tok_cfg = dict(tokenizer_config or {})
+    if tok_cfg.get("trust_remote_code") is None:
+        tok_cfg["trust_remote_code"] = True
+
     register_local_arch(model_path)
+    model_kwargs = {}
+    # mlx-lm 0.32 refuses config model_file (qwen4_exp.py etc.) without this.
+    if "trust_remote_code" in inspect.signature(load_model).parameters:
+        model_kwargs["trust_remote_code"] = tok_cfg["trust_remote_code"]
     model, cfg = load_model(
         model_path,
         lazy=True,
         model_config=model_config,
         get_model_classes=get_model_classes,
+        **model_kwargs,
     )
     # DeepSeek-V2 caches expanded heads unless this is installed first.
     from .mla_v2 import install as install_mla_v2
@@ -800,12 +813,6 @@ def load(
         model = load_adapters(model, adapter_path)
         model.eval()
 
-    # Match stock mlx-lm sharded_load: custom-code repos (Kimi tiktoken, etc.)
-    # need this. Server passes trust_remote_code=None unless --trust-remote-code
-    # is set; treat None as True so local checkpoints with tokenization_*.py load.
-    tok_cfg = dict(tokenizer_config or {})
-    if tok_cfg.get("trust_remote_code") is None:
-        tok_cfg["trust_remote_code"] = True
     tokenizer = load_tokenizer(
         model_path,
         tok_cfg,
