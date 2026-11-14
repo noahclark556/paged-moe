@@ -20,6 +20,10 @@ and broke generation. `install_mlx.sh` also makes `~/.mlx-env` when it's
 missing, checks for Python 3.10+ on arm64 (3.12 preferred), and installs the
 hook into that venv even when another one is active.
 
+`constraints.txt` pins everything the pinned packages pull in (regex, hf-xet,
+httpx, and so on) to the bench env versions, and `install_mlx.sh` installs with
+it. pyyaml is pinned directly now since the engine reads its config with it.
+
 ## [0.3.2] - 2026-11-14
 
 `paged-moe-server` and `run.py` now read `~/paged-moe-config.yaml`. Before this

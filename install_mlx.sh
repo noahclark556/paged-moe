@@ -120,12 +120,15 @@ PY
 
 echo "-> pip install -e PagedMoE  ($ES_PYTHON)"
 "$ES_PYTHON" -m pip install -U pip setuptools wheel >/dev/null
+# constraints.txt holds the dependencies of the dependencies at the tested versions too.
+PIN_ARGS=()
+[[ -f "$ROOT/constraints.txt" ]] && PIN_ARGS=(-c "$ROOT/constraints.txt")
 if [[ -f "$ROOT/requirements.txt" ]]; then
-  "$ES_PYTHON" -m pip install -r "$ROOT/requirements.txt"
+  "$ES_PYTHON" -m pip install -r "$ROOT/requirements.txt" ${PIN_ARGS[@]+"${PIN_ARGS[@]}"}
 fi
 # Native expert-read extension builds when a compiler is present; install
 # still succeeds without it (runtime JIT or Python pool fallback).
-"$ES_PYTHON" -m pip install -e "$ROOT"
+"$ES_PYTHON" -m pip install -e "$ROOT" ${PIN_ARGS[@]+"${PIN_ARGS[@]}"}
 
 echo "-> import check"
 "$ES_PYTHON" -c "import pagedmoe; print('  ok', pagedmoe.__file__)"

@@ -194,7 +194,9 @@ with macOS is 3.9, so if it can't find a newer one `brew install python@3.12`
 and rerun.
 
 mlx, mlx-lm and the tokenizer stack are pinned to the exact versions the
-engine was built and benchmarked on (see `requirements.txt`). The engine hooks
+engine was built and benchmarked on (see `requirements.txt`), and
+`constraints.txt` holds everything those pull in at the same versions, so a
+fresh install matches the bench env package for package. The engine hooks
 into mlx-lm internals, and a newer mlx-lm already breaks it, so if you install
 into a venv you already use, the installer will move those packages to the
 pinned versions. Use a separate venv if something else in there needs newer
