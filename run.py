@@ -11,13 +11,19 @@ MoE model.
     python run.py --model <path-or-repo> --chat          # interactive REPL
     python run.py --model <path-or-repo> --prompt ... --stats
 
-Useful flags: --mode resident|streamed, --cache-gb N, --max-tokens N.
-For an HTTP API instead, use: python -m pagedmoe.server --model ...
+Useful flags: --mode resident|streamed, --cache-gb N, --max-tokens N,
+--config PATH (default ~/paged-moe-config.yaml).
+For an HTTP API instead, use: paged-moe-server --model ...
 """
 
 import argparse
 import json
 import sys
+
+from pagedmoe.launch_env import apply as apply_launch_env
+
+# Per-model settings from the config, before the engine reads its knobs.
+apply_launch_env()
 
 from mlx_lm import stream_generate
 from mlx_lm.sample_utils import make_sampler

@@ -42,7 +42,7 @@ os.environ.setdefault("MLX_METAL_FAST_SYNCH", "0")
 if os.environ.get("PAGED_MOE_FAST_BUFFERS", "1") != "0":
     os.environ.setdefault("MLX_MAX_OPS_PER_BUFFER", "500")
 
-__version__ = "0.3.1"
+__version__ = "0.3.2"
 __all__ = [
     "load",
     "get_stats",

@@ -187,7 +187,7 @@ folder, or `export PAGED_MOE=1` to stream every load. Kill switch:
 `PAGED_MOE_HOOK=0`.
 
 Or if you'd rather do a quick test first, `run.py` in the repo root streams any
-checkpoint without touching the config:
+checkpoint, listed or not:
 
 ```bash
 python run.py --model ~/mlx-models/qwen38-coder-flash \
@@ -211,6 +211,10 @@ Or run the OpenAI-compatible server and point your agent at it:
 paged-moe-server --model ~/mlx-models/qwen3-235-4bit --port 8080
 # http://127.0.0.1:8080/v1, any API key
 ```
+
+The server and `run.py` pick up the same per-model `env:` from the config. A knob
+you already exported wins over the file. Pass `--config /path/to/file.yaml` to
+use a different one.
 
 Quick checks:
 

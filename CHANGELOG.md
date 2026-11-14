@@ -8,6 +8,13 @@ Format loosely follows Keep a Changelog. Versioning aims for SemVer.
 
 <!-- Nothing yet. -->
 
+## [0.3.2] - 2026-11-14
+
+`paged-moe-server` and `run.py` now read `~/paged-moe-config.yaml`. Before this
+only the mlx_lm.load hook did, so the server ran on bare defaults even with
+per-model `env:` set. Anything you export still wins over the file, and
+`--config PATH` points at a different one. `PAGED_MOE_HOOK=0` turns it off.
+
 ## [0.3.1] - 2026-11-14
 
 Fixed loading checkpoints that ship their own model file (Qwen Flash with
