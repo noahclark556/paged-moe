@@ -56,7 +56,9 @@ def install() -> None:
 def _allow_image_content(mlx_server) -> None:
     import json as _json
 
-    def process_message_content(messages):
+    # mlx-lm 0.32.2+ passes keep_images and wants the image URLs back for its
+    # own vision path. Images stay in the content for ours, so it gets none.
+    def process_message_content(messages, *, keep_images=False):
         for message in messages:
             content = message.get("content")
             if isinstance(content, list):
@@ -80,6 +82,7 @@ def _allow_image_content(mlx_server) -> None:
                     args = func.get("arguments")
                     if isinstance(args, str) and args:
                         func["arguments"] = _json.loads(args)
+        return []
 
     mlx_server.process_message_content = process_message_content
 

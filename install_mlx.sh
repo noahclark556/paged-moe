@@ -15,6 +15,9 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 MLX_ENV="${AGENT_MLX_ENV:-${MLX_ENV:-$HOME/.mlx-env}}"
 ES_PYTHON="${PAGED_MOE_PYTHON:-$MLX_ENV/bin/python}"
+# Only make a venv when we're using the default one, not a --python you passed.
+CUSTOM_PYTHON=0
+[[ -n "${PAGED_MOE_PYTHON:-}" ]] && CUSTOM_PYTHON=1
 UNINSTALL=0
 NO_HOOK=0
 MODELS_DIR="${PAGED_MOE_MODELS_DIR:-}"
@@ -36,24 +39,61 @@ while [[ $# -gt 0 ]]; do
     -h|--help) usage; exit 0 ;;
     --uninstall) UNINSTALL=1; shift ;;
     --no-hook) NO_HOOK=1; shift ;;
-    --python) ES_PYTHON="$2"; shift 2 ;;
+    --python) ES_PYTHON="$2"; CUSTOM_PYTHON=1; shift 2 ;;
     --models-dir) MODELS_DIR="$2"; shift 2 ;;
     *) echo "unknown arg: $1" >&2; usage; exit 2 ;;
   esac
 done
 
+# MLX needs Python 3.10+ running natively on Apple Silicon (not under Rosetta).
+python_ok() {
+  "$1" -c 'import platform, sys; sys.exit(0 if sys.version_info >= (3, 10) and platform.machine() == "arm64" else 1)' 2>/dev/null
+}
+
+python_desc() {
+  "$1" -c 'import platform, sys; print(f"Python {sys.version.split()[0]} ({platform.machine()})")' 2>/dev/null || echo "unknown"
+}
+
 if [[ ! -x "$ES_PYTHON" ]]; then
-  echo "error: python not found: $ES_PYTHON" >&2
-  echo "  Create ~/.mlx-env and install mlx-lm / mlx-openai-server first." >&2
+  if [[ "$CUSTOM_PYTHON" -eq 1 || "$UNINSTALL" -eq 1 ]]; then
+    echo "error: python not found: $ES_PYTHON" >&2
+    exit 1
+  fi
+  # The stock macOS python3 is 3.9, so look for a newer one first. 3.12 is
+  # what the engine is tested on.
+  BASE_PY=""
+  for cand in python3.12 python3.13 python3.11 python3.10 python3; do
+    if command -v "$cand" >/dev/null 2>&1 && python_ok "$(command -v "$cand")"; then
+      BASE_PY="$(command -v "$cand")"
+      break
+    fi
+  done
+  if [[ -z "$BASE_PY" ]]; then
+    echo "error: no Python 3.10+ for Apple Silicon found." >&2
+    echo "  Install one (brew install python@3.12, or python.org), then rerun." >&2
+    exit 1
+  fi
+  echo "-> creating venv $MLX_ENV with $(python_desc "$BASE_PY")"
+  "$BASE_PY" -m venv "$MLX_ENV"
+fi
+
+if ! python_ok "$ES_PYTHON"; then
+  echo "error: $ES_PYTHON is $(python_desc "$ES_PYTHON"). MLX needs Python 3.10+ on arm64." >&2
+  if [[ "$CUSTOM_PYTHON" -eq 0 ]]; then
+    echo "  Remove it (rm -rf $MLX_ENV) and rerun, this script will make a new one." >&2
+  fi
   exit 1
 fi
+
+# This env's own CLI. Whatever paged-moe is first on PATH may belong to another venv.
+PM_BIN="$(dirname "$ES_PYTHON")/paged-moe"
 
 if [[ "$UNINSTALL" -eq 1 ]]; then
   echo "-> remove PagedMoE mlx auto-hook"
   # Prefer the console script so we avoid ``python -m`` re-importing a module
   # the still-present .pth already loaded (runpy RuntimeWarning).
-  if command -v paged-moe >/dev/null 2>&1; then
-    paged-moe uninstall || true
+  if [[ -x "$PM_BIN" ]]; then
+    "$PM_BIN" uninstall || true
   else
     "$ES_PYTHON" -c "from pagedmoe.mlx_hook import main; raise SystemExit(main(['uninstall']))" || true
   fi
@@ -111,15 +151,15 @@ HOOK_ARGS=(--models-dir "$MODELS_DIR")
 
 if [[ "$NO_HOOK" -eq 0 ]]; then
   echo "-> install PagedMoE mlx auto-hook + ~/paged-moe-config.yaml"
-  if command -v paged-moe >/dev/null 2>&1; then
-    paged-moe install "${HOOK_ARGS[@]}"
+  if [[ -x "$PM_BIN" ]]; then
+    "$PM_BIN" install "${HOOK_ARGS[@]}"
   else
     "$ES_PYTHON" -c "from pagedmoe.mlx_hook import main; raise SystemExit(main(['install', '--models-dir', r'''$MODELS_DIR''']))"
   fi
 else
   echo "-> skip auto-hook (--no-hook); ensuring ~/paged-moe-config.yaml"
-  if command -v paged-moe >/dev/null 2>&1; then
-    paged-moe ensure-config "${HOOK_ARGS[@]}"
+  if [[ -x "$PM_BIN" ]]; then
+    "$PM_BIN" ensure-config "${HOOK_ARGS[@]}"
   else
     "$ES_PYTHON" -c "from pagedmoe.mlx_hook import main; raise SystemExit(main(['ensure-config', '--models-dir', r'''$MODELS_DIR''']))"
   fi
@@ -134,6 +174,9 @@ echo "  pretrained  seeded into sidecar/ when shipped with this build"
 echo "  models dir  $MODELS_DIR  (edit paths in config anytime)"
 echo "  status      paged-moe status"
 echo ""
-echo "Next: confirm paths in ~/paged-moe-config.yaml, then:"
+echo "Next: activate the venv so paged-moe is on your PATH:"
+echo "  source $(dirname "$ES_PYTHON")/activate"
+echo "  paged-moe serve /path/to/model --port 8080"
+echo "Or confirm paths in ~/paged-moe-config.yaml, then:"
 echo "  paged-moe which /path/to/model"
 echo "See README.md (Install) for mlx test steps."

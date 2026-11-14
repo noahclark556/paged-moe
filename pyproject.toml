@@ -12,12 +12,21 @@ license = { text = "AGPL-3.0-or-later OR LicenseRef-PagedMoE-Commercial" }
 authors = [{ name = "Noah Clark" }]
 keywords = ["mlx", "moe", "apple-silicon", "inference", "paged-experts"]
 dependencies = [
-  "numpy>=1.26",
-  "huggingface_hub>=0.24",
-  "mlx>=0.32; sys_platform == 'darwin'",
-  "mlx-lm>=0.31.3; sys_platform == 'darwin'",
+  # Pinned to the versions the engine was built, tuned and benchmarked on.
+  # The engine hooks mlx-lm internals and the tokenizer stack, so a newer
+  # release can break it or change the numbers in the docs.
+  "mlx==0.32.2; sys_platform == 'darwin'",
+  "mlx-lm==0.31.3; sys_platform == 'darwin'",
+  "numpy==2.3.5",
+  "huggingface_hub==1.16.1",
+  "transformers==5.14.1",
+  "tokenizers==0.22.2",
+  "safetensors==0.8.0",
+  "sentencepiece==0.2.2",
+  "protobuf==7.35.1",
+  "jinja2==3.1.6",
   # Kimi K2 ships a tiktoken tokenizer (tokenization_kimi.py).
-  "tiktoken>=0.7",
+  "tiktoken==0.13.0",
 ]
 
 [project.optional-dependencies]

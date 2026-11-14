@@ -12,8 +12,8 @@ MoE model.
     python run.py --model <path-or-repo> --prompt ... --stats
 
 Useful flags: --mode resident|streamed, --cache-gb N, --max-tokens N,
---config PATH (default ~/paged-moe-config.yaml).
-For an HTTP API instead, use: paged-moe-server --model ...
+--config PATH (default ~/paged-moe-config.yaml), --speed 0-1|exact|auto.
+For an HTTP API instead, use: paged-moe serve <path>
 """
 
 import argparse

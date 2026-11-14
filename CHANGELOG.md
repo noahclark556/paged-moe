@@ -6,7 +6,19 @@ Format loosely follows Keep a Changelog. Versioning aims for SemVer.
 
 ## [Unreleased]
 
-<!-- Nothing yet. -->
+`paged-moe serve <model>` starts the server from just a model path, no config
+needed. It reads the checkpoint (size, active params, bit width) and runs exact
+by default. `--speed` goes from 1 (exact) to 0 (fastest), or `auto` to pick a
+prune for that model, and works on `paged-moe-server` and `run.py` too.
+`paged-moe detect <model>` prints what it found and what `--speed` would set.
+The server also prints a line on startup saying whether output is exact.
+
+Dependencies are now pinned to the exact versions the engine was built and
+benchmarked on (mlx 0.32.2, mlx-lm 0.31.3, and the tokenizer stack). A fresh
+install was pulling mlx-lm 0.32, which changed the internals the engine hooks
+and broke generation. `install_mlx.sh` also makes `~/.mlx-env` when it's
+missing, checks for Python 3.10+ on arm64 (3.12 preferred), and installs the
+hook into that venv even when another one is active.
 
 ## [0.3.2] - 2026-11-14
 

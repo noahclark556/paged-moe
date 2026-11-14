@@ -296,6 +296,7 @@ def load(
     lazy: bool = False,  # accepted for mlx-lm API compatibility; ignored
     return_config: bool = False,
     revision: str | None = None,
+    trust_remote_code: bool | None = None,  # see tok_cfg below
     *,
     mode: str | None = None,
     cache_gb: float | None = None,
@@ -349,6 +350,8 @@ def load(
     # Match stock mlx-lm sharded_load: custom-code repos (Kimi tiktoken, etc.)
     # need this. Server passes trust_remote_code=None unless --trust-remote-code
     # is set; treat None as True so local checkpoints with tokenization_*.py load.
+    # mlx-lm 0.32.2+ also passes it as its own argument, False unless the flag
+    # is set. It's accepted but doesn't override this default.
     tok_cfg = dict(tokenizer_config or {})
     if tok_cfg.get("trust_remote_code") is None:
         tok_cfg["trust_remote_code"] = True

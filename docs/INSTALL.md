@@ -20,8 +20,9 @@ folder).
 ## Requirements
 
 - macOS + Apple Silicon (Metal)
-- Python 3.10+ venv with **mlx** / **mlx-lm** (same one as openai-server if you use it), typically `~/.mlx-env`
-- Matching versions: see `requirements.txt` / `pyproject.toml` (`mlx-lm>=0.31.3`)
+- Python 3.10+ running natively on arm64. The `python3` that ships with macOS is 3.9, so get a newer one from Homebrew (`brew install python@3.12`) or python.org.
+- A venv for mlx, typically `~/.mlx-env` (same one as openai-server if you use it). `install_mlx.sh` makes it if it's missing and installs mlx / mlx-lm into it.
+- Pinned versions: `requirements.txt` / `pyproject.toml` pin mlx 0.32.2, mlx-lm 0.31.3, transformers, tokenizers, huggingface_hub, numpy and the rest of the tokenizer stack to exactly what the engine was built and benchmarked on. The engine hooks mlx-lm internals (mlx-lm 0.32 already breaks it), so installing into an existing venv moves those packages to the pinned versions. Use a separate venv if something else needs newer ones.
 
 ## Install
 
@@ -30,6 +31,7 @@ cd paged-moe               # cloned repo root
 chmod +x install_mlx.sh
 ./install_mlx.sh
 # or: ./install_mlx.sh --python /path/to/venv/bin/python
+source ~/.mlx-env/bin/activate
 ```
 
 Manual equivalent:

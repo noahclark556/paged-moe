@@ -363,8 +363,41 @@ def main(argv: list[str] | None = None) -> int:
         print(
             "usage: paged-moe "
             "[status|install|uninstall|ensure-config|which <model-path>|"
+            "detect <model-path> [--speed S]|serve <model-path> [--speed S] [server flags]|"
             "machine|ladder] [--models-dir PATH]"
         )
+        return 0
+
+    if cmd == "serve":
+        if len(argv) < 2 or argv[1].startswith("-"):
+            print("usage: paged-moe serve <model-path> [--speed 0-1|exact|auto] [server flags]", file=sys.stderr)
+            return 2
+        from .launch_env import server_main
+
+        sys.argv = ["paged-moe-server", "--model", argv[1], *argv[2:]]
+        server_main()
+        return 0
+
+    if cmd == "detect":
+        if len(argv) < 2 or argv[1].startswith("-"):
+            print("usage: paged-moe detect <model-path> [--speed 0-1|exact|auto]", file=sys.stderr)
+            return 2
+        from . import autotune
+
+        rest = argv[2:]
+        raw = rest[rest.index("--speed") + 1] if "--speed" in rest[:-1] else "auto"
+        try:
+            speed = autotune.parse_speed(raw)
+        except ValueError as e:
+            print(e, file=sys.stderr)
+            return 2
+        ck = autotune.inspect(argv[1])
+        print(ck.describe())
+        print(f"--speed {raw}:")
+        for k, v in sorted(autotune.speed_env(ck, speed).items()):
+            print(f"  {k}={v}")
+        curve = autotune.speed_curve(ck.path)
+        print("speed scale: " + ("measured on this model" if curve else "fixed (no kept-mass table yet)"))
         return 0
 
     if cmd == "ensure-config":

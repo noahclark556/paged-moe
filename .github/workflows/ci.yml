@@ -82,6 +82,8 @@ jobs:
               "pagedmoe.time_to_warm",
               "pagedmoe.native_read",
               "pagedmoe.seal",
+              "pagedmoe.autotune",
+              "pagedmoe.launch_env",
               # mlx-backed modules last (fresh CI install loads mlx once cleanly)
               "pagedmoe.cache",
               "pagedmoe.streaming",
@@ -104,10 +106,10 @@ jobs:
           print("ship smoke passed")
           PY
 
-      - name: Machine envelope tests (no GPU)
+      - name: Machine envelope and --speed tests (no GPU)
         env:
           PAGED_MOE_HOOK: "0"
-        run: python -m pytest tests/test_machine.py
+        run: python -m pytest tests/test_machine.py tests/test_autotune.py
 
       - name: Detect this Mac + print a ladder
         env:

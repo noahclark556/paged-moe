@@ -141,8 +141,40 @@ Full list in the [CHANGELOG](./CHANGELOG.md).
 
 ## Quick start
 
-Three steps. After that you use mlx-lm / mlx-openai-server the way you
-already do.
+**Fastest way:** install, then point `paged-moe serve` at a model. No config
+needed. It reads the checkpoint, sizes everything for your Mac and picks the
+settings on its own. The detection logic is ported from Global Agent, so it's
+the same thing the app does when you download a model there.
+
+```bash
+git clone https://github.com/noahclark556/paged-moe.git
+cd paged-moe
+./install_mlx.sh              # makes ~/.mlx-env if you don't have one
+source ~/.mlx-env/bin/activate
+
+# exact (default): bit-identical output
+paged-moe serve ~/mlx-models/qwen38-coder-flash --port 8080
+
+# or speed: picks a prune for this model, faster but not bit-identical
+paged-moe serve ~/mlx-models/qwen38-coder-flash --speed auto --port 8080
+```
+
+`--speed` also takes a number from 1 (exact) to 0 (fastest). Then call it like
+any OpenAI-compatible server:
+
+```bash
+curl -N http://127.0.0.1:8080/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{
+    "model": "default_model",
+    "messages": [{"role": "user", "content": "Write a Python function that merges two sorted lists."}],
+    "max_tokens": 300,
+    "stream": true
+  }'
+```
+
+If you want the full setup (the mlx_lm hook, per-model config), it's three
+steps. After that you use mlx-lm / mlx-openai-server the way you already do.
 
 ### 1. Install
 
@@ -152,10 +184,21 @@ cd paged-moe
 ./install_mlx.sh
 # or: ./install_mlx.sh --python /path/to/venv/bin/python
 # or: ./install_mlx.sh --models-dir ~/mlx-models
+source ~/.mlx-env/bin/activate
 ```
 
 That installs the package into your mlx venv, turns on the `mlx_lm.load` hook,
-and writes `~/paged-moe-config.yaml`.
+and writes `~/paged-moe-config.yaml`. If you don't have `~/.mlx-env` yet it
+makes one. It needs Python 3.10+ on Apple Silicon, and the `python3` that ships
+with macOS is 3.9, so if it can't find a newer one `brew install python@3.12`
+and rerun.
+
+mlx, mlx-lm and the tokenizer stack are pinned to the exact versions the
+engine was built and benchmarked on (see `requirements.txt`). The engine hooks
+into mlx-lm internals, and a newer mlx-lm already breaks it, so if you install
+into a venv you already use, the installer will move those packages to the
+pinned versions. Use a separate venv if something else in there needs newer
+ones.
 
 Or if you'd rather do it by hand:
 
@@ -216,6 +259,25 @@ The server and `run.py` pick up the same per-model `env:` from the config. A kno
 you already exported wins over the file. Pass `--config /path/to/file.yaml` to
 use a different one.
 
+Don't want to touch the config at all? Point `paged-moe serve` at a model. It
+reads the checkpoint, sizes everything for your Mac and runs exact by default.
+`--speed` is there if you want to trade some fidelity for speed:
+
+```bash
+paged-moe serve ~/mlx-models/qwen38-coder-flash --port 8080               # exact
+paged-moe serve ~/mlx-models/qwen38-coder-flash --speed auto --port 8080  # picks a prune for this model
+paged-moe serve ~/mlx-models/qwen38-coder-flash --speed 0.5 --port 8080   # 1 is exact, 0 is fastest
+```
+
+`auto` picks from the model's size, active params and bit width. Bigger models
+get more prune, low-bit and small-active ones get less. Once a model has run
+pruned for a while the number scale follows how much of the mixture each
+setting actually keeps on that model. `--speed` wins over the config and
+anything exported, and it works on `paged-moe-server` and `run.py` too. On
+startup it prints what it found and whether the output is exact.
+`paged-moe detect <model> --speed auto` shows what it would pick without
+loading anything.
+
 Quick checks:
 
 ```bash
@@ -233,16 +295,16 @@ and kills it when you're done.
 ### Who it's for
 
 - Qwen / GLM / DeepSeek / Kimi / MiniMax class MoEs on a Mac that can't hold
-  them
+them
 - Agent loops, not just one-shot chat
 - Plain MLX checkpoints. No converted format, no second copy on disk
 
 ### Who it's not for
 
 - Models that already fit in RAM. Stock mlx-lm is enough (PagedMoE just
-  loads those resident anyway)
+loads those resident anyway)
 - The smallest possible memory footprint. This spends RAM on a big expert
-  cache on purpose, so agent turns stay warm
+cache on purpose, so agent turns stay warm
 - NVIDIA / CUDA
 
 ---
@@ -259,23 +321,23 @@ the same, the output is the same.
 The parts that make it fast enough to use:
 
 - **Route prediction.** Each layer's router is a small resident matrix, so
-  the engine runs the next few layers' routers on the current hidden state and
-  starts those reads early. On a disk-bound test (64-expert MoE with an
-  external-SSD read delay) that was 10.6 to 19.0 tok/s. On a model the cache
-  already holds it costs a few percent, so a governor measures both ways and
-  keeps whichever wins.
+the engine runs the next few layers' routers on the current hidden state and
+starts those reads early. On a disk-bound test (64-expert MoE with an
+external-SSD read delay) that was 10.6 to 19.0 tok/s. On a model the cache
+already holds it costs a few percent, so a governor measures both ways and
+keeps whichever wins.
 - **Slab storage.** Cached experts live in fixed GPU slots and compute takes
-  views into them. +11% decode on Qwen3-235B, +20% on Qwen3-Next.
+views into them. +11% decode on Qwen3-235B, +20% on Qwen3-Next.
 - **Native reads.** A small C pool does the reads with the GIL released,
-  split across readers, with demand misses ahead of speculation. Falls back to
-  Python if it can't build.
+split across readers, with demand misses ahead of speculation. Falls back to
+Python if it can't build.
 - **Frequency-aware eviction.** Hot experts get a second chance, so one
-  prefill sweep can't flush the working set.
+prefill sweep can't flush the working set.
 - **Memory that behaves.** KV is priced up front, 8-bit for long contexts,
-  and dequantized one layer at a time when a stored conversation is resumed.
+and dequantized one layer at a time when a stored conversation is resumed.
 - **An optional sidecar.** A tiny online model that learns which experts come
-  next and prefetches them. It only acts while decode is measurably faster
-  with it on.
+next and prefetches them. It only acts while decode is measurably faster
+with it on.
 
 None of the speed work changes which experts run. A wrong guess wastes a read,
 that's it. The full walkthrough is in [docs/DESIGN.md](./docs/DESIGN.md), and
@@ -291,32 +353,32 @@ expert weights, so re-prefilling a 30k conversation costs 60 to 80 seconds.
 The server works hard to never do that.
 
 - **Prefix reuse that survives real clients.** Agent clients rewrite things:
-  thinking text that never gets replayed, reminders parked at the tail,
-  blocks edited near the front. The server snapshots the KV at the last point
-  a prompt diverged from the one before it, so it learns each client's stable
-  and volatile parts from real traffic. `PAGED_MOE_PREFIX_DEBUG=1` logs how
-  much each request reused and where it diverged.
+thinking text that never gets replayed, reminders parked at the tail,
+blocks edited near the front. The server snapshots the KV at the last point
+a prompt diverged from the one before it, so it learns each client's stable
+and volatile parts from real traffic. `PAGED_MOE_PREFIX_DEBUG=1` logs how
+much each request reused and where it diverged.
 - **Stable front matter.** Send `stable_prefix_messages: N` and the first N
-  messages are pinned. History compaction after that only prefills the new
-  history.
+messages are pinned. History compaction after that only prefills the new
+history.
 - **Front matter on disk.** The pinned prefix (system prompt, tools, codebase
-  map, memory) is written to disk and loaded after a restart. A file only
-  loads if the weights, config, engine numerics, settings and token ids all
-  match and its CRC checks out. Otherwise it's a normal prefill. Hosts that
-  encrypt their data can hand the engine a key over a pipe and the files are
-  sealed at rest.
+map, memory) is written to disk and loaded after a restart. A file only
+loads if the weights, config, engine numerics, settings and token ids all
+match and its CRC checks out. Otherwise it's a normal prefill. Hosts that
+encrypt their data can hand the engine a key over a pipe and the files are
+sealed at rest.
 - **Branching on hybrid caches.** Linear-attention layers can't be trimmed,
-  so a retry or an edited message used to prefill from scratch. The engine
-  keeps the small recurrent state at each turn's resume point and restores it
-  in about a millisecond, bit-identical to a fresh prefill.
+so a retry or an edited message used to prefill from scratch. The engine
+keeps the small recurrent state at each turn's resume point and restores it
+in about a millisecond, bit-identical to a fresh prefill.
 - **Replay with the real ids.** When a turn comes back as text and
-  re-tokenizes differently than what decode produced, the engine splices the
-  original ids back in so the stored cache still matches.
-- **`warm_prefix`.** POST a message list with `max_tokens: 0` and
-  `warm_prefix: true` and it gets prefilled and cached without decoding.
-  Handy after a task finishes and you collapse history to a summary.
+re-tokenizes differently than what decode produced, the engine splices the
+original ids back in so the stored cache still matches.
+- `warm_prefix`**.** POST a message list with `max_tokens: 0` and
+`warm_prefix: true` and it gets prefilled and cached without decoding.
+Handy after a task finishes and you collapse history to a summary.
 - **Cache breakpoints.** `cache_control` on a message, `cache_breaks: [...]`
-  on the request, or `<|cache_break|>` in the text.
+on the request, or `<|cache_break|>` in the text.
 
 All of this is plain OpenAI-compatible JSON. Fields the server doesn't know
 are ignored by other servers, so they're safe to send. The host side of the
@@ -387,57 +449,58 @@ This didn't come out of the box working. Some of what it took, and what's
 still rough.
 
 - **The 235B started at about 2 tok/s.** Profiling got it to 2.6 at identical
-  output. Slab storage, route prediction and the read path got it to 6 and up.
-  It's still disk-bound: a token needs ~8 GB of expert weights and misses
-  ~1.5 GB of it, so the SSD sets the pace.
+output. Slab storage, route prediction and the read path got it to 6 and up.
+It's still disk-bound: a token needs ~8 GB of expert weights and misses
+~1.5 GB of it, so the SSD sets the pace.
 - **It froze the machine.** First it was mlx-lm wiring nearly all of RAM. Then
-  mmap reads double-counting every expert in the page cache. Then `F_NOCACHE`,
-  which macOS quietly ignores for reads over 1 MB, so a long prefill filled the
-  file cache and the kernel started compressing the slab (a 16 second system
-  stall). Each one is fixed and has a guard now.
+mmap reads double-counting every expert in the page cache. Then `F_NOCACHE`,
+which macOS quietly ignores for reads over 1 MB, so a long prefill filled the
+file cache and the kernel started compressing the slab (a 16 second system
+stall). Each one is fixed and has a guard now.
 - **Long prompts crashed.** A 67,586-token prompt used to take the server
-  down. It prefills in three chunks now (91 s) with the server alive.
+down. It prefills in three chunks now (91 s) with the server alive.
 - **A quantized KV reuse bug produced confident, fluent, off-topic text.** That
-  one was nasty because nothing errored. There's a regression bench for it.
+one was nasty because nothing errored. There's a regression bench for it.
 - **Speculative decoding with a draft model is a 2 to 3x regression on the
-  235B.** A verify batch needs each layer's expert union, which thrashes the
-  cache. N-gram drafting won on a synthetic prompt and lost on agent traffic.
-  What finally worked is the governed verify loop above, which only drafts
-  where it measures faster.
+235B.** A verify batch needs each layer's expert union, which thrashes the
+cache. N-gram drafting won on a synthetic prompt and lost on agent traffic.
+What finally worked is the governed verify loop above, which only drafts
+where it measures faster.
 - **Pruning can break text.** Aggressive settings on the 235B once produced
-  garbage, and GLM-5.2 at its fastest setting can fall into a loop. The engine
-  now runs tool calls and turn starts at stricter settings, gates critical
-  misses, and has a loop rescue. It's still a fidelity knob, not a free
-  speedup.
+garbage, and GLM-5.2 at its fastest setting can fall into a loop. The engine
+now runs tool calls and turn starts at stricter settings, gates critical
+misses, and has a loop rescue. It's still a fidelity knob, not a free
+speedup.
 - **The GPU hung.** A Metal wait that never returned held 40 GB with no error,
-  and once a killed process left 30 GB held by the driver until a reboot. The
-  watchdog exits on stalls, and load checks for memory the driver is still
-  holding before it plans a budget.
+and once a killed process left 30 GB held by the driver until a reboot. The
+watchdog exits on stalls, and load checks for memory the driver is still
+holding before it plans a budget.
 - **Small prefills are still expensive.** A few hundred tokens of tool result
-  routes to ~60% of the expert mass, so on Qwen3.8-Flash-Next even a short
-  result reads 46 to 82 GB. It's at the drive's speed now, but it's the main
-  thing between turns that's left.
+routes to ~60% of the expert mass, so on Qwen3.8-Flash-Next even a short
+result reads 46 to 82 GB. It's at the drive's speed now, but it's the main
+thing between turns that's left.
 - **Some ideas just didn't pay.** The sidecar's prefill head, lookup decode on
-  agent traffic, batched prefill gathers, aligned reads. Measured, left off.
+agent traffic, batched prefill gathers, aligned reads. Measured, left off.
 - **The very biggest are slow at full fidelity.** Qwen3-Coder-480B with prune
-  off ran at about 1 tok/s in September. It runs. I wouldn't call it usable.
+off ran at about 1 tok/s in September. It runs. I wouldn't call it usable.
 
 ---
 
 ## What is exact and what isn't
 
 - **Default (prune off): bit-identical** to a fully resident load. Prefetch,
-  prediction, the sidecar, slabs, staging and verify drafts only change timing,
-  never which experts a layer computes with. The tests check this against
-  resident runs, including a starved cache.
-- **`PAGED_MOE_PRUNE` / `PAGED_MOE_WAIT_ABOVE`** skip low-weight experts when
-  they'd cost a disk read. Faster, and an approximation. Tool calls and the
-  first 64 tokens of a turn run stricter on their own.
+prediction, the sidecar, slabs, staging and verify drafts only change timing,
+never which experts a layer computes with. The tests check this against
+resident runs, including a starved cache.
+- `PAGED_MOE_PRUNE` **/** `PAGED_MOE_WAIT_ABOVE` skip low-weight experts when
+they'd cost a disk read. Faster, and an approximation. Tool calls and the
+first 64 tokens of a turn run stricter on their own. `--speed` below 1 sets
+these for you.
 - **Verify** samples from the same model plain decode does at whatever prune
-  you set. `PAGED_MOE_VERIFY_FIDELITY=exact` makes every emitted token the
-  exact model's pick even with prune on, at the cost of heavier passes.
+you set. `PAGED_MOE_VERIFY_FIDELITY=exact` makes every emitted token the
+exact model's pick even with prune on, at the cost of heavier passes.
 - **The sidecar's prune head** is the only head that changes logits, and it's
-  off by default.
+off by default.
 
 ---
 
@@ -536,6 +599,8 @@ them). More in [docs/tinymodel-improvements.md](./docs/tinymodel-improvements.md
 | `paged-moe machine` | hardware plus derived cache / threads / headroom |
 | `paged-moe ladder` | per-Mac fit table |
 | `paged-moe install` / `uninstall` | the `mlx_lm.load` hook |
+| `paged-moe serve <model> [--speed S]` | server from just a model path |
+| `paged-moe detect <model> [--speed S]` | what it reads off a checkpoint and what `--speed` would set |
 | `paged-moe-server ...` | OpenAI-compatible server |
 | `paged-moe-pretrain ...` | sidecar warm-start / fit / unlock |
 | `python run.py --model ... --chat` | quick REPL from a clone |
