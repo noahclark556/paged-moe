@@ -85,6 +85,22 @@ A client that already does its own repair can send `"tool_call_repair": false`
 to get the old output back, and `PAGED_MOE_TOOL_REPAIR=0` turns it off for the
 whole server.
 
+Requests that don't send sampling settings now get the model's own instead of
+greedy decoding. mlx-lm falls back to temperature 0 with no top-k, which isn't
+what any of these models were tuned for, and thinking models tend to loop on
+it. Plenty of OpenAI clients only send the messages, so that's what they got.
+
+Anything left out now comes from the checkpoint's `generation_config.json`,
+and whatever that file doesn't set comes from the family's serving recipe:
+top-k 40 for DeepSeek and GLM, and a light 1.05 repetition penalty for Qwen,
+which stops the paste loops it falls into without hurting code or tool calls.
+A checkpoint whose config says `do_sample: false` stays greedy. The startup log
+shows what it picked and where each value came from.
+
+Anything the request sends still wins, and so do `--temp`, `--top-p`, `--top-k`
+and `--min-p` on the server. `PAGED_MOE_SAMPLING_DEFAULTS=0` goes back to
+mlx-lm's defaults.
+
 ## [0.3.2] - 2026-11-14
 
 `paged-moe-server` and `run.py` now read `~/paged-moe-config.yaml`. Before this

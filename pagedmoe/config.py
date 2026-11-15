@@ -1713,6 +1713,11 @@ TEMPLATE_KWARGS: bool = bool(_env("PAGED_MOE_TEMPLATE_KWARGS", 1, int))
 # requests that send tools, and only for names those tools offer. A request
 # can turn it off with "tool_call_repair": false. 0 = off for every request.
 TOOL_REPAIR: bool = bool(_env("PAGED_MOE_TOOL_REPAIR", 1, int))
+# Sampling settings a request leaves out come from the checkpoint's
+# generation_config.json, then the family recipe (sampling.py), instead of
+# mlx-lm's greedy defaults. Request values and --temp / --top-p / --top-k /
+# --min-p on the server still win. 0 = mlx-lm's defaults.
+SAMPLING_DEFAULTS: bool = bool(_env("PAGED_MOE_SAMPLING_DEFAULTS", 1, int))
 
 # The stable pin (host front matter) on disk, see prefix_disk.py. A restart
 # used to prefill the front matter again: 14k tokens, 40 s on Flash.

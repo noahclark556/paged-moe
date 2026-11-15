@@ -82,6 +82,7 @@ from . import (
     prune_curve,
     replay_splice,
     rescue,
+    sampling,
     stage_gentle,
     think_budget,
     tool_repair,
@@ -2685,6 +2686,8 @@ def install_patches(model=None):
             _install_kimi_tool_parser(self.tokenizer)
         _install_json_tools_unwrap(self.tokenizer)
         _stop_on_endoftext(self.tokenizer)
+        if config.SAMPLING_DEFAULTS:
+            _sampling_for(model)
         fidelity.configure(self.tokenizer)
         rescue.configure(self.tokenizer)
         try:
@@ -2917,6 +2920,8 @@ def install_patches(model=None):
             self.chat_template_kwargs = lifted
         self._pm_tool_names = tool_repair.tool_names(body.get("tools"))
         request = _legacy_deepseek_request(self, request, body)
+        if config.SAMPLING_DEFAULTS:
+            sampling.fill(self, body, _sampling_for(_served_model, self)[0])
         activity.enter()
         turn_trace.begin(body, _model)
         trace_err = None
@@ -3291,6 +3296,27 @@ def _keep_open_tool_call(response):
             state = "tool"
         prev = state
         yield gen
+
+
+_sampling_cache: dict = {}
+
+
+def _sampling_for(model, handler=None) -> tuple:
+    """(defaults, sources) for the served checkpoint, worked out once (sampling.py)."""
+    path = (getattr(model, "_pagedmoe_info", None) or {}).get("model_path")
+    if not path and handler is not None:
+        try:
+            path = handler.response_generator.cli_args.model
+        except AttributeError:
+            path = None
+    mt = getattr(getattr(model, "args", None), "model_type", "") or ""
+    key = (path, mt)
+    hit = _sampling_cache.get(key)
+    if hit is None:
+        hit = sampling.defaults_for(path, mt) if (path or mt) else ({}, {})
+        _sampling_cache[key] = hit
+        print(f"[paged-moe] sampling when a request leaves it out: {sampling.describe(*hit)}", flush=True)
+    return hit
 
 
 _legacy_ds_templates: dict = {}
