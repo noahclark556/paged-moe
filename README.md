@@ -75,6 +75,28 @@ exact unless you say otherwise, so export the Setting column first to match a
 row, e.g. `PAGED_MOE_PRUNE=0.8 PAGED_MOE_WAIT_ABOVE=0.2 ./bench/memory_benchmark.sh 3`
 for GLM-4.7.
 
+To bench your own model on your own Mac, use `paged-moe bench`. It replays a
+fixed coding agent task (8 requests building a small express app, about 13k
+tokens of context) against the server, once at `--speed 0.25` and once exact,
+and prints decode tok/s, time to first token, prefill, memory and how far the
+speed run lands from the exact model.
+
+For the most accurate numbers, restart the Mac before each measurement. The
+first two commands below run speed and then exact back to back. To restart in
+between, run the last two separately instead.
+
+```bash
+paged-moe bench ~/mlx-models/<model> --quick        # speed + exact, half budgets
+paged-moe bench ~/mlx-models/<model>                # speed + exact, full run, the number to quote
+
+paged-moe bench ~/mlx-models/<model> --speed 0.25   # speed only
+paged-moe bench ~/mlx-models/<model> --exact        # exact only
+```
+
+Results go to `~/.paged_moe/bench/` as JSON. It ignores exported `PAGED_MOE_*`
+and `paged-moe-config.yaml` so runs compare across Macs. `--env KEY=VAL` if
+you want to try a setting on top.
+
 The headline isn't "fastest tokens on earth." It's that a 199 GB or 578 GB
 model on a laptop goes from a hard no to something you can actually work with.
 
@@ -603,6 +625,7 @@ them). More in [docs/tinymodel-improvements.md](./docs/tinymodel-improvements.md
 | `paged-moe install` / `uninstall` | the `mlx_lm.load` hook |
 | `paged-moe serve <model> [--speed S]` | server from just a model path |
 | `paged-moe detect <model> [--speed S]` | what it reads off a checkpoint and what `--speed` would set |
+| `paged-moe bench <model> [--speed S\|--exact] [--quick]` | agent-task bench on this Mac, speed and exact |
 | `paged-moe-server ...` | OpenAI-compatible server |
 | `paged-moe-pretrain ...` | sidecar warm-start / fit / unlock |
 | `python run.py --model ... --chat` | quick REPL from a clone |

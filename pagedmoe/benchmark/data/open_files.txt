@@ -1,0 +1,1042 @@
+[OPEN EDITORS] Files the user has open from another project. Reference only; they are not in /workspace and don't need changes.
+
+--- autotune.py ---
+# Copyright (C) 2026 Noah Clark
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""
+Read a checkpoint and turn a speed setting into engine knobs.
+
+The engine already picks resident or streamed by size and sizes its cache
+from this Mac. The one thing it can't pick for you is fidelity: how much of
+the router's mixture to drop when an expert would need a disk read. That's
+`--speed`:
+
+  1 (or "exact")  nothing dropped, bit-identical output
+  0.5             PRUNE 0.7, WAIT_ABOVE 0.25
+  0               PRUNE 0.95, WAIT_ABOVE 0.5, one-pass decode
+  auto            a per-model pick from total size, active size and bit width
+
+Positions in between are spaced by how much of the mixture each setting keeps
+on this model, once the engine has recorded that (prune_curve.py). Before that
+they follow the fixed mapping above.
+
+Nothing in here imports the engine, so it can run before pagedmoe.config
+reads the environment.
+"""
+
+from __future__ import annotations
+
+import glob
+import hashlib
+import json
+import math
+import os
+import re
+import struct
+from dataclasses import dataclass
+from pathlib import Path
+
+# Whole checkpoint plus this much headroom has to fit in this share of RAM
+# before it runs resident (no prune needed).
+_RESIDENT_RAM_FRACTION = 0.82
+_RESIDENT_HEADROOM_GB = 6.0
+# Few active params means each dropped expert is a bigger share of the output.
+_SMALL_ACTIVE_B = 12.0
+# Same bars prune_curve.position() uses before a table counts.
+_CURVE_MIN_ROWS = 4096
+_CURVE_MIN_SPAN = 0.05
+_CURVE_POINTS = 101
+
+_ROUTED_RE = re.compile(r"\.(?:experts|switch_mlp|block_sparse_moe\.experts)\.")
+_SHARED_RE = re.compile(r"shared_expert")
+_LOOKUP_RE = re.compile(r"embed")
+_DTYPE_BYTES = {"F64": 8, "F32": 4, "BF16": 2, "F16": 2, "I64": 8, "I32": 4, "I16": 2, "I8": 1, "U8": 1, "BOOL": 1}
+
+
+@dataclass
+class Checkpoint:
+    path: str
+    model_type: str
+    total_b: float | None
+    active_b: float | None
+    moe: bool
+    bits: int | None
+    disk_gb: float
+    ram_gb: float
+
+    @property
+    def fits_resident(self) -> bool:
+        return self.disk_gb + _RESIDENT_HEADROOM_GB <= self.ram_gb * _RESIDENT_RAM_FRACTION
+
+    def describe(self) -> str:
+        parts = []
+        if self.total_b:
+            parts.append(f"{self.total_b:g}B")
+        if self.moe:
+            parts.append(f"MoE, {self.active_b:g}B active" if self.active_b else "MoE")
+        if self.bits:
+            parts.append(f"{self.bits}-bit")
+        parts.append(f"{self.disk_gb:.0f} GB on disk")
+        where = "fits in memory" if self.fits_resident else "streams"
+        return f"{', '.join(parts)}, {where} on this {self.ram_gb:.0f} GB Mac"
+
+
+def _read_json(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text())
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _ram_gb() -> float:
+    try:
+        return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / (1 << 30)
+    except (ValueError, OSError):
+        return 48.0
+
+
+def _expert_counts(cfg: dict) -> tuple[int, int]:
+    def first(*keys):
+        for k in keys:
+            try:
+                v = int(cfg.get(k) or 0)
+            except (TypeError, ValueError):
+                continue
+            if v > 0:
+                return v
+        return 0
+
+    experts = first("num_local_experts", "num_experts", "n_routed_experts", "moe_num_experts", "num_routed_experts")
+    top_k = first("num_experts_per_tok", "moe_topk", "num_experts_per_token", "moe_k", "top_k_experts")
+    return experts, top_k
+
+
+def _scan_params(model_dir: Path, quant: dict) -> tuple[float, float, float] | None:
+    """(total, routed expert, embedding) params from the safetensors headers.
+
+    Quantized weights are packed U32, so the bit width comes back per tensor
+    from its scales. Mixed-precision checkpoints count right that way.
+    """
+    files = sorted(glob.glob(str(model_dir / "*.safetensors")))
+    index = _read_json(model_dir / "model.safetensors.index.json").get("weight_map")
+    if isinstance(index, dict) and index:
+        named = set(index.values())
+        files = [f for f in files if os.path.basename(f) in named]
+    if not files:
+        return None
+    tensors: dict[str, tuple[str, list[int]]] = {}
+    for path in files:
+        try:
+            with open(path, "rb") as f:
+                (size,) = struct.unpack("<Q", f.read(8))
+                if not 0 < size < 256 << 20:
+                    return None
+                header = json.loads(f.read(size))
+        except (OSError, ValueError, struct.error):
+            return None
+        for name, meta in header.items():
+            if name != "__metadata__":
+                tensors[name] = (meta["dtype"], list(meta["shape"]))
+
+    bits_default = int(quant.get("bits") or 4)
+    group_default = int(quant.get("group_size") or 64)
+    total = routed = lookup = 0.0
+    for name, (dtype, shape) in tensors.items():
+        if re.search(r"\.(scales|biases)$", name):
+            owner = tensors.get(re.sub(r"\.(scales|biases)$", ".weight", name))
+            if owner and owner[0] == "U32":
+                continue
+        elems = 1
+        for d in shape:
+            elems *= d
+        if dtype == "U32":
+            base = name.removesuffix(".weight")
+            override = quant.get(base) if isinstance(quant.get(base), dict) else {}
+            group = int(override.get("group_size") or group_default)
+            scales = tensors.get(f"{base}.scales")
+            packed = shape[-1] if shape else 1
+            if scales and scales[1]:
+                bits = packed * 32 / (scales[1][-1] * group)
+            else:
+                bits = int(override.get("bits") or bits_default)
+            params = elems * 32 / (bits if bits > 0 else bits_default)
+        elif dtype in _DTYPE_BYTES:
+            params = float(elems)
+        else:
+            continue
+        total += params
+        if _ROUTED_RE.search(name) and not _SHARED_RE.search(name):
+            routed += params
+        elif _LOOKUP_RE.search(name):
+            lookup += params
+    return (total, routed, lookup) if total > 0 else None
+
+
+def inspect(model_path: str) -> Checkpoint:
+    """Sizes and shape of a local MLX checkpoint, from its config and headers."""
+    model_dir = Path(os.path.expanduser(model_path))
+    if not (model_dir / "config.json").is_file():
+        raise FileNotFoundError(f"no config.json in {model_dir}")
+    config = _read_json(model_dir / "config.json")
+    lang = dict(config)
+    for key in ("text_config", "llm_config", "language_config"):
+        if isinstance(config.get(key), dict):
+            lang.update(config[key])
+            break
+    quant = config.get("quantization") or config.get("quantization_config") or {}
+    quant = quant if isinstance(quant, dict) else {}
+    bits = int(quant["bits"]) if str(quant.get("bits", "")).isdigit() else None
+
+    disk = 0
+    for f in glob.glob(str(model_dir / "*.safetensors")):
+        try:
+            disk += os.stat(f).st_size
+        except OSError:
+            pass
+
+    experts, top_k = _expert_counts(lang)
+    scan = _scan_params(model_dir, quant)
+    moe = bool(scan and scan[1] > 0) or experts >= 4
+
+    def round_b(n: float) -> float:
+        return max(0.1, round(n / 1e8) / 10)
+
+    total_b = active_b = None
+    if scan:
+        total, routed, lookup = scan
+        total_b = round_b(total)
+        if moe and experts and top_k and routed:
+            active_b = round_b(total - lookup - routed + routed * top_k / experts)
+        else:
+            active_b = total_b
+    elif disk:
+        total_b = round(disk * 8 / ((bits + 0.5) if bits else 16) / 1e9)
+        active_b = round(total_b * top_k / experts) if moe and experts and top_k else total_b
+
+    return Checkpoint(
+        path=str(model_dir),
+        model_type=str(lang.get("model_type") or ""),
+        total_b=total_b,
+        active_b=active_b,
+        moe=moe,
+        bits=bits,
+        disk_gb=disk / 1e9,
+        ram_gb=_ram_gb(),
+    )
+
+
+def suggested_prune(ck: Checkpoint) -> float:
+    """PRUNE for --speed auto. Bigger models take more pruning; low-bit and
+    small-active ones less, since they have less fidelity to spare (Kimi K2 at
+    2-bit and PRUNE 0.85 loops into garbage)."""
+    if ck.fits_resident:
+        return 0.0
+    t = ck.total_b or 80
+    prune = 0.85 if t >= 200 else 0.7 if t >= 70 else 0.55 if t >= 30 else 0.4
+    if ck.active_b is not None and ck.active_b < _SMALL_ACTIVE_B:
+        prune = min(prune, 0.7)
+    if ck.bits is not None and ck.bits <= 2:
+        return min(prune, 0.5)
+    if ck.bits is not None and ck.bits <= 3:
+        return min(prune, 0.7)
+    return prune
+
+
+def _round_half_up(v: float, places: int) -> float:
+    k = 10**places
+    return math.floor(v * k + 0.5) / k
+
+
+def _fixed_profile(x: float) -> tuple[float, float, bool]:
+    """(PRUNE, WAIT_ABOVE, one-pass) at position x on the fixed scale."""
+    x = min(1.0, max(0.0, x))
+    prune = 0.95 - 0.25 * (x / 0.5) if x <= 0.5 else 0.7 - 0.7 * ((x - 0.5) / 0.5)
+    return _round_half_up(prune, 2), _round_half_up(0.5 * (1 - x), 2), x < 0.25
+
+
+def _curve_path(model_path: str) -> Path:
+    real = os.path.realpath(os.path.expanduser(model_path))
+    key = hashlib.sha1(real.encode()).hexdigest()[:16]
+    root = os.environ.get("PAGED_MOE_SIDECAR_DIR") or str(Path.home() / ".paged_moe" / "sidecar")
+    return Path(root).expanduser() / "prune_curves" / f"{key}.json"
+
+
+def _mass_at(table: dict, prune: float, wait: float) -> float:
+    def cell(xs, v):
+        if v <= xs[0]:
+            return 0, 0, 0.0
+        if v >= xs[-1]:
+            return len(xs) - 1, len(xs) - 1, 0.0
+        i = max(j for j in range(len(xs) - 1) if xs[j] <= v)
+        return i, i + 1, (v - xs[i]) / (xs[i + 1] - xs[i])
+
+    i0, i1, fi = cell(table["prune"], prune)
+    j0, j1, fj = cell(table["wait_above"], wait)
+    m = table["mass"]
+    a = m[i0][j0] * (1 - fj) + m[i0][j1] * fj
+    b = m[i1][j0] * (1 - fj) + m[i1][j1] * fj
+    return a * (1 - fi) + b * fi
+
+
+def speed_curve(model_path: str) -> list[float] | None:
+    """Kept-mass position at each fixed position i/100, or None without a
+    usable table. Rises strictly from 0 to 1."""
+    table = _read_json(_curve_path(model_path))
+    try:
+        if table.get("version") != 1 or int(table.get("rows", 0)) < _CURVE_MIN_ROWS:
+            return None
+        if len(table["mass"]) != len(table["prune"]):
+            return None
+        kept: list[float] = []
+        for i in range(_CURVE_POINTS):
+            p, w, _ = _fixed_profile(i / (_CURVE_POINTS - 1))
+            kept.append(max(_mass_at(table, p, w), kept[-1] if kept else float("-inf")))
+    except (KeyError, TypeError, ValueError, IndexError):
+        return None
+    lo, hi = kept[0], kept[-1]
+    if hi - lo < _CURVE_MIN_SPAN:
+        return None
+    x = [(m - lo) / (hi - lo) for m in kept]
+    for i in range(1, len(x)):
+        x[i] = max(x[i], x[i - 1] + 1e-4)
+    return [_round_half_up(v / x[-1], 4) for v in x]
+
+
+def _invert(curve: list[float], v: float) -> float:
+    v = min(1.0, max(0.0, v))
+    i = 0
+    while i < len(curve) - 2 and curve[i + 1] < v:
+        i += 1
+    span = curve[i + 1] - curve[i]
+    f = (v - curve[i]) / span if span > 0 else 0.0
+    return (i + min(1.0, max(0.0, f))) / (len(curve) - 1)
+
+
+def parse_speed(raw: str) -> float | str:
+    """1.0 for exact, a float in [0, 1], or "auto". Raises ValueError."""
+    s = raw.strip().lower()
+    if s in ("exact", "max", "1", "1.0"):
+        return 1.0
+    if s == "auto":
+        return "auto"
+    v = float(s)
+    if not 0.0 <= v <= 1.0:
+        raise ValueError(f"--speed takes 0 to 1, exact or auto, not {raw!r}")
+    return v
+
+
+def speed_env(ck: Checkpoint, speed: float | str) -> dict[str, str]:
+    """PRUNE / WAIT_ABOVE / FLOW for a speed setting on this checkpoint."""
+    if speed == "auto":
+        prune = suggested_prune(ck)
+        wait = 0.2 if prune > 0 else 0.0
+        one_pass = False
+    elif float(speed) >= 1.0:
+        prune, wait, one_pass = 0.0, 0.0, False
+    else:
+        curve = speed_curve(ck.path)
+        x = _invert(curve, float(speed)) if curve else float(speed)
+        prune, wait, one_pass = _fixed_profile(x)
+    return {
+        "PAGED_MOE_PRUNE": f"{prune:g}",
+        "PAGED_MOE_WAIT_ABOVE": f"{wait:g}",
+        "PAGED_MOE_FLOW": "1" if one_pass else "0",
+    }
+
+--- turn_trace.py ---
+# Copyright (C) 2026 Noah Clark
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""One JSON line per chat request: where its wall time went.
+
+Set ``PAGED_MOE_TRACE=/path/turns.jsonl`` to turn it on. Off costs nothing
+past one ``if``. The generation worker runs one request at a time, but HTTP
+requests overlap: a client that aborts a stream sends its next request while
+the worker is still unwinding the old one. So each HTTP thread owns its
+record, records queue in arrival order, and the worker takes the oldest one
+when it starts on a request (``bind_model``, called from the prompt-cache
+fetch).
+
+Times are seconds from the request's arrival. Expert cache counters are
+snapshotted at phase boundaries, so ``decode`` bytes and disk wait are the
+decode phase only, not the whole process.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import threading
+import time
+
+_PATH = os.environ.get("PAGED_MOE_TRACE", "").strip()
+_lock = threading.Lock()
+_http = threading.local()
+_queue: list = []
+_cur: dict | None = None
+_model = None
+
+_COUNTERS = (
+    "hits",
+    "misses",
+    "bytes_read",
+    "demand_miss_bytes",
+    "disk_wait_s",
+    "materialize_s",
+    "spec_wasted_bytes",
+    "prefill_layers",
+    "skipped_waits",
+    "closed_ok",
+    "closed_replay",
+    "stitch_forwards",
+    "full_stitch_tokens",
+)
+
+
+def enabled() -> bool:
+    return bool(_PATH)
+
+
+def _now(rec: dict) -> float:
+    return time.perf_counter() - rec["_t0"]
+
+
+def _snap() -> dict:
+    c = getattr(_model, "_pagedmoe_cache", None) if _model is not None else None
+    if c is None:
+        return {}
+    out = {}
+    for k in _COUNTERS:
+        try:
+            out[k] = float(getattr(c, k, 0) or 0)
+        except (TypeError, ValueError):
+            out[k] = 0.0
+    slab = getattr(c, "slab", None)
+    out["slab_slots"] = float(getattr(slab, "slots", 0) or 0) if slab is not None else 0.0
+    return out
+
+
+def _delta(a: dict, b: dict) -> dict:
+    d = {k: round(b.get(k, 0.0) - a.get(k, 0.0), 4) for k in _COUNTERS}
+    d["read_gb"] = round(d.pop("bytes_read") / 1e9, 3)
+    d["demand_gb"] = round(d.pop("demand_miss_bytes") / 1e9, 3)
+    d["spec_wasted_gb"] = round(d.pop("spec_wasted_bytes") / 1e9, 3)
+    tot = d["hits"] + d["misses"]
+    d["hit_rate"] = round(d["hits"] / tot, 4) if tot else None
+    return d
+
+
+def begin(body: dict, model=None) -> None:
+    """HTTP thread, before the request is tokenized."""
+    global _model
+    if not _PATH:
+        return
+    if model is not None:
+        _model = model
+    msgs = body.get("messages") or []
+    rec = {
+        "t": round(time.time(), 3),
+        # Name only: the client may send a checkpoint path.
+        "model": os.path.basename(str(body.get("model") or "").rstrip("/")) or None,
+        "n_messages": len(msgs),
+        "max_tokens": body.get("max_tokens") or body.get("max_completion_tokens"),
+        "warm": bool(body.get("warm_prefix") or body.get("warmPrefix")),
+        "tools": len(body.get("tools") or []),
+        "temperature": body.get("temperature"),
+        "prefill": [],
+        "events": [],
+        "_t0": time.perf_counter(),
+        "_marks": {"begin": _snap()},
+    }
+    _http.rec = rec
+    with _lock:
+        _queue.append(rec)
+
+
+def bind_model(model) -> None:
+    """Generation worker, at the start of a request: take the oldest queued record."""
+    global _cur, _model
+    if not _PATH:
+        return
+    if model is not None:
+        _model = model
+    with _lock:
+        _cur = _queue.pop(0) if _queue else None
+    if _cur is not None:
+        _cur["queued_s"] = round(_now(_cur), 4)
+        _cur["_marks"]["begin"] = _snap()
+
+
+def note(**kw) -> None:
+    if _cur is not None:
+        _cur.update(kw)
+
+
+def event(name: str, **kw) -> None:
+    """Something that happened mid-request (cold miss, slab yield, OOM)."""
+    if _cur is not None:
+        _cur["events"].append({"at": round(_now(_cur), 3), "name": name, **kw})
+
+
+def mark(name: str) -> None:
+    """First time only: offset of a phase boundary plus a counter snapshot."""
+    if _cur is None or name in _cur:
+        return
+    _cur[name] = round(_now(_cur), 4)
+    _cur["_marks"][name] = _snap()
+
+
+def prefill_chunk(tokens: int, seconds: float, read_gb: float, blocked: float, copy: float, kv: int) -> None:
+    if _cur is not None:
+        _cur["prefill"].append(
+            {
+                "tok": int(tokens),
+                "kv": int(kv),
+                "s": round(seconds, 3),
+                "gb": round(read_gb, 3),
+                "blocked": round(blocked, 3),
+                "copy": round(copy, 3),
+            }
+        )
+
+
+def end(error: str | None = None) -> None:
+    """HTTP thread, after the response finished (or failed).
+
+    A record the worker never started is dropped from the queue here. One the
+    worker is still unwinding (client went away mid-stream) is written as it
+    stands; its late notes are lost.
+    """
+    global _cur
+    rec = getattr(_http, "rec", None)
+    if rec is None:
+        return
+    _http.rec = None
+    with _lock:
+        if rec in _queue:
+            _queue.remove(rec)
+            rec["never_started"] = True
+    if _cur is rec:
+        _cur = None
+    rec["end"] = round(_now(rec), 4)
+    end_snap = _snap()
+    if error:
+        rec["error"] = error
+    marks = rec.pop("_marks")
+    rec.pop("_t0", None)
+    b = marks.get("begin", {})
+    if "first_token" in marks:
+        rec["phase_prefill"] = _delta(b, marks["first_token"])
+        last = marks.get("decode_end", end_snap)
+        rec["phase_decode"] = _delta(marks["first_token"], last)
+    else:
+        rec["phase_prefill"] = _delta(b, end_snap)
+    rec["slab_slots"] = [b.get("slab_slots"), end_snap.get("slab_slots")]
+    c = getattr(_model, "_pagedmoe_cache", None) if _model is not None else None
+    rec["stitch_full"] = bool(getattr(c, "stitched", False)) if c is not None else False
+    try:
+        from . import config
+
+        # Read at the end: live_config can move them mid-session.
+        rec["prune"] = float(config.PRUNE)
+        rec["wait_above"] = float(config.WAIT_ABOVE)
+    except Exception:
+        pass
+    try:
+        import mlx.core as mx
+
+        from .cache import note_peak
+
+        rec["mx_active_gb"] = round(mx.get_active_memory() / 1e9, 3)
+        rec["mx_peak_gb"] = round(note_peak() / 1e9, 3)
+    except Exception:
+        pass
+    line = json.dumps(rec, separators=(",", ":"), default=str)
+    with _lock:
+        try:
+            os.makedirs(os.path.dirname(_PATH) or ".", exist_ok=True)
+            with open(_PATH, "a") as f:
+                f.write(line + "\n")
+        except OSError:
+            pass
+
+--- launch_env.py ---
+# Copyright (C) 2026 Noah Clark
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""
+Per-model settings for `paged-moe-server` and `run.py`.
+
+The mlx_lm.load hook already applies `~/paged-moe-config.yaml`. The server and
+run.py call the loader directly, so without this they ran on bare engine
+defaults. This puts the same settings in the environment before any engine
+module is imported (most knobs are read once at import).
+
+Order, lowest to highest: `defaults:` in the YAML, then the matched model's
+`env:` (or a paged_moe.yaml marker), then anything already in the environment,
+then `--speed` (autotune.py), since that's asked for on the command line.
+
+`PAGED_MOE_HOOK=0` skips the YAML and the summary line, so host apps that set
+their own env per model get exactly what they set.
+"""
+
+from __future__ import annotations
+
+import os
+import sys
+
+
+def _flag_value(argv: list[str], flag: str) -> str | None:
+    for i, arg in enumerate(argv):
+        if arg == flag and i + 1 < len(argv):
+            return argv[i + 1]
+        if arg.startswith(flag + "="):
+            return arg.split("=", 1)[1]
+    return None
+
+
+def _pop_flag(argv: list[str], flag: str) -> str | None:
+    """Remove `flag VALUE` / `flag=VALUE` from argv and return the value."""
+    for i, arg in enumerate(argv):
+        if arg == flag and i + 1 < len(argv):
+            value = argv[i + 1]
+            del argv[i : i + 2]
+            return value
+        if arg.startswith(flag + "="):
+            del argv[i]
+            return arg.split("=", 1)[1]
+    return None
+
+
+def apply(argv: list[str] | None = None, *, quiet: bool = False) -> dict[str, str]:
+    """Fill os.environ for the model named by --model. Returns what was set.
+
+    Strips `--config PATH` and `--speed S` from argv (sys.argv by default) so
+    the wrapped CLI never sees them. Must run before pagedmoe.config is imported.
+    """
+    argv = sys.argv if argv is None else argv
+    cfg_path = _pop_flag(argv, "--config")
+    if cfg_path:
+        os.environ["PAGED_MOE_CONFIG"] = os.path.expanduser(cfg_path)
+    raw_speed = _pop_flag(argv, "--speed")
+
+    from . import autotune
+    from .mlx_hook import _hook_disabled, _merged_env
+
+    speed = None
+    if raw_speed is not None:
+        try:
+            speed = autotune.parse_speed(raw_speed)
+        except ValueError:
+            sys.exit(f"[paged-moe] --speed takes a number from 0 to 1, exact, or auto (got {raw_speed!r})")
+
+    model = _flag_value(argv, "--model")
+    if not model:
+        return {}
+
+    applied: dict[str, str] = {}
+    hooked = not _hook_disabled()
+    if hooked:
+        try:
+            layered = _merged_env(model)
+        except Exception as e:
+            print(f"[paged-moe] could not read the config: {e!r}", file=sys.stderr, flush=True)
+            layered = {}
+        applied = {k: v for k, v in layered.items() if k not in os.environ}
+        os.environ.update(applied)
+        if applied and not quiet:
+            keys = " ".join(f"{k.removeprefix('PAGED_MOE_')}={v}" for k, v in sorted(applied.items()))
+            print(f"[paged-moe] config settings: {keys}", file=sys.stderr, flush=True)
+
+    if speed is None and not hooked:
+        return applied
+    try:
+        ck = autotune.inspect(model)
+    except Exception as e:
+        if speed is not None:
+            sys.exit(f"[paged-moe] could not read {model} for --speed: {e!r}")
+        return applied
+
+    if speed is not None:
+        tuned = autotune.speed_env(ck, speed)
+        os.environ.update(tuned)
+        applied.update(tuned)
+    if not quiet:
+        print(f"[paged-moe] {ck.describe()}", file=sys.stderr, flush=True)
+        print(f"[paged-moe] {_fidelity_line(ck, speed)}", file=sys.stderr, flush=True)
+    return applied
+
+
+def _fidelity_line(ck, speed) -> str:
+    prune = float(os.environ.get("PAGED_MOE_PRUNE") or 0)
+    wait = float(os.environ.get("PAGED_MOE_WAIT_ABOVE") or 0)
+    if prune <= 0:
+        return "exact output (nothing pruned)"
+    label = f"--speed {speed}" if speed is not None else "the config or env"
+    return (
+        f"pruned at PRUNE {prune:g}, WAIT_ABOVE {wait:g} from {label}. "
+        "Faster, but output isn't bit-identical. --speed 1 for exact"
+    )
+
+
+def server_main() -> None:
+    """Entry point for `paged-moe-server`."""
+    apply()
+    from .server import main
+
+    main()
+
+--- prune_curve.py ---
+# Copyright (C) 2026 Noah Clark
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""How much of the router's mixture a decode keeps, by PRUNE and WAIT_ABOVE.
+
+PRUNE keeps experts within a ratio of the row's winner, so one value means
+very different things on different models. GLM-5.2 (8 of 256, flat sigmoid
+weights, a cache that holds a few percent of 418 GB) keeps ~0.45 of the mass
+at PRUNE 0.7 / WAIT_ABOVE 0.25; MiniMax-M3 keeps 0.50-0.63 at 0.8 / 0.35.
+
+Approximate decode rows are recorded with the experts that were free (no
+disk read) when the layer ran, and after a generation the mass a token would
+keep is worked out over a grid of (PRUNE, WAIT_ABOVE): free experts always
+stay (KEEP_FREE), the rest need ratio >= PRUNE and weight >= WAIT_ABOVE. The
+table goes to SIDECAR_DIR/prune_curves/<sha1(realpath)[:16]>.json, merged
+with what was there. A host app can map a speed slider through it. Recording is two
+list appends per layer; the table is built off the decode thread.
+"""
+
+from __future__ import annotations
+
+import hashlib
+import json
+import os
+import threading
+import time
+from pathlib import Path
+
+import numpy as np
+
+from . import config
+
+PRUNE_GRID = [round(0.05 * i, 2) for i in range(20)]
+WAIT_GRID = [round(0.025 * i, 3) for i in range(21)]
+# Rows held between flushes, rows a table needs, rows one table is built from.
+_MAX_ROWS = 32768
+_MIN_ROWS = 2048
+_SAMPLE_ROWS = 8192
+# Older rows count for at most this many when merging, so the table follows
+# a cache size or setting that changed.
+_KEEP_ROWS = 100_000
+
+_lock = threading.Lock()
+_w: list = []
+_res: list = []
+_n = 0
+
+
+def note(w: np.ndarray, res: np.ndarray) -> None:
+    """One layer's decode rows: unit-mass weights and which slots were free."""
+    global _n
+    if not config.PRUNE_CURVE or _n >= _MAX_ROWS:
+        return
+    with _lock:
+        _w.append(w)
+        _res.append(res)
+        _n += int(w.shape[0])
+
+
+def path_for(model_path: str) -> Path:
+    real = os.path.realpath(os.path.expanduser(model_path))
+    key = hashlib.sha1(real.encode()).hexdigest()[:16]
+    return Path(config.SIDECAR_DIR).expanduser() / "prune_curves" / f"{key}.json"
+
+
+def table(w: np.ndarray, res: np.ndarray) -> np.ndarray:
+    """Mean kept mass, [len(PRUNE_GRID), len(WAIT_GRID)]."""
+    w = w.astype(np.float32)
+    res = res.astype(bool)
+    top = w.max(axis=-1, keepdims=True)
+    waits = np.asarray(WAIT_GRID, np.float32)[:, None, None]
+    out = np.empty((len(PRUNE_GRID), len(WAIT_GRID)), np.float64)
+    for i, r in enumerate(PRUNE_GRID):
+        sel = w >= r * top
+        kept = res[None] | (sel[None] & (w[None] >= waits))
+        out[i] = (w[None] * kept).sum(axis=-1).mean(axis=-1)
+    return out
+
+
+def _merge(path: Path, real: str, mass: np.ndarray, rows: int) -> None:
+    old_rows = 0
+    try:
+        old = json.loads(path.read_text())
+        same = (
+            old.get("version") == 1
+            and old.get("prune") == PRUNE_GRID
+            and old.get("wait_above") == WAIT_GRID
+        )
+        if same:
+            old_rows = min(int(old.get("rows", 0)), _KEEP_ROWS)
+            if old_rows > 0:
+                prev = np.asarray(old["mass"], np.float64)
+                mass = (prev * old_rows + mass * rows) / (old_rows + rows)
+    except (OSError, ValueError, KeyError, TypeError):
+        old_rows = 0
+    data = {
+        "version": 1,
+        "model": real,
+        "rows": old_rows + rows,
+        "updated": int(time.time()),
+        "prune": PRUNE_GRID,
+        "wait_above": WAIT_GRID,
+        "mass": np.round(mass, 4).tolist(),
+    }
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(data))
+    tmp.replace(path)
+
+
+def _write(model_path: str, w: np.ndarray, res: np.ndarray) -> None:
+    try:
+        if w.shape[0] > _SAMPLE_ROWS:
+            pick = np.random.default_rng().choice(w.shape[0], _SAMPLE_ROWS, replace=False)
+            w, res = w[pick], res[pick]
+        real = os.path.realpath(os.path.expanduser(model_path))
+        _merge(path_for(model_path), real, table(w, res), int(w.shape[0]))
+    except Exception as e:
+        print(f"[paged-moe] prune curve not saved: {e!r}", flush=True)
+
+
+def flush(model_path: str | None) -> None:
+    """End of a generation: fold what was recorded into the model's table."""
+    global _w, _res, _n
+    if not model_path or _n < _MIN_ROWS:
+        return
+    with _lock:
+        ws, rs = _w, _res
+        _w, _res, _n = [], [], 0
+    try:
+        K = ws[0].shape[-1]
+        pairs = [(a, b) for a, b in zip(ws, rs) if a.shape[-1] == K and a.shape == b.shape]
+        w = np.concatenate([a for a, _ in pairs]).reshape(-1, K)
+        res = np.concatenate([b for _, b in pairs]).reshape(-1, K)
+    except (ValueError, IndexError):
+        return
+    threading.Thread(target=_write, args=(model_path, w, res), daemon=True).start()
+
+
+def reset() -> None:
+    global _w, _res, _n
+    with _lock:
+        _w, _res, _n = [], [], 0
+    _loaded.clear()
+
+
+# A table needs this many rows, and this much kept mass between the fastest
+# setting and exact, before position() answers. A host that reads the table
+# itself should use the same bars so both agree on the slider.
+_POS_ROWS = 4096
+_POS_SPAN = 0.05
+_loaded: dict[str, tuple[float, np.ndarray | None]] = {}
+
+
+def _load(model_path: str) -> np.ndarray | None:
+    path = path_for(model_path)
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return None
+    hit = _loaded.get(str(path))
+    if hit is not None and hit[0] == mtime:
+        return hit[1]
+    mass = None
+    try:
+        data = json.loads(path.read_text())
+        if (
+            data.get("version") == 1
+            and int(data.get("rows", 0)) >= _POS_ROWS
+            and data.get("prune") == PRUNE_GRID
+            and data.get("wait_above") == WAIT_GRID
+        ):
+            mass = np.asarray(data["mass"], np.float64)
+            if mass.shape != (len(PRUNE_GRID), len(WAIT_GRID)):
+                mass = None
+    except (OSError, ValueError, KeyError, TypeError):
+        mass = None
+    _loaded[str(path)] = (mtime, mass)
+    return mass
+
+
+def _at(mass: np.ndarray, prune: float, wait_above: float) -> float:
+    def cell(xs, v):
+        if v <= xs[0]:
+            return 0, 0, 0.0
+        if v >= xs[-1]:
+            return len(xs) - 1, len(xs) - 1, 0.0
+        i = int(np.searchsorted(xs, v, side="right")) - 1
+        return i, i + 1, (v - xs[i]) / (xs[i + 1] - xs[i])
+
+    i0, i1, fi = cell(PRUNE_GRID, prune)
+    j0, j1, fj = cell(WAIT_GRID, wait_above)
+    a = mass[i0, j0] * (1 - fj) + mass[i0, j1] * fj
+    b = mass[i1, j0] * (1 - fj) + mass[i1, j1] * fj
+    return float(a * (1 - fi) + b * fi)
+
+
+def position(model_path: str | None, prune: float, wait_above: float) -> float | None:
+    """Where (prune, wait_above) sits on a speed slider, 0 fastest to 1 exact:
+    the share of what the fastest setting drops that this one keeps. None
+    without a usable table."""
+    if not model_path:
+        return None
+    mass = _load(model_path)
+    if mass is None:
+        return None
+    lo = _at(mass, PRUNE_GRID[-1], WAIT_GRID[-1])
+    hi = _at(mass, 0.0, 0.0)
+    if hi - lo < _POS_SPAN:
+        return None
+    return min(1.0, max(0.0, (_at(mass, prune, wait_above) - lo) / (hi - lo)))
+
+--- pagecache.py ---
+# Copyright (C) 2026 Noah Clark
+# SPDX-License-Identifier: AGPL-3.0-or-later
+"""Keep the checkpoint out of the OS file cache.
+
+F_NOCACHE is a hint, not a guarantee. A pread over 1 MB lands mostly in the
+file cache anyway (16 MB reads: all of it), and even capped reads go the
+buffered way once part of their range is resident, which pulls the rest in.
+On Flash a two-turn run left 10.8 GB of expert pages cached after the cap,
+30 GB before it. Clean file pages should be the first thing the kernel drops,
+but these were just read, so they sit on the active list while the slab sits
+idle through prefill. The kernel compressed 26 GB of slab to keep them and
+the whole machine stalled for 16 s.
+
+msync(MS_INVALIDATE) on a read-only mapping drops a file's clean pages. 15
+GB came out in about 150 ms. A daemon thread watches the system's
+file-backed page count (one sysctl) and drops the checkpoint files once it
+has grown past TRIM_MB since the last drop. Nothing else of ours reads those
+files through the cache, and the bytes on disk never change, so dropping
+them costs at most a re-read.
+"""
+
+from __future__ import annotations
+
+import ctypes
+import ctypes.util
+import mmap
+import os
+import threading
+import time
+
+from . import config, mempressure
+
+_PROT_READ = 0x1
+_MAP_SHARED = 0x1
+_MS_INVALIDATE = 0x2
+_MAP_FAILED = ctypes.c_void_p(-1).value
+
+_lock = threading.Lock()
+_files: list[str] = []
+_thread: threading.Thread | None = None
+_libc = None
+_dropped = 0
+_trims = 0
+
+
+def _c():
+    global _libc
+    if _libc is None:
+        lib = ctypes.CDLL(ctypes.util.find_library("c"), use_errno=True)
+        lib.mmap.restype = ctypes.c_void_p
+        lib.mmap.argtypes = [
+            ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int,
+            ctypes.c_int, ctypes.c_int, ctypes.c_longlong,
+        ]
+        lib.msync.argtypes = [ctypes.c_void_p, ctypes.c_size_t, ctypes.c_int]
+        lib.munmap.argtypes = [ctypes.c_void_p, ctypes.c_size_t]
+        _libc = lib
+    return _libc
+
+
+def file_cache_bytes() -> int | None:
+    """System-wide file-backed pages in bytes, None when not reported."""
+    pages = mempressure._sysctl_int("vm.vm_page_external_count")
+    if pages is None:
+        return None
+    return pages * mmap.PAGESIZE
+
+
+def drop(paths) -> int:
+    """Drop the clean cached pages of `paths`. Returns how many files it hit."""
+    lib = _c()
+    n = 0
+    for path in paths:
+        try:
+            fd = os.open(path, os.O_RDONLY)
+        except OSError:
+            continue
+        try:
+            size = os.fstat(fd).st_size
+            if size <= 0:
+                continue
+            addr = lib.mmap(None, size, _PROT_READ, _MAP_SHARED, fd, 0)
+            if addr is None or addr == _MAP_FAILED:
+                continue
+            try:
+                if lib.msync(addr, size, _MS_INVALIDATE) == 0:
+                    n += 1
+            finally:
+                lib.munmap(addr, size)
+        finally:
+            os.close(fd)
+    return n
+
+
+def _poll() -> None:
+    global _dropped, _trims
+    period = max(0.05, float(config.PAGECACHE_TRIM_POLL_S))
+    limit = max(0, int(config.PAGECACHE_TRIM_MB)) << 20
+    # Pages left by an earlier run never show up as growth, so start clean.
+    base = -1
+    while True:
+        now = file_cache_bytes()
+        if now is None:
+            time.sleep(period)
+            continue
+        if base >= 0 and now < base:
+            base = now
+        if base >= 0 and now - base < limit:
+            time.sleep(period)
+            continue
+        with _lock:
+            paths = list(_files)
+        try:
+            drop(paths)
+        except Exception:  # noqa: BLE001 - never take decode down for this
+            pass
+        after = file_cache_bytes() or now
+        _dropped += max(0, now - after)
+        _trims += 1
+        base = after
+
+
+def watch(paths) -> bool:
+    """Add checkpoint files and start the trimmer. Idempotent; False when off."""
+    global _thread
+    if not (config.PAGECACHE_TRIM and config.NOCACHE):
+        return False
+    if file_cache_bytes() is None:
+        return False
+    with _lock:
+        for p in paths:
+            p = str(p)
+            if p not in _files:
+                _files.append(p)
+        if _thread is None:
+            _thread = threading.Thread(target=_poll, name="pagecache-trim", daemon=True)
+            _thread.start()
+    return True
+
+
+def stats() -> dict:
+    return {"trims": _trims, "dropped_gb": round(_dropped / 1e9, 2)}

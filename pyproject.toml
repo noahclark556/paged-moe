@@ -51,7 +51,7 @@ paged-moe-pretrain = "pagedmoe.pretrain_sidecar:main"
 include = ["pagedmoe*"]
 
 [tool.setuptools.package-data]
-pagedmoe = ["pretrained_sidecar/*", "_native_read.c"]
+pagedmoe = ["pretrained_sidecar/*", "_native_read.c", "benchmark/data/*"]
 
 [tool.setuptools]
 license-files = ["LICENSE", "NOTICE", "LICENSING.md"]

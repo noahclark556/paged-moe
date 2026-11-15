@@ -364,9 +364,15 @@ def main(argv: list[str] | None = None) -> int:
             "usage: paged-moe "
             "[status|install|uninstall|ensure-config|which <model-path>|"
             "detect <model-path> [--speed S]|serve <model-path> [--speed S] [server flags]|"
+            "bench <model-path> [--speed S|--exact] [--quick]|"
             "machine|ladder] [--models-dir PATH]"
         )
         return 0
+
+    if cmd == "bench":
+        from .benchmark import main as bench_main
+
+        return bench_main(argv[1:])
 
     if cmd == "serve":
         if len(argv) < 2 or argv[1].startswith("-"):

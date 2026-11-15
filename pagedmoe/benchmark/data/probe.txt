@@ -1,0 +1,89 @@
+The expert cache keeps recently used experts in unified memory, and the router
+decides which experts each token needs. When the cache misses, the weights are
+read from the SSD, which is the slowest step in the pipeline. Dropping a weak
+expert saves a read, but the mixture it produces is no longer the one the model
+was trained to compute, so a confident token loses almost nothing while an
+ambiguous one can change the next word entirely.
+
+To call the tool, emit exactly one call and nothing else:
+
+{"name": "read_file", "arguments": {"filePath": "expert_stream/slab.py", "startLine": 80, "endLine": 183}}
+
+class SlabStore:
+    """One slab per component, each `[slots, *expert_shape]`.
+
+    Dumb storage: slot lifetime, LRU and quarantine are the cache's business
+    (see `ExpertCache`). Must be constructed on the MLX/GPU thread; after that
+    `dest()` is a plain numpy view and is safe to write from read workers.
+    """
+
+    def __init__(self, specs: dict[str, tuple[tuple, str, int]], slots: int):
+        """`specs` maps component name -> (per-expert shape, dtype, nbytes)."""
+        if slots < 1:
+            raise ValueError(f"slab needs at least one slot, got {slots}")
+        self.slots = int(slots)
+        self.nbytes = 0
+        self._storage: dict[str, mx.array] = {}
+        self._compute: dict[str, mx.array] = {}
+        self._bytes: dict[str, np.ndarray] = {}
+        self._stride: dict[str, int] = {}
+
+        for name, (shape, dtype, nbytes) in specs.items():
+            np_dt, mx_dt, comp_dt = _STORAGE[dtype]
+            expect = int(np.prod(shape)) * np.dtype(np_dt).itemsize
+            if expect != nbytes:
+                # A stride mismatch would silently read a shifted tensor.
+                raise ValueError(
+                    f"{name}: checkpoint says {nbytes} B/expert, "
+                    f"{shape}x{dtype} implies {expect} B"
+                )
+            slab = mx.zeros((self.slots, *shape), dtype=mx_dt)
+            mx.eval(slab)
+
+            flat = np.asarray(slab)
+            if not flat.flags.writeable or not flat.flags.c_contiguous:
+                raise RuntimeError(
+                    f"{name}: slab view is not a writeable contiguous view "
+                    "(MLX no longer exposes its buffer; slab path unusable)"
+                )
+            self._storage[name] = slab
+            self._bytes[name] = flat.reshape(-1).view(np.uint8)
+            self._stride[name] = int(nbytes)
+            view = slab.view(comp_dt) if comp_dt is not mx_dt else slab
+            if view is not slab:
+                mx.eval(view)
+            self._compute[name] = view
+            self.nbytes += slab.nbytes
+
+        self.names = tuple(specs)
+        self.specs = dict(specs)
+        self.expert_bytes = sum(self._stride.values())
+
+    def release(self) -> None:
+        """Drop every slab so Metal can hand the memory back."""
+        self.slot_dests = ()
+        self._storage.clear()
+        self._compute.clear()
+        self._bytes.clear()
+        self.nbytes = 0
+
+    def has(self, name: str) -> bool:
+        return name in self._compute
+
+    def dest(self, name: str, slot: int) -> np.ndarray:
+        """Writeable byte range for one component of one slot (pread target)."""
+        stride = self._stride[name]
+        return self._bytes[name][slot * stride : (slot + 1) * stride]
+
+    def compute(self, name: str) -> mx.array:
+        """The full `[slots, ...]` tensor to hand to gather_qmm."""
+        return self._compute[name]
+
+    def expert(self, name: str, slot: int) -> mx.array:
+        """One slot as a view into the slab, for the per-expert path."""
+        return mx.squeeze(self._compute[name][slot : slot + 1], 0)
+
+The stage is released at decode start. Every read that landed in it is
+dropped from the in-flight table first, so a decode step never computes from
+memory that has been handed back. A later prefill builds a new stage and
+claims only reads that belong to it.

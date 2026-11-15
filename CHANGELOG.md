@@ -24,6 +24,13 @@ hook into that venv even when another one is active.
 httpx, and so on) to the bench env versions, and `install_mlx.sh` installs with
 it. pyyaml is pinned directly now since the engine reads its config with it.
 
+`paged-moe bench <model>` benches any checkpoint on your own Mac. It replays a
+fixed coding agent task (8 requests, about 13k tokens of context) against the
+server at `--speed 0.25` and exact, then prints decode tok/s, time to first
+token, prefill, memory and the loss of the speed run against the exact model.
+`--quick` halves the budgets for a smoke test. Also callable from Python as
+`pagedmoe.benchmark.run()`.
+
 ## [0.3.2] - 2026-11-14
 
 `paged-moe-server` and `run.py` now read `~/paged-moe-config.yaml`. Before this
