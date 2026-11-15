@@ -53,26 +53,43 @@ Baseline is an M5 Pro with 48 GB, checkpoints on the internal SSD. None of
 these load with stock mlx-lm on this machine. The RAM budget is about 35 GB,
 so the smallest one is already 1.8x over and Kimi is 16x over.
 
-| Model | Checkpoint | Peak RAM | Prefill | Decode | Setting |
-| --- | ---: | ---: | ---: | ---: | --- |
-| **Qwen3-Coder-Next** 6-bit | 65 GB | 30.7 GB | 235 tok/s | **20.6 tok/s** | exact (no prune) |
-| **Qwen3-235B-A22B** 4-bit | 132 GB | 30.6 GB | 99 tok/s | **7.9 tok/s** | prune 0.7, wait 0.2 |
-| **GLM-4.7** 4-bit | 199 GB | 31.8 GB | 73 tok/s | **5.9 tok/s** | prune 0.8, wait 0.2 |
-| **DeepSeek-V3.2** 4-bit | 378 GB | 33.2 GB | 45 tok/s | **5.7 tok/s** | prune 0.8, wait 0.2 |
-| **Kimi-K2-Instruct** 4-bit | 578 GB | 31.6 GB | 27 tok/s | **8.8 tok/s** | prune 0.8, wait 0.2 |
+### Latest bench
+
+| Model | Checkpoint | Peak RAM | Prefill | Decode (speed) | Decode (exact) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **Qwen3-Coder-Next** 6-bit | 65 GB | 31.7 GB | 827 tok/s | **30.5 tok/s** | **21.8 tok/s** |
+| **Qwen3-235B-A22B** 4-bit | 132 GB | 31.5 GB | 307 tok/s | **7.0 tok/s** | **2.9 tok/s** |
+| **GLM-4.7** 4-bit | 199 GB | | | | |
+| **DeepSeek-V3.2** 4-bit | 378 GB | | | | |
+| **Kimi-K2-Instruct** 4-bit | 578 GB | | | | |
+
+Run with `paged-moe bench` (below), which replays a coding agent task: 8
+requests, a ~12k-token front matter, KV reserved for 32k. Prefill is the cold
+first turn. Decode is wall clock over every turn. Speed is `--speed 0.25`,
+exact is every routed expert, bit-identical. Prune trades a bit of fidelity
+for fewer disk reads, more on that [here](#what-is-exact-and-what-isnt).
+Blank rows haven't been rerun yet.
+
+### Legacy bench (September)
+
+| Model | Checkpoint | Peak RAM | Prefill | Decode (speed) | Decode (exact) |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| **Qwen3-Coder-Next** 6-bit | 65 GB | 30.7 GB | 235 tok/s | | **20.6 tok/s** |
+| **Qwen3-235B-A22B** 4-bit | 132 GB | 30.6 GB | 99 tok/s | **7.9 tok/s** | |
+| **GLM-4.7** 4-bit | 199 GB | 31.8 GB | 73 tok/s | **5.9 tok/s** | |
+| **DeepSeek-V3.2** 4-bit | 378 GB | 33.2 GB | 45 tok/s | **5.7 tok/s** | |
+| **Kimi-K2-Instruct** 4-bit | 578 GB | 31.6 GB | 27 tok/s | **8.8 tok/s** | |
 
 How these were measured: cold ~2k-token prompt, 128 warmup tokens on the same
 KV (not counted), then 512 timed greedy tokens with EOS ignored. Decode is
-wall clock. Kimi's last quarter of the run held 10.2 tok/s. The "Setting"
-column matters: prune trades a bit of fidelity for fewer disk reads, more on
-that [here](#what-is-exact-and-what-isnt). With prune off everything is
-bit-identical and the big ones decode slower.
+wall clock. Speed here was a fixed prune per model: 0.7 on the 235B, 0.8 on
+the rest, wait 0.2 on all of them. Kimi's last quarter of the run held 10.2
+tok/s. The two tables don't line up row for row, the prompt and the turn
+shape are different.
 
-This ladder was last run in September. A lot landed since then, mostly on
-the prefill and agent-turn side, and each of those was measured on its own
-(below). `bench/memory_benchmark.sh <tier>` reruns it on your machine. It runs
-exact unless you say otherwise, so export the Setting column first to match a
-row, e.g. `PAGED_MOE_PRUNE=0.8 PAGED_MOE_WAIT_ABOVE=0.2 ./bench/memory_benchmark.sh 3`
+`bench/memory_benchmark.sh <tier>` reruns the legacy ladder on your machine.
+It runs exact unless you say otherwise, so export the prune first to match a
+speed row, e.g. `PAGED_MOE_PRUNE=0.8 PAGED_MOE_WAIT_ABOVE=0.2 ./bench/memory_benchmark.sh 3`
 for GLM-4.7.
 
 To bench your own model on your own Mac, use `paged-moe bench`. It replays a
@@ -445,7 +462,7 @@ rate and what the governor is going by.
 Measured in a sandbox that holds the engine to each Mac's RAM, cache budget,
 reader count and SSD speed. The GPU is still the M5 Pro, so on a real chip of
 that class tok/s can be a bit off. The 64 GB and 128 GB rows are IO-scaled
-estimates, not runs. Prune / wait match the table above.
+estimates, not runs. Prune / wait match the legacy table above.
 
 | Mac | Model | Checkpoint | Peak RAM | Prefill | Decode |
 | --- | --- | ---: | ---: | ---: | ---: |
