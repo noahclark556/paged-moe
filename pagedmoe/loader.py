@@ -39,7 +39,11 @@ import mlx.core as mx
 from mlx_lm.utils import load_model, load_tokenizer
 
 from . import config, kvmem, pagecache
-from .chat_compat import fix_think_tokens, install_deepseek_v32_chat_template
+from .chat_compat import (
+    fix_think_tokens,
+    install_deepseek_v32_chat_template,
+    install_template_kwargs,
+)
 
 # Any load() path (server, CLI, benches) needs the DeepSeek template shim.
 install_deepseek_v32_chat_template()
@@ -822,6 +826,7 @@ def load(
         eos_token_ids=cfg.get("eos_token_id", None),
     )
     fix_think_tokens(tokenizer)
+    install_template_kwargs(tokenizer)
 
     info["load_s"] = round(time.perf_counter() - t0, 2)
 

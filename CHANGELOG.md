@@ -40,6 +40,27 @@ still raise it up to 32. Smaller Macs are unchanged, and `read_threads` in
 your config or `PAGED_MOE_READ_THREADS` still overrides it. Pull and restart
 the server; `paged-moe machine` shows the new count.
 
+The server now fits the usual chat template kwargs to what each model's
+template actually reads, so the thinking and effort switches work without
+knowing each family's quirks. It checks the template once at load by
+rendering it, and only steps in where that shows it matters:
+
+- MiniMax-M3 ignored `enable_thinking` and always ran adaptive. It now maps to
+  the template's `thinking_mode`. DeepSeek-V3.1 gets the same for its
+  `thinking` switch.
+- Templates that keep every earlier turn's reasoning when `preserve_thinking`
+  isn't sent (qwen38-coder-flash does) now drop it unless you ask. Long multi
+  turn agent sessions were losing the thread on that old reasoning.
+- An effort the template would reject (`high` on that same Flash template,
+  which only takes low, medium and xhigh) moves to the nearest one it takes
+  instead of failing the request. `reasoning_effort` at the top of the request, the way OpenAI
+  clients send it, is passed to the template too.
+
+Anything you send explicitly is kept as is, apart from an effort the template
+can't take. Templates that already handle these render exactly as before. The
+startup log says what it changed for that model, and
+`PAGED_MOE_TEMPLATE_KWARGS=0` turns it all off.
+
 ## [0.3.2] - 2026-11-14
 
 `paged-moe-server` and `run.py` now read `~/paged-moe-config.yaml`. Before this

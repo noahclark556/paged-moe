@@ -66,6 +66,7 @@ from mlx_lm.models.cache import (
 from . import (
     activity,
     adaptive_prefill,
+    chat_compat,
     config,
     fidelity,
     gpu_trail,
@@ -2909,6 +2910,10 @@ def install_patches(model=None):
         global _pending_cache_breaks, _pending_stable, _pending_stable_head, _pending_stable_shared
         global _pending_stable_all_shared, _pending_stable_client, _pending_chat, _pending_chat_tag
         body = getattr(self, "body", None) or {}
+        lifted = chat_compat.lift_request_kwargs(body)
+        if lifted is not None:
+            body["chat_template_kwargs"] = lifted
+            self.chat_template_kwargs = lifted
         activity.enter()
         turn_trace.begin(body, _model)
         trace_err = None

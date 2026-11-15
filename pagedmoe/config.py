@@ -1701,6 +1701,13 @@ REPLAY_SPLICE: bool = bool(_env("PAGED_MOE_REPLAY_SPLICE", 1, int))
 # replays the same way, so an evicted turn costs one prefill from that point.
 REPLAY_SPLICE_MAX: int = _env("PAGED_MOE_REPLAY_SPLICE_MAX", 512, int)
 
+# Fit what a client sends to what the chat template reads (chat_compat.py):
+# enable_thinking for templates that switch on thinking_mode or thinking,
+# preserve_thinking off unless asked, and reasoning_effort values the
+# template would reject moved to the nearest one it takes. Anything else the
+# client sets goes through as sent. 0 = pass kwargs through untouched.
+TEMPLATE_KWARGS: bool = bool(_env("PAGED_MOE_TEMPLATE_KWARGS", 1, int))
+
 # The stable pin (host front matter) on disk, see prefix_disk.py. A restart
 # used to prefill the front matter again: 14k tokens, 40 s on Flash.
 PREFIX_DISK: bool = bool(_env("PAGED_MOE_PREFIX_DISK", 1, int))
