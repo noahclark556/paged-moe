@@ -42,6 +42,29 @@ if [[ -z "$PY" ]]; then
   fi
 fi
 
+cat >&2 <<'EOF'
+Note: this ladder bench is outdated. It only runs six fixed models at a ~2k
+prompt. For any model on your own Mac, use the new bench instead:
+
+  paged-moe bench /path/to/model            # speed + exact, full run
+  paged-moe bench /path/to/model --quick    # half budgets, a smoke test
+
+See "paged-moe bench --help" or the README.
+
+EOF
+
+if [[ "${1:-}" =~ ^[1-6]$ ]]; then
+  skip_ask=0
+  for a in "$@"; do [[ "$a" == "-y" ]] && skip_ask=1; done
+  if [[ $skip_ask -eq 0 && -t 0 ]]; then
+    read -r -p "Run the old ladder tier anyway? [y/N] " reply
+    if [[ ! "$reply" =~ ^[Yy] ]]; then
+      echo "Stopped. Run paged-moe bench for the new one." >&2
+      exit 0
+    fi
+  fi
+fi
+
 if [[ $# -lt 1 ]]; then
   cat <<'EOF'
 Usage:
