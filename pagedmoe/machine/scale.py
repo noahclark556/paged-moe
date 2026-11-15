@@ -12,7 +12,7 @@ Formulas (ram_gb relative to 48):
     headroom     = clamp(6 * ram/48, 2, 8)     # flat KV+scratch when RESERVE_CTX is 0
     activation   = clamp(3 * ram/48, 1.5, 4)
     staging_cap  = clamp(6 * ram/48, 1, 12)
-    read_threads = clamp(perf_cores, 2, 32)
+    read_threads = clamp(perf_cores, 2, 32), never under 16 from the 48 GB class up
     kv_fp16_ctx  = 0 if ram<=18 else 4096 if ram<=32 else 8192
 
 48 GB is a snap-to-exact so the measured machine does not drift.
@@ -112,6 +112,11 @@ def derive_envelope(
     threads = max(2, min(32, threads))
     if near:
         threads = BASELINE_READ_THREADS
+    elif ram >= BASELINE_RAM_GB - 1.5:
+        # Readers wait on the SSD, not the CPU, and the drive wants ~qd16.
+        # perflevel0 undercounts M5 chips (6 "Super" of 18 non-efficiency
+        # cores), which put a 96 GB M5 at 6 readers.
+        threads = max(BASELINE_READ_THREADS, threads)
 
     # Explicit yaml/profile knobs win over the formula.
     if ov.get("max_cache_gb") is not None:

@@ -64,6 +64,29 @@ def test_128gb_scales_up():
     assert env.headroom_gb == 8.0  # capped
 
 
+def test_read_threads_floor_from_48gb_up():
+    # M5 sysctl reports 6 perflevel0 cores. Bigger RAM must not mean fewer readers.
+    for ram in (64, 96, 128, 192, 256, 512):
+        env = derive_envelope(Hardware(ram_gb=ram, perf_cores=6, source="test"))
+        assert env.near_baseline is False
+        assert env.read_threads == 16, (ram, env.read_threads)
+    # 48 GB with a custom fraction skips the baseline snap; still 16.
+    env = derive_envelope(Hardware(ram_gb=48, perf_cores=6, source="test"), ram_fraction=0.6)
+    assert env.near_baseline is False
+    assert env.read_threads == 16
+    # More cores still raise it, up to the cap.
+    assert derive_envelope(Hardware(ram_gb=192, perf_cores=24, source="test")).read_threads == 24
+    assert derive_envelope(Hardware(ram_gb=512, perf_cores=40, source="test")).read_threads == 32
+    # Explicit override still wins.
+    env = derive_envelope(
+        Hardware(ram_gb=256, perf_cores=6, source="test"), overrides={"read_threads": 8}
+    )
+    assert env.read_threads == 8
+    # Below the 48 GB class nothing changes.
+    assert derive_envelope(Hardware(ram_gb=36, perf_cores=6, source="test")).read_threads == 6
+    assert derive_envelope(Hardware(ram_gb=16, perf_cores=4, source="test")).read_threads == 4
+
+
 def test_faster_disk_has_no_delay():
     assert read_delay_us_per_mb(12.0, 6.0) == 0.0
     assert read_delay_us_per_mb(6.0, 12.0) > 0.0
@@ -197,6 +220,7 @@ def main() -> None:
         test_m2_16gb_scales_cache,
         test_m2_air_uses_four_perf_cores,
         test_128gb_scales_up,
+        test_read_threads_floor_from_48gb_up,
         test_faster_disk_has_no_delay,
         test_coder_next_fits_16gb,
         test_glm_ooms_16gb,

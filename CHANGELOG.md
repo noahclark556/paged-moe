@@ -31,6 +31,15 @@ token, prefill, memory and the loss of the speed run against the exact model.
 `--quick` halves the budgets for a smoke test. Also callable from Python as
 `pagedmoe.benchmark.run()`.
 
+Macs with more than 48 GB no longer drop to fewer SSD readers than a 48 GB
+one. The reader count came from the performance core count, and macOS only
+reports 6 of those on M5 chips, so a 96 GB M5 ran with 6 readers instead of
+16. At the 1 MB read size the engine uses, that left about a fifth of the
+drive's bandwidth unused. From 48 GB up it's now never below 16, and more cores
+still raise it up to 32. Smaller Macs are unchanged, and `read_threads` in
+your config or `PAGED_MOE_READ_THREADS` still overrides it. Pull and restart
+the server; `paged-moe machine` shows the new count.
+
 ## [0.3.2] - 2026-11-14
 
 `paged-moe-server` and `run.py` now read `~/paged-moe-config.yaml`. Before this
