@@ -1707,6 +1707,12 @@ REPLAY_SPLICE_MAX: int = _env("PAGED_MOE_REPLAY_SPLICE_MAX", 512, int)
 # template would reject moved to the nearest one it takes. Anything else the
 # client sets goes through as sent. 0 = pass kwargs through untouched.
 TEMPLATE_KWARGS: bool = bool(_env("PAGED_MOE_TEMPLATE_KWARGS", 1, int))
+# Tool calls the template's parser missed (tool_repair.py): calls written in
+# another family's markup, DeepSeek V3 / V3.1 native calls, a bare JSON call,
+# or a call left in reasoning when the turn ends with nothing else. Only on
+# requests that send tools, and only for names those tools offer. A request
+# can turn it off with "tool_call_repair": false. 0 = off for every request.
+TOOL_REPAIR: bool = bool(_env("PAGED_MOE_TOOL_REPAIR", 1, int))
 
 # The stable pin (host front matter) on disk, see prefix_disk.py. A restart
 # used to prefill the front matter again: 14k tokens, 40 s on Flash.

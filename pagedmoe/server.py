@@ -84,6 +84,7 @@ from . import (
     rescue,
     stage_gentle,
     think_budget,
+    tool_repair,
     turn_trace,
     verify_decode,
 )
@@ -2914,6 +2915,8 @@ def install_patches(model=None):
         if lifted is not None:
             body["chat_template_kwargs"] = lifted
             self.chat_template_kwargs = lifted
+        self._pm_tool_names = tool_repair.tool_names(body.get("tools"))
+        request = _legacy_deepseek_request(self, request, body)
         activity.enter()
         turn_trace.begin(body, _model)
         trace_err = None
@@ -3217,24 +3220,49 @@ def _install_lenient_tool_parse():
     if fmt_cls is None or getattr(fmt_cls.__call__, "_ga_lenient", False):
         return
 
-    def __call__(self, tool_calls):
-        result = []
-        for tool_text in tool_calls or []:
-            try:
-                parsed = self._tool_parser(tool_text, self._tools)
-            except Exception as e:
-                parsed = _lenient_xml_call(tool_text)
-                if parsed is None:
-                    print(f"[paged-moe] dropped unparseable tool call ({type(e).__name__}: {e})", flush=True)
-                    continue
+    def _native(self, tool_text):
+        try:
+            if self._tool_parser is None:
+                raise ValueError("no tool parser for this template")
+            return self._tool_parser(tool_text, self._tools)
+        except Exception as e:
+            parsed = _lenient_xml_call(tool_text)
+            if parsed is not None:
                 print(
                     f"[paged-moe] tool call {parsed['name']} kept with raw values "
                     f"({type(e).__name__}: {e})",
                     flush=True,
                 )
+                return parsed
+            # Another family's markup inside this template's tags.
+            parsed = tool_repair.parse_block(tool_text) if config.TOOL_REPAIR else []
+            if parsed:
+                names = ", ".join(c["name"] for c in parsed)
+                print(f"[paged-moe] tool call {names} read in another format", flush=True)
+                return parsed
+            print(f"[paged-moe] dropped unparseable tool call ({type(e).__name__}: {e})", flush=True)
+            return None
+
+    def __call__(self, tool_calls):
+        result = []
+        for tool_text in tool_calls or []:
+            recovered = tool_repair.parse_tool_text(tool_text)
+            if recovered is None:
+                parsed = _native(self, tool_text)
+            else:
+                head, parsed = recovered[0], recovered[1:]
+                if head.strip():
+                    native = _native(self, head)
+                    if native is not None:
+                        parsed = (native if isinstance(native, list) else [native]) + parsed
+                if not parsed:
+                    print("[paged-moe] dropped unparseable recovered tool call", flush=True)
+                    continue
+            if parsed is None:
+                continue
             if not isinstance(parsed, list):
                 parsed = [parsed]
-            result.extend(self._format(tc) for tc in parsed)
+            result.extend(self._format(dict(tc)) for tc in parsed)
         return result
 
     __call__._ga_lenient = True
@@ -3263,6 +3291,51 @@ def _keep_open_tool_call(response):
             state = "tool"
         prev = state
         yield gen
+
+
+_legacy_ds_templates: dict = {}
+
+
+def _legacy_deepseek_request(handler, request, body):
+    """Write tool turns out for a DeepSeek-V2 template (tool_repair.legacy_deepseek_messages)."""
+    if not config.TOOL_REPAIR or getattr(request, "request_type", None) != "chat":
+        return request
+    if not dataclasses.is_dataclass(request):
+        return request
+    msgs = request.messages or []
+    if not request.tools and not any(isinstance(m, dict) and m.get("tool_calls") for m in msgs):
+        return request
+    try:
+        tok = handler.response_generator.model_provider.tokenizer
+    except AttributeError:
+        return request
+    if tok is None:
+        return request
+    legacy = _legacy_ds_templates.get(id(tok))
+    if legacy is None:
+        legacy = tool_repair.legacy_deepseek_template(chat_compat.template_text(tok))
+        _legacy_ds_templates[id(tok)] = legacy
+        if legacy:
+            print("[paged-moe] chat template: DeepSeek-V2 tool turns written out as text", flush=True)
+    if not legacy:
+        return request
+    msgs = tool_repair.legacy_deepseek_messages(list(msgs), request.tools or [])
+    body["messages"] = msgs
+    body.pop("tools", None)
+    return dataclasses.replace(request, messages=msgs, tools=None)
+
+
+def _repair_names(handler, request) -> set:
+    """Tool names to recover calls for on this request, or none to skip."""
+    if not config.TOOL_REPAIR or handler is None:
+        return set()
+    body = getattr(handler, "body", None) or {}
+    if body.get("tool_call_repair") is False or getattr(handler, "max_tokens", 1) == 0:
+        return set()
+    names = getattr(handler, "_pm_tool_names", None)
+    if names is None:
+        names = tool_repair.tool_names(getattr(request, "tools", None))
+    return names
 
 
 def _install_tool_stream():
@@ -3330,6 +3403,9 @@ def _install_tool_stream():
         )
         started["ctx"] = ctx
         response = _keep_open_tool_call(response)
+        names = _repair_names(handler, request)
+        if names:
+            response = tool_repair.ToolRepair(names).run(response)
         if handler is None or not getattr(handler, "stream", False):
             return ctx, response
         return ctx, _relay(response, handler)

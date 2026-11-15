@@ -61,6 +61,30 @@ can't take. Templates that already handle these render exactly as before. The
 startup log says what it changed for that model, and
 `PAGED_MOE_TEMPLATE_KWARGS=0` turns it all off.
 
+Tool calls the model writes in a shape the server's parser doesn't expect are
+no longer lost as plain text. mlx-lm only catches a call when it starts with
+the exact tokens of the one parser the template picked, so anything else ended
+up in the reply and the client never ran it. The server now also picks up:
+
+- DeepSeek V3 and V3.1 native calls. mlx-lm has no parser for these at all, so
+  tool calling on those models didn't work through the server before.
+- Calls in another family's format, like Hermes JSON from a Qwen XML model or
+  `<invoke name=...>` markup, both on their own and inside the template's tags.
+- A reply that is nothing but a `{"name": ..., "arguments": ...}` object.
+- A call left in the reasoning, but only when the turn ends with no call and
+  no reply text.
+
+It only runs on requests that send tools, and a block only counts as a call
+once its name matches one of those tools, so normal text and markup you are
+just talking about come through untouched. Recovered calls stream the same as
+native ones. DeepSeek-V2 and V2.5, whose templates never render tools, now get
+the tool list in the system prompt and their earlier tool turns written out in
+the model's own format, so they keep calling past the first round.
+
+A client that already does its own repair can send `"tool_call_repair": false`
+to get the old output back, and `PAGED_MOE_TOOL_REPAIR=0` turns it off for the
+whole server.
+
 ## [0.3.2] - 2026-11-14
 
 `paged-moe-server` and `run.py` now read `~/paged-moe-config.yaml`. Before this
