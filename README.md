@@ -390,7 +390,9 @@ map, memory) is written to disk and loaded after a restart. A file only
 loads if the weights, config, engine numerics, settings and token ids all
 match and its CRC checks out. Otherwise it's a normal prefill. Hosts that
 encrypt their data can hand the engine a key over a pipe and the files are
-sealed at rest.
+sealed at rest. This is on by default but only saves when the request sends
+`stable_prefix_messages` and that part is at least 1,024 tokens. Walkthrough
+in [docs/PREFIX_CACHE.md](./docs/PREFIX_CACHE.md).
 - **Branching on hybrid caches.** Linear-attention layers can't be trimmed,
 so a retry or an edited message used to prefill from scratch. The engine
 keeps the small recurrent state at each turn's resume point and restores it
@@ -573,6 +575,8 @@ process environment. Every knob is documented at the top of its block in
 | `PAGED_MOE_PREFILL_CHUNK` | `32768` | max tokens per prefill pass |
 | `PAGED_MOE_PREFILL_AHEAD` | `1` | start the next layer's prefill reads early |
 | `PAGED_MOE_PREFIX_DISK` | `1` | pinned front matter KV on disk |
+| `PAGED_MOE_PREFIX_DISK_DIR` | `~/.paged_moe/prefix_cache` | where those files go |
+| `PAGED_MOE_PREFIX_DISK_MAX_GB` | `12` | total size cap for those files |
 | `PAGED_MOE_HYBRID_CKPT` | `1` | recurrent-state checkpoints for branching |
 | `PAGED_MOE_NATIVE_READ` | `1` | C read pool, falls back to Python |
 | `PAGED_MOE_NOCACHE` | `1` | bypass the page cache. Leave it on |

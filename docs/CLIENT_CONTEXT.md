@@ -106,6 +106,15 @@ prefill there once on hybrid caches, so a rewrite resumes from that pin
 instead of token 0. Keep those N messages truly stable. If they change, the pin
 misses once and gets rebuilt.
 
+The pin is also saved to disk (`~/.paged_moe/prefix_cache`, capped at 12 GB)
+and loaded back after a restart, as long as it's at least 1,024 tokens. Look
+for `[prefix-disk] saved ...` and later `[prefix-disk] loaded ... from disk` in
+the server log, and `usage.prompt_tokens_details.cached_tokens` in the
+response. `stable_prefix_shared_messages`, `stable_prefix_head_messages` and
+`stable_prefix_chat_id` with `stable_prefix_chat_messages` add more cut points
+so a partial change doesn't throw away the whole file. Details and a curl
+walkthrough are in [PREFIX_CACHE.md](./PREFIX_CACHE.md).
+
 ---
 
 ## Do
