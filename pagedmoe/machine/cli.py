@@ -68,11 +68,15 @@ def cmd_machine(argv: list[str]) -> int:
     print(f"perf cores:    {h.perf_cores}" + (f"  e-cores {h.efficiency_cores}" if h.efficiency_cores else ""))
     print(f"gpu cores:     {h.gpu_cores or '? (paged-moe machine probe)'}")
     print(f"mem bw:        {h.mem_bw_gb_s or '?'} GB/s")
+    print(f"gpu work set:  {f'{h.gpu_working_set_gb:g} GiB' if h.gpu_working_set_gb else '? (0.75 of RAM assumed)'}")
     print(f"ssd:           {h.disk_gb_s or '? (paged-moe machine probe)'} GB/s")
     print(f"storage:       {h.storage_total_gb or '?'} GB  ({h.storage_free_gb or '?'} GB free)")
     print("--- envelope ---")
     print(f"baseline:      {'yes (48 GB class, shipped knobs kept)' if e.near_baseline else 'no (scaled from 48 GB M5 Pro)'}")
-    print(f"ram fraction:  {e.ram_fraction}")
+    print(
+        f"ram fraction:  {e.ram_fraction}"
+        + (f"  (resident check {e.resident_fraction})" if e.resident_fraction is not None else "")
+    )
     print(f"budget:        {e.ram_budget_gb:g} GB")
     print(f"max cache:     {e.max_cache_gb:g} GB")
     print(f"prefill cache: {e.prefill_cache_gb:g} GB")

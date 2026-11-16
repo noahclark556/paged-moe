@@ -151,6 +151,24 @@ def held_aware_budget(
     return new_budget
 
 
+def raised_budget(budget: int, ram: int) -> int:
+    """Hold a machine-raised budget under Metal's real working set.
+
+    Only applies when the machine layer lifted RAM_FRACTION above
+    RESIDENT_RAM_FRACTION. Never goes below the RESIDENT_RAM_FRACTION budget,
+    so a big Mac never gets less than it did before the raise.
+    """
+    from . import mempressure
+    from .machine.scale import WORKING_SET_MARGIN_GB
+
+    floor = int(config.RESIDENT_RAM_FRACTION * ram)
+    ws = mempressure.gpu_working_set_bytes()
+    if not ws:
+        return floor
+    ceiling = int(ws - WORKING_SET_MARGIN_GB * (1 << 30))
+    return max(floor, min(budget, ceiling))
+
+
 def _kv_model_config(cfg: dict) -> dict:
     """Config slice used for KV sizing.
 
@@ -341,6 +359,11 @@ def load(
     total_bytes = sum(loc.nbytes for loc in tensor_index.values())
     ram = config.total_ram_bytes()
     budget = int(config.RAM_FRACTION * ram)
+    if (
+        config.RESIDENT_RAM_FRACTION is not None
+        and config.RAM_FRACTION > config.RESIDENT_RAM_FRACTION
+    ):
+        budget = raised_budget(budget, ram)
     gpu_held = None
     if config.GPU_HELD_CHECK:
         from . import mempressure
@@ -401,8 +424,12 @@ def load(
     kv_reserve = kvmem.kv_reserve_bytes(kv_cfg, config.RESERVE_CTX)
     headroom = _headroom_bytes() if kv_reserve <= 0 else _activation_bytes() + kv_reserve
 
+    resident_budget = budget
+    if config.RESIDENT_RAM_FRACTION is not None:
+        resident_budget = min(budget, int(config.RESIDENT_RAM_FRACTION * ram))
+
     if mode == "auto":
-        fits = total_bytes + headroom <= budget
+        fits = total_bytes + headroom <= resident_budget
         if fits:
             mode = "resident"
         elif glus:
@@ -806,7 +833,9 @@ def load(
         # conversation and the store.
         from . import mempressure
 
-        ceiling = min(budget, mempressure.gpu_working_set_bytes() or budget)
+        ceiling = min(
+            resident_budget, mempressure.gpu_working_set_bytes() or resident_budget
+        )
         room = ceiling - total_bytes - _activation_bytes()
         kvmem.set_store_budget(
             max(room // 2, 1 << 30),

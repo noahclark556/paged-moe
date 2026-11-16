@@ -20,6 +20,9 @@ class Hardware:
     hw_model: str | None = None
     gpu_cores: int | None = None
     mem_bw_gb_s: float | None = None
+    # Metal's max recommended working set in GiB. Only set for the real host;
+    # catalog and simulated Macs leave it None and get an estimate.
+    gpu_working_set_gb: float | None = None
     disk_gb_s: float | None = None
     storage_total_gb: float | None = None
     storage_free_gb: float | None = None
@@ -63,6 +66,9 @@ class Envelope:
     staging_cap_gb: float
     kv_fp16_ctx: int
     read_delay_us_per_mb: float = 0.0
+    # Budget share used only to decide resident vs streamed. None means
+    # ram_fraction.
+    resident_fraction: float | None = None
     near_baseline: bool = False
     disk_gb_s: float | None = None
     extra_env: dict[str, str] = field(default_factory=dict)
@@ -79,6 +85,8 @@ class Envelope:
             "PAGED_MOE_STAGING_CAP_GB": _fmt(self.staging_cap_gb),
             "PAGED_MOE_KV_FP16_CTX": str(int(self.kv_fp16_ctx)),
         }
+        if self.resident_fraction is not None:
+            env["PAGED_MOE_RESIDENT_RAM_FRACTION"] = _fmt(self.resident_fraction)
         if simulate:
             env["PAGED_MOE_SIMULATE_RAM_GB"] = _fmt(self.ram_gb)
             env["PAGED_MOE_ENVELOPE_STRICT"] = "1"

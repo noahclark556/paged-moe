@@ -102,6 +102,13 @@ def _simulated_ram_gb() -> float | None:
     return gb if gb > 0 else None
 
 
+def _host_working_set_gb() -> float | None:
+    from .. import mempressure
+
+    n = mempressure.gpu_working_set_bytes()
+    return round(n / (1 << 30), 2) if n else None
+
+
 def _with_simulated_ram(provider: MachineProvider) -> MachineProvider:
     gb = _simulated_ram_gb()
     if gb is None:
@@ -109,6 +116,7 @@ def _with_simulated_ram(provider: MachineProvider) -> MachineProvider:
     data = provider.hardware.to_dict()
     data["ram_gb"] = gb
     data.pop("ram_bytes", None)
+    data.pop("gpu_working_set_gb", None)
     data["source"] = "simulate"
     hw = Hardware.from_dict(data)
     return MachineProvider.from_hardware(hw, simulate=True, catalog_id=provider.catalog_id)
@@ -145,6 +153,7 @@ class MachineProvider:
         env = derive_envelope(
             hw,
             host_disk_gb_s=host_disk_gb_s,
+            ram_fraction=_env_ram_fraction() if float(hw.ram_gb) > 49.5 else None,
             overrides=overrides,
         )
         return cls(hw, env, catalog_id=catalog_id, simulate=simulate)
@@ -204,6 +213,8 @@ class MachineProvider:
                 if hw.mem_bw_gb_s is None and cached.get("mem_bw_gb_s"):
                     hw.mem_bw_gb_s = float(cached["mem_bw_gb_s"])
             hw = _merge_hardware(hw, section, source="detect+yaml")
+            if hw.gpu_working_set_gb is None and not section.get("ram_gb"):
+                hw.gpu_working_set_gb = _host_working_set_gb()
         else:
             # Manual yaml only. Missing RAM falls back to detect so we never
             # invent a tiny envelope on a 48 GB box.
@@ -239,6 +250,9 @@ class MachineProvider:
 
     def apply_to_environ(self, *, only_unset: bool = True) -> dict[str, str]:
         env = self.envelope.to_env(simulate=self.simulate)
+        if only_unset and os.environ.get("PAGED_MOE_RAM_FRACTION"):
+            # A hand-set fraction covers the resident check too.
+            env.pop("PAGED_MOE_RESIDENT_RAM_FRACTION", None)
         applied = {}
         for k, v in env.items():
             if only_unset and os.environ.get(k):
@@ -276,6 +290,18 @@ class MachineProvider:
             "hardware": self.hardware.to_dict(),
             "envelope": self.envelope.to_dict(),
         }
+
+
+def _env_ram_fraction() -> float | None:
+    """Hand-set PAGED_MOE_RAM_FRACTION, so a big Mac pinned to it keeps the old caps."""
+    raw = os.environ.get("PAGED_MOE_RAM_FRACTION", "").strip()
+    if not raw:
+        return None
+    try:
+        v = float(raw)
+    except ValueError:
+        return None
+    return v if 0 < v < 1 else None
 
 
 def _yaml_overrides(section: dict[str, Any]) -> dict[str, Any]:

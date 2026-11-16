@@ -229,7 +229,10 @@ def fit_model(
         )
 
     # Resident if the whole checkpoint plus headroom sits in the budget.
-    if int(total * 1e9) + headroom_bytes <= budget_bytes:
+    resident_bytes = budget_bytes
+    if envelope.resident_fraction is not None:
+        resident_bytes = min(budget_bytes, int(envelope.resident_fraction * ram_bytes))
+    if int(total * 1e9) + headroom_bytes <= resident_bytes:
         peak = round(total + activation_gb, 1)
         return FitResult(
             model_id=mid,

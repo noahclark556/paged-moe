@@ -6,8 +6,12 @@ Capacity knobs only. Do not put PRUNE / WAIT / sidecar / prefill-chunk here.
 
 Formulas (ram_gb relative to 48):
 
-    budget       = ram_gb * 0.68
-    max_cache    = 26 * (ram_gb / 48)          # ceiling; load still subtracts backbone
+    budget       = ram_gb * ram_fraction(ram_gb)
+    ram_fraction = 0.68 up to 48 GB. Above that the budget stays 4.8 GiB under
+                   Metal's working set: the host's real one, or 0.75 of RAM for
+                   catalog and simulated Macs (96 GB -> 0.70, 128 GB -> 0.7125).
+                   loader.py checks it again at load
+    max_cache    = 26 * (budget / 32.64)       # ceiling; load still subtracts backbone
     prefill_cache = clamp(4 * ram/48, 2, 8)
     headroom     = clamp(6 * ram/48, 2, 8)     # flat KV+scratch when RESERVE_CTX is 0
     activation   = clamp(3 * ram/48, 1.5, 4)
@@ -34,6 +38,17 @@ BASELINE_ACTIVATION_GB = 3.0
 BASELINE_STAGING_CAP_GB = 6.0
 BASELINE_KV_FP16_CTX = 8192
 BASELINE_READ_THREADS = 16
+# What the 48 GB budget leaves for macOS and apps (48 * 0.32).
+BASELINE_OS_RESERVE_GB = BASELINE_RAM_GB * (1.0 - BASELINE_RAM_FRACTION)
+# Share of each GB past 48 that also stays out of the budget.
+LARGE_RESERVE_PER_GB = 0.12
+LARGE_RAM_FRACTION_CAP = 0.82
+# The budget is nearly all Metal memory, and going past Metal's recommended
+# working set is what aborts a command buffer. 0.68 on 48 GB sits 4.8 GiB
+# under the 48 GB M5 Pro's 37.44 GiB, so a raised budget keeps that gap. 0.75 of RAM
+# is only the estimate for Macs that are not the host.
+LARGE_WORKING_SET_FRACTION = 0.75
+WORKING_SET_MARGIN_GB = 4.8
 
 BASELINE = Envelope(
     ram_gb=BASELINE_RAM_GB,
@@ -69,6 +84,26 @@ def is_baseline_hardware(hw: Hardware) -> bool:
     return abs(float(hw.ram_gb) - BASELINE_RAM_GB) <= 1.5
 
 
+def auto_ram_fraction(ram_gb: float, working_set_gb: float | None = None) -> float:
+    """Default budget share of RAM for this machine size.
+
+    Up to 48 GB this is exactly 0.68. Above that it is the lower of two
+    bounds: macOS keeps the 48 GB reserve plus 12% of the extra RAM, and the
+    budget stays WORKING_SET_MARGIN_GB under Metal's working set. That is the
+    host's real figure when known, else 0.75 of RAM (96 GB -> 0.70, 128 GB ->
+    0.7125).
+    """
+    ram = float(ram_gb)
+    if ram <= BASELINE_RAM_GB + 1.5:
+        return BASELINE_RAM_FRACTION
+    reserve = BASELINE_OS_RESERVE_GB + LARGE_RESERVE_PER_GB * (ram - BASELINE_RAM_GB)
+    by_os = 1.0 - reserve / ram
+    ws = float(working_set_gb) if working_set_gb else LARGE_WORKING_SET_FRACTION * ram
+    by_metal = (ws - WORKING_SET_MARGIN_GB) / ram
+    frac = min(LARGE_RAM_FRACTION_CAP, by_os, by_metal)
+    return round(max(BASELINE_RAM_FRACTION, frac), 4)
+
+
 def derive_envelope(
     hw: Hardware,
     *,
@@ -79,14 +114,24 @@ def derive_envelope(
     """Map hardware to capacity knobs. ``overrides`` are explicit yaml/env caps."""
     ov = overrides or {}
     ram = float(hw.ram_gb)
+    auto_frac = auto_ram_fraction(ram, hw.gpu_working_set_gb)
+    explicit = ov.get("ram_fraction") is not None or ram_fraction is not None
     frac = float(
         ov["ram_fraction"]
         if ov.get("ram_fraction") is not None
-        else (ram_fraction if ram_fraction is not None else BASELINE_RAM_FRACTION)
+        else (ram_fraction if ram_fraction is not None else auto_frac)
     )
     budget = ram * frac
     scale = ram / BASELINE_RAM_GB
+    # The cache ceiling grows with the default budget. A hand-set fraction
+    # keeps the plain RAM-scaled ceiling it always had.
+    cache_scale = scale if explicit else scale * (auto_frac / BASELINE_RAM_FRACTION)
     near = is_baseline_hardware(hw) and abs(frac - BASELINE_RAM_FRACTION) < 1e-9
+    # The raised share is for the expert cache, which shrinks under memory
+    # pressure. Whether a whole model loads resident stays on the 48 GB share.
+    resident_frac = (
+        BASELINE_RAM_FRACTION if not explicit and frac > BASELINE_RAM_FRACTION else None
+    )
 
     if near:
         max_cache = BASELINE_MAX_CACHE_GB
@@ -96,7 +141,7 @@ def derive_envelope(
         staging = BASELINE_STAGING_CAP_GB
         kv_ctx = BASELINE_KV_FP16_CTX
     else:
-        max_cache = _round1(max(2.0, BASELINE_MAX_CACHE_GB * scale))
+        max_cache = _round1(max(2.0, BASELINE_MAX_CACHE_GB * cache_scale))
         prefill = _round1(_clamp(BASELINE_PREFILL_CACHE_GB * scale, 2.0, 8.0))
         headroom = _round1(_clamp(BASELINE_HEADROOM_GB * scale, 2.0, 8.0))
         activation = _round1(_clamp(BASELINE_ACTIVATION_GB * scale, 1.5, 4.0))
@@ -150,6 +195,7 @@ def derive_envelope(
         ram_gb=ram,
         ram_fraction=frac,
         ram_budget_gb=round(budget, 2),
+        resident_fraction=resident_frac,
         max_cache_gb=float(max_cache),
         prefill_cache_gb=float(prefill),
         read_threads=int(threads),

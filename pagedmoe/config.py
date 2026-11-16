@@ -505,6 +505,11 @@ MODE: str = _env("PAGED_MOE_MODE", "auto", str)
 # pile-on that caused it is gone, and the wired limit is now forced to 0, so the
 # budget is no longer fighting an invisible second copy of the checkpoint.
 RAM_FRACTION: float = _env("PAGED_MOE_RAM_FRACTION", 0.68, float)
+# Share used only for the auto resident-vs-streamed call. None means
+# RAM_FRACTION. The machine layer sets 0.68 here when it raises RAM_FRACTION on
+# a big Mac, so the extra budget goes to the expert cache (which shrinks under
+# memory pressure) and never tips a whole model into a resident load.
+RESIDENT_RAM_FRACTION: float | None = _env("PAGED_MOE_RESIDENT_RAM_FRACTION", None, float)
 
 # None means "auto": min(RAM_FRACTION * RAM - backbone - headroom, MAX_CACHE_GB)
 CACHE_GB: float | None = _env("PAGED_MOE_CACHE_GB", None, float)

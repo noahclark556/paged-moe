@@ -233,11 +233,17 @@ expert arrays are discarded **without ever being read**.
 `load()` is a drop-in for `mlx_lm.load()` (same signature + streaming
 kwargs). Sizing comes from headers only. Mode decision:
 
-    resident  if total_bytes + 6 GB headroom <= RAM_FRACTION x RAM
+    resident  if total_bytes + 6 GB headroom <= RESIDENT_RAM_FRACTION x RAM
     streamed  otherwise (requires MoE layers; a too-big dense model errors)
 
+RAM_FRACTION is 0.68 up to 48 GB. On bigger Macs the machine layer raises it
+while keeping the budget 4.8 GB under Metal's working set, and sets
+RESIDENT_RAM_FRACTION to 0.68 so the extra only goes to the expert cache.
+Otherwise RESIDENT_RAM_FRACTION is just RAM_FRACTION.
+
 Auto cache budget = RAM budget - backbone - 6 GB headroom (KV cache,
-activations), hard-capped at `PAGED_MOE_MAX_CACHE_GB` (26).
+activations), hard-capped at `PAGED_MOE_MAX_CACHE_GB` (26 on 48 GB; it grows
+with the budget on other Macs).
 
 That cap dominates how an agent session feels. Every turn appends a few
 hundred fresh tokens, and a short prefill chunk routes across nearly every

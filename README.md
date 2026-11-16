@@ -576,13 +576,15 @@ slower.
 
 Per-model knobs go under `env:` in `~/paged-moe-config.yaml`, or in the
 process environment. Every knob is documented at the top of its block in
-`pagedmoe/config.py`. The ones worth knowing:
+`pagedmoe/config.py`, and [docs/engine-docs.md](./docs/engine-docs.md) is the
+full engine guide (setups, config file, precedence, CLI, server, and every knob
+worth touching). The ones worth knowing:
 
 | Knob | Default | What it does |
 | --- | --- | --- |
 | `PAGED_MOE_PRUNE` | `0` | skip weak experts that would need a read (fidelity knob) |
 | `PAGED_MOE_WAIT_ABOVE` | `0` | only stall on misses above this mixture weight |
-| `PAGED_MOE_CACHE_GB` / `_MAX_CACHE_GB` | auto / `26` | expert cache size and its ceiling |
+| `PAGED_MOE_CACHE_GB` / `_MAX_CACHE_GB` | auto / `26` on 48 GB | expert cache size and its ceiling (the ceiling grows with RAM) |
 | `PAGED_MOE_PREDICT` | `auto` | route-prediction prefetch, governor picks on or off |
 | `PAGED_MOE_VERIFY` | `1` | verify decode on streamed models |
 | `PAGED_MOE_VERIFY_FIDELITY` | `plain` | `exact` = every token is the exact model's pick |
@@ -620,6 +622,12 @@ env:
 ```
 
 Leave prune unset for bit-identical decode.
+
+Don't raise Metal's wired limit (`iogpu.wired_limit_mb`) or set
+`PAGED_MOE_RAM_FRACTION` by hand to make room. The engine sizes its memory from
+your Mac (RAM, GPU working set, what other apps are holding) and keeps its own
+wired limit at 0. On 48 GB and under it uses 0.68 of RAM, and bigger Macs get a
+bit more for the expert cache while staying under the GPU's limit.
 
 ### Sidecar warm-start
 
