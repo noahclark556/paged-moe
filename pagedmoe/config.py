@@ -510,6 +510,10 @@ RAM_FRACTION: float = _env("PAGED_MOE_RAM_FRACTION", 0.68, float)
 # a big Mac, so the extra budget goes to the expert cache (which shrinks under
 # memory pressure) and never tips a whole model into a resident load.
 RESIDENT_RAM_FRACTION: float | None = _env("PAGED_MOE_RESIDENT_RAM_FRACTION", None, float)
+# On a raised budget, learn how far under Metal's working set each model really
+# needs to stay and use that (2 to 4.8 GiB) on its next load. 0 keeps the
+# static 4.8 GiB. See ws_margin.py.
+WS_MARGIN_LEARN: bool = bool(_env("PAGED_MOE_WS_MARGIN_LEARN", 1, int))
 
 # None means "auto": min(RAM_FRACTION * RAM - backbone - headroom, MAX_CACHE_GB)
 CACHE_GB: float | None = _env("PAGED_MOE_CACHE_GB", None, float)

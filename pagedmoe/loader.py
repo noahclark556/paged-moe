@@ -32,6 +32,7 @@ chat templates) works unchanged.
 from __future__ import annotations
 
 import inspect
+import os
 import time
 from pathlib import Path
 
@@ -151,7 +152,7 @@ def held_aware_budget(
     return new_budget
 
 
-def raised_budget(budget: int, ram: int) -> int:
+def raised_budget(budget: int, ram: int, margin_gb: float | None = None) -> int:
     """Hold a machine-raised budget under Metal's real working set.
 
     Only applies when the machine layer lifted RAM_FRACTION above
@@ -165,8 +166,40 @@ def raised_budget(budget: int, ram: int) -> int:
     ws = mempressure.gpu_working_set_bytes()
     if not ws:
         return floor
-    ceiling = int(ws - WORKING_SET_MARGIN_GB * (1 << 30))
+    margin = WORKING_SET_MARGIN_GB if margin_gb is None else float(margin_gb)
+    ceiling = int(ws - margin * (1 << 30))
     return max(floor, min(budget, ceiling))
+
+
+def learned_budget(budget: int, ram: int, model_path) -> tuple[int, float, int]:
+    """(budget, margin GiB, bytes added) for a raised budget on this model.
+
+    With no learned margin this is raised_budget at the static margin. A
+    learned one recomputes the fraction with it, under the same OS and 0.82
+    bounds, and the added bytes go to the cache cap when the machine set it.
+    """
+    from . import mempressure, ws_margin
+    from .machine.scale import auto_ram_fraction
+
+    ws = mempressure.gpu_working_set_bytes()
+    margin = ws_margin.margin_for(str(model_path), ws)
+    base = raised_budget(budget, ram)
+    if not ws or margin >= ws_margin.static_gb():
+        return base, ws_margin.static_gb(), 0
+    frac = auto_ram_fraction(ram / (1 << 30), ws / (1 << 30), margin_gb=margin)
+    lifted = raised_budget(max(budget, int(frac * ram)), ram, margin)
+    return max(base, lifted), margin, max(0, lifted - base)
+
+
+def _machine_cache_cap() -> bool:
+    """True when MAX_CACHE_GB is the machine layer's value, not the user's."""
+    try:
+        from .machine import get_provider
+
+        want = get_provider().envelope.to_env().get("PAGED_MOE_MAX_CACHE_GB")
+    except Exception:
+        return False
+    return want is not None and os.environ.get("PAGED_MOE_MAX_CACHE_GB") == want
 
 
 def _kv_model_config(cfg: dict) -> dict:
@@ -359,11 +392,24 @@ def load(
     total_bytes = sum(loc.nbytes for loc in tensor_index.values())
     ram = config.total_ram_bytes()
     budget = int(config.RAM_FRACTION * ram)
-    if (
+    raised = (
         config.RESIDENT_RAM_FRACTION is not None
         and config.RAM_FRACTION > config.RESIDENT_RAM_FRACTION
-    ):
-        budget = raised_budget(budget, ram)
+    )
+    ws_margin_gb = None
+    cap_lift = 0
+    if raised:
+        static = budget
+        budget, ws_margin_gb, cap_lift = learned_budget(budget, ram, model_path)
+        if cap_lift:
+            print(
+                f"[paged-moe] working-set margin {ws_margin_gb:g} GiB learned for "
+                f"{model_path.name}: budget {raised_budget(static, ram) / 1e9:.1f} -> "
+                f"{budget / 1e9:.1f} GB",
+                flush=True,
+            )
+        if not _machine_cache_cap():
+            cap_lift = 0
     gpu_held = None
     if config.GPU_HELD_CHECK:
         from . import mempressure
@@ -468,6 +514,16 @@ def load(
             flush=True,
         )
 
+    from . import ws_margin
+
+    ws_margin.end()
+    if raised and mode == "streamed" and not held_excess and config.WS_MARGIN_LEARN:
+        from . import mempressure
+
+        ws = mempressure.gpu_working_set_bytes()
+        if ws:
+            ws_margin.begin(str(model_path), ws, budget, ws_margin_gb)
+
     info = {
         "model_path": str(model_path),
         "mode": mode,
@@ -568,7 +624,7 @@ def load(
         else:
             cache_bytes = budget - backbone_bytes - headroom
             # Hard ceiling - auto mode must never grab 28 GB on a 48 GB box.
-            max_cache = int(config.MAX_CACHE_GB * 1e9)
+            max_cache = int(config.MAX_CACHE_GB * 1e9) + cap_lift
             if cache_bytes > max_cache:
                 cache_bytes = max_cache
             if head_bytes:

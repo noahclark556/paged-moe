@@ -394,6 +394,7 @@ Set them in the process environment, under yaml `env:`, or (for the server /
 | --- | --- | --- |
 | `PAGED_MOE_MODE` | `auto` | `auto` / `resident` / `streamed` |
 | `PAGED_MOE_RAM_FRACTION` | `0.68` up to 48 GB, auto above | share of RAM the engine may use. Above 48 GB it rises a little but stays 4.8 GB under the GPU working set (about 0.70 on 96 GB). The extra only goes to the expert cache. Setting it yourself turns that off |
+| `PAGED_MOE_WS_MARGIN_LEARN` | `1` | on Macs above 48 GB, measure how close each model really gets to the GPU working set and let its next load use a smaller gap (2 to 4.8 GB). `0` keeps the fixed 4.8 |
 | `PAGED_MOE_CACHE_GB` | auto | fixed expert-cache size |
 | `PAGED_MOE_MAX_CACHE_GB` | `26` on 48 GB | ceiling on the auto cache. Grows with the RAM budget on other Macs |
 | `PAGED_MOE_RESERVE_CTX` | `0` | tokens of KV to hold back when sizing the cache (set this on heavy-KV models) |

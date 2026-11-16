@@ -241,6 +241,13 @@ while keeping the budget 4.8 GB under Metal's working set, and sets
 RESIDENT_RAM_FRACTION to 0.68 so the extra only goes to the expert cache.
 Otherwise RESIDENT_RAM_FRACTION is just RAM_FRACTION.
 
+The 4.8 GB gap is only the starting point. `ws_margin.py` checks each turn
+how close a streamed model really got (its Metal peak against the budget,
+plus GPU memory other apps hold, plus 2 GB) and saves it per model. The next
+load uses that gap, between 2 and 4.8 GB. It shrinks by at most 1 GB a session
+and only after a prefill, 128 decode tokens, and no memory warning, and grows
+back right away if a turn needs more.
+
 Auto cache budget = RAM budget - backbone - 6 GB headroom (KV cache,
 activations), hard-capped at `PAGED_MOE_MAX_CACHE_GB` (26 on 48 GB; it grows
 with the budget on other Macs).

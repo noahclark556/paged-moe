@@ -336,7 +336,10 @@ def test_yaml_ram_override():
 
 
 def test_explicit_env_wins_over_derived():
-    prev = os.environ.get("PAGED_MOE_MAX_CACHE_GB")
+    from pagedmoe import config as cfg
+
+    saved_env = dict(os.environ)
+    saved_cfg = {k: v for k, v in vars(cfg).items() if k.isupper()}
     os.environ["PAGED_MOE_MAX_CACHE_GB"] = "11"
     try:
         reset_provider()
@@ -344,10 +347,10 @@ def test_explicit_env_wins_over_derived():
         p.apply(only_unset=True)
         assert os.environ["PAGED_MOE_MAX_CACHE_GB"] == "11"
     finally:
-        if prev is None:
-            os.environ.pop("PAGED_MOE_MAX_CACHE_GB", None)
-        else:
-            os.environ["PAGED_MOE_MAX_CACHE_GB"] = prev
+        # apply() binds a 16 GB envelope into the process; later tests expect 48.
+        os.environ.clear()
+        os.environ.update(saved_env)
+        vars(cfg).update(saved_cfg)
         reset_provider()
 
 

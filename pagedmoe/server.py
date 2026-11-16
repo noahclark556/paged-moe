@@ -88,6 +88,7 @@ from . import (
     tool_repair,
     turn_trace,
     verify_decode,
+    ws_margin,
 )
 from .loader import load as _streamed_load
 from .loader import relieve_pressure
@@ -625,6 +626,11 @@ def _install_adaptive_prefill_generate() -> None:
             try:
                 info = getattr(mdl, "_pagedmoe_info", None) or {}
                 prune_curve.flush(info.get("model_path"))
+            except Exception:
+                pass
+            try:
+                cache = getattr(mdl, "_pagedmoe_cache", None)
+                ws_margin.note_turn(n, bool(getattr(cache, "prefill_layers", 0)))
             except Exception:
                 pass
 

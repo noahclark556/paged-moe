@@ -251,6 +251,18 @@ def recent(window_s: float) -> bool:
     return seen is not None and time.monotonic() - seen < max(0.0, float(window_s))
 
 
+def warned_since(t: float) -> bool:
+    """True when the kernel reported WARN or worse at or after monotonic `t`.
+    Also True when not polling: nothing measured is not the same as calm.
+    """
+    with _lock:
+        polling = _last_bad is not None
+        seen = _seen_bad
+    if not polling or level() >= WARN:
+        return True
+    return seen is not None and seen >= t
+
+
 def take_worst() -> int:
     """Worst level since the last call, folded with the level right now."""
     global _worst

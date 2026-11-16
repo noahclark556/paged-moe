@@ -84,7 +84,11 @@ def is_baseline_hardware(hw: Hardware) -> bool:
     return abs(float(hw.ram_gb) - BASELINE_RAM_GB) <= 1.5
 
 
-def auto_ram_fraction(ram_gb: float, working_set_gb: float | None = None) -> float:
+def auto_ram_fraction(
+    ram_gb: float,
+    working_set_gb: float | None = None,
+    margin_gb: float = WORKING_SET_MARGIN_GB,
+) -> float:
     """Default budget share of RAM for this machine size.
 
     Up to 48 GB this is exactly 0.68. Above that it is the lower of two
@@ -99,7 +103,7 @@ def auto_ram_fraction(ram_gb: float, working_set_gb: float | None = None) -> flo
     reserve = BASELINE_OS_RESERVE_GB + LARGE_RESERVE_PER_GB * (ram - BASELINE_RAM_GB)
     by_os = 1.0 - reserve / ram
     ws = float(working_set_gb) if working_set_gb else LARGE_WORKING_SET_FRACTION * ram
-    by_metal = (ws - WORKING_SET_MARGIN_GB) / ram
+    by_metal = (ws - float(margin_gb)) / ram
     frac = min(LARGE_RAM_FRACTION_CAP, by_os, by_metal)
     return round(max(BASELINE_RAM_FRACTION, frac), 4)
 
