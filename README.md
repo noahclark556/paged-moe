@@ -38,7 +38,8 @@ Another app built on the same engine is the
 [PagedMoE Assistant](https://pagedmoe.com/assistant), a private AI assistant
 that runs on your Mac.
 
-**Jump:** [Numbers](#numbers) | [What's new in 0.3](#whats-new-in-03) |
+**Jump:** [Numbers](#numbers) | [Other Macs](#other-macs) |
+[What's new in 0.3](#whats-new-in-03) |
 [Quick start](#quick-start) | [Agents](#built-for-agent-loops) |
 [Exact tokens](#exact-tokens-where-they-matter) |
 [Your Mac](#results-by-mac) | [The hard parts](#the-hard-parts) |
@@ -59,7 +60,7 @@ so the smallest one is already 1.8x over and Kimi is 16x over.
 | --- | ---: | ---: | ---: | ---: | ---: |
 | **Qwen3-Coder-Next** 6-bit | 65 GB | 31.7 GB | 827 tok/s | **30.5 tok/s** | **21.8 tok/s** |
 | **Qwen3-235B-A22B** 4-bit | 132 GB | 31.5 GB | 307 tok/s | **7.0 tok/s** | **2.9 tok/s** |
-| **GLM-4.7** 4-bit | 199 GB | | | | |
+| **GLM-4.7** 4-bit | 199 GB | 31.4 GB | 210 tok/s | **5.9 tok/s** | **1.4 tok/s** |
 | **DeepSeek-V3.2** 4-bit | 378 GB | | | | |
 | **Kimi-K2-Instruct** 4-bit | 578 GB | | | | |
 
@@ -69,6 +70,28 @@ first turn. Decode is wall clock over every turn. Speed is `--speed 0.25`,
 exact is every routed expert, bit-identical. Prune trades a bit of fidelity
 for fewer disk reads, more on that [here](#what-is-exact-and-what-isnt).
 Blank rows haven't been rerun yet.
+
+### Other Macs
+
+Same `paged-moe bench` task as above, from other machines. Mode is exact
+(nothing pruned) or speed (`--speed 0.25`, or `--speed auto` where noted).
+These were measured before a recent decode fix that helps larger Macs, so a
+re-run should come out faster.
+
+| Mac | Model | Mode | Checkpoint | Peak RAM | Prefill | Decode |
+| --- | --- | --- | ---: | ---: | ---: | ---: |
+| 128 GB M5 Max Studio | Qwen3-235B-A22B 4-bit | exact | 139 GB | 79.3 GB | 535 tok/s | 9.4 tok/s |
+| 128 GB M5 Max Studio | Qwen3-235B-A22B 4-bit | speed | 139 GB | 79.3 GB | 540 tok/s | 11.9 tok/s |
+| 128 GB M5 Max Studio | MiniMax-M3 4-bit | exact | 240 GB | 80.8 GB | 473 tok/s | 4.5 tok/s |
+| 128 GB M5 Max Studio | MiniMax-M3 4-bit | speed | 240 GB | 80.8 GB | 474 tok/s | 7.6 tok/s |
+| 128 GB M5 Max Studio | GLM-5.2 4-bit | exact | 390 GB | 86.5 GB | 157 tok/s | 1.7 tok/s |
+| 128 GB M5 Max Studio | GLM-5.2 4-bit | speed | 390 GB | 86.5 GB | 159 tok/s | 9.1 tok/s |
+| 96 GB M5 Ultra | GLM-5.3 4-bit | speed auto | 418 GB | 68.5 GB | 164 tok/s | 3.6 tok/s |
+
+These came from people who ran the bench on their own Macs and shared the
+results. Checkpoint sizes can differ a bit across mlx builds of the same
+model (139 GB vs 132 GB on the 235B is that). Real runs, not the sandbox
+estimates under [Results by Mac](#results-by-mac).
 
 ### Legacy bench (September)
 

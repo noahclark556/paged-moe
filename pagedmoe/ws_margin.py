@@ -127,7 +127,7 @@ def next_margin(used: float, needed: float, recent: list[float], counts: bool) -
         return _clamp(needed)
     if not counts:
         return _clamp(used)
-    floor = max([needed, *recent])
+    floor = max([needed] + list(recent))
     return _clamp(max(floor, used - STEP_GB))
 
 
@@ -207,7 +207,9 @@ def _save(s: dict, need: float, counts: bool) -> None:
     new = next_margin(s["margin"], need, recent, counts)
     if counts or need > s["margin"]:
         sessions = [x for x in sessions if x.get("id") != s["id"]]
-        sessions.append({"id": s["id"], "needed_gb": round(need, 2), **s.get("seen", {})})
+        entry = {"id": s["id"], "needed_gb": round(need, 2)}
+        entry.update(s.get("seen", {}))
+        sessions.append(entry)
         sessions = sessions[-KEEP_SESSIONS:]
     data = {
         "version": 1,
