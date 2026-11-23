@@ -1,0 +1,18 @@
+# python -m pagedmoe.train pagedmoe/train/examples/grpo.yaml
+# Rows: {"prompt": ..., "answer": ...}. Every other field is passed to the rewards.
+method: grpo
+model: ~/mlx-models/Qwen3.6-35B-A3B-4bit
+data: data/math.jsonl
+max_steps: 200
+batch_size: 8                    # prompts per step
+num_generations: 8               # completions per prompt
+max_completion_tokens: 512
+temperature: 1.0
+beta: 0.0                        # > 0 adds a KL term and a reference pass
+loss_type: dapo                  # dapo | grpo | dr_grpo
+rewards:
+  - exact_answer                 # builtin: last number / \boxed{} / #### vs row["answer"]
+  - pagedmoe/train/examples/rewards.py:short_and_tagged
+reward_weights: [1.0, 0.2]
+template_kwargs:
+  enable_thinking: false

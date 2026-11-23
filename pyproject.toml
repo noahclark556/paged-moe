@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "paged-moe"
-version = "0.3.2"
+version = "0.4.0"
 description = "PagedMoE: run MoE models bigger than your Mac's RAM by paging experts from the SSD through mlx-lm"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -35,6 +35,11 @@ dependencies = [
 dev = [
   "pytest>=8.0",
 ]
+# Parquet and Hugging Face datasets as training data. Not needed for jsonl / csv.
+train = [
+  "datasets>=2.14",
+  "pandas>=2.0",
+]
 
 [project.urls]
 Homepage = "https://github.com/noahclark556/paged-moe"
@@ -46,12 +51,13 @@ License = "https://github.com/noahclark556/paged-moe/blob/main/LICENSING.md"
 paged-moe = "pagedmoe.mlx_hook:main"
 paged-moe-server = "pagedmoe.launch_env:server_main"
 paged-moe-pretrain = "pagedmoe.pretrain_sidecar:main"
+paged-moe-train = "pagedmoe.train.cli:main"
 
 [tool.setuptools.packages.find]
 include = ["pagedmoe*"]
 
 [tool.setuptools.package-data]
-pagedmoe = ["pretrained_sidecar/*", "_native_read.c", "benchmark/data/*"]
+pagedmoe = ["pretrained_sidecar/*", "_native_read.c", "benchmark/data/*", "train/examples/*.yaml", "train/examples/*.sh"]
 
 [tool.setuptools]
 license-files = ["LICENSE", "NOTICE", "LICENSING.md"]

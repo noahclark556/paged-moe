@@ -1,0 +1,17 @@
+# python -m pagedmoe.train pagedmoe/train/examples/sft.yaml
+# Anything not set here is planned from the model, the data and this Mac.
+method: sft
+model: ~/mlx-models/Qwen3.6-35B-A3B-4bit
+data: data/chat.jsonl            # {"messages": [...]} rows; assistant turns are trained
+# eval_data: data/valid.jsonl
+epochs: 2
+# learning_rate: 1.0e-4          # default per method
+# batch_size: 16                 # rows per optimizer step
+# max_seq_len: 4096              # default: p99.5 of the data, up to 8192
+template_kwargs:
+  enable_thinking: false
+lora:
+  rank: 16
+  alpha: 32
+  target: all-linear             # attention | all-linear | experts | custom
+save_steps: 50

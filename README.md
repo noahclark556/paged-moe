@@ -1,12 +1,19 @@
 # PagedMoE
 
-Run Mixture-of-Experts models that are way bigger than your Mac's RAM.
-Not as a demo, as a real coding agent: tools, multi-turn, long prompts.
+Run and fine-tune Mixture-of-Experts models that are way bigger than your
+Mac's RAM. Not as a demo. Run them as a real coding agent (tools,
+multi-turn, long prompts), and train them on your own data, on a laptop.
 
 On a 48 GB MacBook Pro this runs a **578 GB Kimi-K2 at ~9 tok/s** with a
-32 GB memory peak (with its prune recipe, details below). It prefills a **31,500-token prompt in 34 seconds**. And
-after the first turn, an agent's next turn usually starts in **under 2
-seconds**, not a minute.
+32 GB memory peak (with its prune recipe, details below). It prefills a
+**31,500-token prompt in 34 seconds**. And after the first turn, an agent's
+next turn usually starts in **under 2 seconds**, not a minute.
+
+It trains them too. The same laptop fine-tunes a **270 GB Qwen3-Coder-480B**
+with LoRA at a **~30 GiB peak**, and a 65 GB Qwen3-Coder-Next at **123 tok/s**.
+SFT, DPO, ORPO, GRPO and more, all on your Mac, nothing rented. As far as I
+know this is the only way to fine-tune nearly any MoE locally on a MacBook,
+including the ones that don't fit in memory.
 
 I haven't benched it, but the largest model I've had running reliably as an
 agent on a 48 GB MacBook is **GLM-5.2, a 744B parameter model**, through the
@@ -23,9 +30,11 @@ the weights. PagedMoE keeps the always-on backbone in memory and pages the
 routed experts in from the SSD when the router actually asks for them. Same
 checkpoints you already have (plain mlx-community safetensors), same mlx-lm
 underneath, and the output is bit-identical to a fully resident run unless
-you turn on pruning.
+you turn on pruning. Training works the same way: the experts stay on disk,
+a small LoRA adapter learns, and every step reads each expert at most about
+twice no matter how big the batch is.
 
-> **Status:** `v0.3.0` pre-release. Installs from a clone, not on PyPI yet.
+> **Status:** `v0.4.0` pre-release. Installs from a clone, not on PyPI yet.
 > APIs can still change before `v1.0`.
 
 **Fastest way to see it run:** download [Global Agent](https://globalagent.dev/)
@@ -34,17 +43,27 @@ the hood) and this engine is built into it. It detects your Mac, picks the
 settings for that model and runs it right there in the app. No clone, no env
 vars. The download is free.
 
+**Fastest way to train one:** download
+[Paged Trainer](https://pagedmoe.com/train). It's an easy-to-use app for the
+trainer. Pick a model and a dataset, it plans the run for your Mac, and every
+method and setting the trainer has is right there in the UI:
+live stats, checkpoints, resume, chat with any checkpoint, evals and the
+training bench.
+
+![Paged Trainer](./docs/images/paged-trainer.png)
+
 Another app built on the same engine is the
 [PagedMoE Assistant](https://pagedmoe.com/assistant), a private AI assistant
 that runs on your Mac.
 
-**Jump:** [Numbers](#numbers) | [Other Macs](#other-macs) |
-[What's new in 0.3](#whats-new-in-03) |
-[Quick start](#quick-start) | [Agents](#built-for-agent-loops) |
+**Jump:** [Numbers](#numbers) | [Training bench](#training-bench) |
+[Other Macs](#other-macs) | [What's new in 0.4](#whats-new-in-04) |
+[Quick start](#quick-start) | [Fine-tuning](#fine-tuning) |
+[Agents](#built-for-agent-loops) |
 [Exact tokens](#exact-tokens-where-they-matter) |
 [Your Mac](#results-by-mac) | [The hard parts](#the-hard-parts) |
 [Fidelity](#what-is-exact-and-what-isnt) | [Models](#compatible-models) |
-[Config](#config) | [Upgrading](#upgrading-from-02x) | [License](#license-dual)
+[Config](#config) | [Upgrading](#upgrading) | [License](#license-dual)
 
 ---
 
@@ -61,8 +80,6 @@ so the smallest one is already 1.8x over and Kimi is 16x over.
 | **Qwen3-Coder-Next** 6-bit | 65 GB | 31.7 GB | 827 tok/s | **30.5 tok/s** | **21.8 tok/s** |
 | **Qwen3-235B-A22B** 4-bit | 132 GB | 31.5 GB | 307 tok/s | **7.0 tok/s** | **2.9 tok/s** |
 | **GLM-4.7** 4-bit | 199 GB | 31.4 GB | 210 tok/s | **5.9 tok/s** | **1.4 tok/s** |
-| **DeepSeek-V3.2** 4-bit | 378 GB | | | | |
-| **Kimi-K2-Instruct** 4-bit | 578 GB | | | | |
 
 Run with `paged-moe bench` (below), which replays a coding agent task: 8
 requests, a ~12k-token front matter, KV reserved for 32k. Prefill is the cold
@@ -70,6 +87,37 @@ first turn. Decode is wall clock over every turn. Speed is `--speed 0.25`,
 exact is every routed expert, bit-identical. Prune trades a bit of fidelity
 for fewer disk reads, more on that [here](#what-is-exact-and-what-isnt).
 Blank rows haven't been rerun yet.
+
+### Training bench
+
+LoRA fine-tuning on the same 48 GB M5 Pro. Every one of these is bigger than
+the training budget, so all of them train streamed, experts read from the
+SSD every step.
+
+| Model | Checkpoint | Step | Train speed | s / step | 1k-row epoch | Peak memory | SSD read / step |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| **Qwen3-Coder-Next** 6-bit | 65 GB | 8 rows | **123 tok/s** | 133 s | **4h 37m** | 28.5 GiB | 59 GB |
+| **Qwen3-235B-A22B** 4-bit | 132 GB | 7 rows | **63 tok/s** | 229 s | **9h 06m** | 29.7 GiB | 211 GB |
+| **Qwen3.8-Flash-Next** 6-bit | 148 GB | 4 rows | **61 tok/s** | 135 s | **9h 20m** | 27.9 GiB | 113 GB |
+| **GLM-4.7** 4-bit | 199 GB | 3 rows | **24 tok/s** | 259 s | **23h 59m** | 27.9 GiB | 351 GB |
+| **Qwen3-Coder-480B** 4-bit | 270 GB | 1 row | **24 tok/s** | 87 s | **1d 0h** | 29.8 GiB | 339 GB |
+
+SFT on 2,048-token rows, QLoRA rank 16 on every linear layer, a fixed
+synthetic corpus so Macs compare. The trainer picks the rows per step, the
+micro-batches and the expert cache for the Mac it's on. Train speed counts
+every token the model processes. Peak memory is the most MLX held at once,
+in GiB like Apple sells RAM (a 48 GB Mac has 48 GiB). The whole process
+peaked between 29 and 34 GiB. SSD read is the expert bytes read per step.
+
+Run it on your own Mac, any checkpoint:
+
+```bash
+paged-moe-train bench run ~/mlx-models/<model>
+paged-moe-train bench table            # Markdown, or --format csv / json
+```
+
+Paged Trainer has the same bench in its Bench tab. More in
+[docs/paged-training.md](./docs/paged-training.md#benchmark).
 
 ### Other Macs
 
@@ -139,6 +187,32 @@ you want to try a setting on top.
 
 The headline isn't "fastest tokens on earth." It's that a 199 GB or 578 GB
 model on a laptop goes from a hard no to something you can actually work with.
+
+---
+
+## What's new in 0.4
+
+**Training.** `pagedmoe.train` fine-tunes MoE checkpoints with LoRA,
+including ones many times bigger than RAM, using the same paging the server
+uses. It's not a bolt-on: it plans the run from this Mac (resident or
+streamed, memory, rows per step, micro-batches, expert cache), measures a
+few real steps before it commits, and watches memory pressure while it
+runs. Methods: SFT, CPT, ORPO, DPO, SimPO, CPO, KTO and GRPO, plus custom
+objectives, custom rows and trainable input encoders. Adapters come out in
+mlx-lm format. Everything is in [Fine-tuning](#fine-tuning) below, and
+[Paged Trainer](https://pagedmoe.com/train) puts all of it in a Mac app.
+
+A lot of the work went into the backward pass, since that's where the time
+goes:
+
+- A step walks the model one layer at a time for the whole batch, so the
+  expert mass is read at most about twice per step instead of once per
+  micro-batch.
+- Frozen 4-bit weights get a cheaper backward. On a 235B layer at 8k
+  tokens, forward plus backward went from 1.0 s to ~0.6 s.
+- Hybrid linear attention (Qwen3.5 / 3.6 / Next) trains in 128-token chunks
+  instead of one token at a time, which used to be ~95% of the step.
+- Streamed gradients match the fully loaded path. The tests check it.
 
 ---
 
@@ -361,6 +435,7 @@ and kills it when you're done.
 - Qwen / GLM / DeepSeek / Kimi / MiniMax class MoEs on a Mac that can't hold
 them
 - Agent loops, not just one-shot chat
+- Fine-tuning an MoE on your own data without renting GPUs
 - Plain MLX checkpoints. No converted format, no second copy on disk
 
 ### Who it's not for
@@ -369,7 +444,86 @@ them
 loads those resident anyway)
 - The smallest possible memory footprint. This spends RAM on a big expert
 cache on purpose, so agent turns stay warm
+- Full fine-tuning. Training is LoRA / DoRA
 - NVIDIA / CUDA
+
+---
+
+## Fine-tuning
+
+Same install. LoRA adapters on any MoE checkpoint mlx-lm loads, resident when
+it fits and streamed when it doesn't. You don't pick: it reads the
+checkpoint and your Mac and plans the run.
+
+If you'd rather skip the terminal, I'd start with
+[Paged Trainer](https://pagedmoe.com/train). It runs this same trainer and every
+option is right there in the UI.
+Everything below is the same engine from the command line and Python.
+
+```bash
+# see the plan first: mode, memory, rows per step, speed estimate. Nothing trains.
+paged-moe-train plan sft --model ~/mlx-models/Qwen3.6-35B-A3B-4bit --data chat.jsonl
+
+# train
+paged-moe-train sft --model ~/mlx-models/Qwen3.6-35B-A3B-4bit --data chat.jsonl --epochs 2
+
+# pick a stopped run back up, talk to a checkpoint, compare checkpoints
+paged-moe-train resume ~/.paged_moe/train/runs/<run>
+paged-moe-train chat ~/.paged_moe/train/runs/<run>
+paged-moe-train eval ~/.paged_moe/train/runs/<run> --data eval.jsonl --generate
+```
+
+Or from Python:
+
+```python
+from pagedmoe.train import SFTConfig, SFTTrainer
+
+trainer = SFTTrainer(SFTConfig(
+    model="~/mlx-models/Qwen3.6-35B-A3B-4bit",
+    data="chat.jsonl",
+    epochs=2,
+))
+print(trainer.plan)
+trainer.train()
+```
+
+Any config field works as a flag (`--lora.rank 32`, `--max-seq-len 4096`),
+and config files work too (`paged-moe-train pagedmoe/train/examples/sft.yaml`).
+Data is jsonl, json, csv, parquet, a folder, or a Hugging Face dataset.
+
+| Method | Data |
+| --- | --- |
+| `sft` | chat messages, prompt / completion, or token ids |
+| `cpt` | raw text, packed |
+| `dpo`, `orpo`, `simpo`, `cpo` | prompt, chosen, rejected |
+| `kto` | prompt, completion, good or bad |
+| `grpo` | prompts plus reward functions (built in or your own Python) |
+
+What it measured on a 48 GB Mac:
+
+| Model | Checkpoint | Training peak | Mode |
+| --- | ---: | ---: | --- |
+| **Qwen3-Coder-480B** 4-bit | 270 GB | 29.8 GiB | streamed |
+| **Qwen3-235B-A22B** 4-bit | 132 GB | 29.7 GiB | streamed |
+| **Qwen3-Coder-Next** 6-bit | 65 GB | 28.5 GiB | streamed |
+| **Qwen3.6-35B-A3B** 4-bit, planned as a 16 GB Mac | 20 GB | ~10 GB | streamed |
+
+Adapters load anywhere mlx-lm does:
+
+```python
+from pagedmoe import load
+model, tok = load("~/mlx-models/Qwen3.6-35B-A3B-4bit", adapter_path="~/.paged_moe/train/runs/<run>")
+```
+
+`mlx_lm.generate --adapter-path` and `mlx_lm.fuse` work too. Training always
+runs the exact model (no prune, no drafts), and the routers are never
+trained, so the model still picks experts the way the weights on disk
+expect. It's one GPU job at a time, so stop a running server first.
+
+The full guide (every method, the config reference, checkpoints, evals,
+custom objectives and encoders) is
+[docs/paged-training.md](./docs/paged-training.md). The short version of why
+it fits is [docs/why-it-trains.md](./docs/why-it-trains.md).
 
 ---
 
@@ -680,11 +834,28 @@ them). More in [docs/tinymodel-improvements.md](./docs/tinymodel-improvements.md
 | `paged-moe bench <model> [--speed S\|--exact] [--quick]` | agent-task bench on this Mac, speed and exact |
 | `paged-moe-server ...` | OpenAI-compatible server |
 | `paged-moe-pretrain ...` | sidecar warm-start / fit / unlock |
+| `paged-moe-train <method> ...` | fine-tune (`sft`, `dpo`, `grpo`, ...), also `plan`, `resume`, `chat`, `eval` |
+| `paged-moe-train bench run [model]` | training bench on this Mac |
 | `python run.py --model ... --chat` | quick REPL from a clone |
 
 ---
 
-## Upgrading from 0.2.x
+## Upgrading
+
+From 0.3, pull and rerun the installer. The pinned versions didn't change,
+it just registers the new `paged-moe-train` command (an editable install
+won't have it until you do):
+
+```bash
+git pull
+./install_mlx.sh
+paged-moe-train --help
+```
+
+Training runs, probe profiles and bench results go under
+`~/.paged_moe/train/`. Nothing the server uses moves.
+
+### From 0.2.x
 
 The import package is `pagedmoe` now (was `expert_stream`) and every env knob is
 `PAGED_MOE_*` (was `EXPERT_STREAM_*`). Old names are not read, so rename them
@@ -715,6 +886,14 @@ python tests/test_real_model.py    # real MoE, ~4 GB download the first time
 Tests that need a specific checkpoint skip when it isn't there. Run them with
 no `PAGED_MOE_*` exported, since a pruning setting makes decode approximate on
 purpose. `bench/` has the probes behind the numbers in this README.
+
+The training tests run every method end to end on a tiny synthetic MoE, and
+check the streamed path's gradients and losses against the fully loaded one:
+
+```bash
+for t in tests/test_train_*.py; do python "$t"; done    # each prints OK, ~10 s total
+pagedmoe/train/examples/sandbox.sh --here    # same checks, plus real-model runs with MODEL=...
+```
 
 `walkthrough/tour.py` runs one real request and drops you into pdb at each
 major engine stage, if you want to see it work from the inside.

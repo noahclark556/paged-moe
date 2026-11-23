@@ -91,6 +91,10 @@ jobs:
               "pagedmoe.prefix_disk",
               "pagedmoe.server",
               "pagedmoe.mlx_hook",
+              "pagedmoe.train",
+              "pagedmoe.train.plan",
+              "pagedmoe.train.cli",
+              "pagedmoe.train.bench",
           ]
           for name in mods:
               try:
@@ -110,6 +114,11 @@ jobs:
         env:
           PAGED_MOE_HOOK: "0"
         run: python -m pytest tests/test_machine.py tests/test_autotune.py
+
+      - name: Training CLI entry point
+        env:
+          PAGED_MOE_HOOK: "0"
+        run: paged-moe-train --help
 
       - name: Detect this Mac + print a ladder
         env:

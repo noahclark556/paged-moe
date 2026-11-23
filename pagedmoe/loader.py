@@ -248,6 +248,8 @@ def resolve_model_path(path_or_repo: str) -> Path:
     p = Path(path_or_repo).expanduser()
     if p.exists():
         return p
+    if p.is_absolute() or path_or_repo.startswith((".", "~")):
+        raise FileNotFoundError(f"model folder not found: {p.absolute()}")
 
     from huggingface_hub import snapshot_download
 

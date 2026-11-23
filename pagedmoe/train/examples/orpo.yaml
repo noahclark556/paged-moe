@@ -1,0 +1,12 @@
+# python -m pagedmoe.train pagedmoe/train/examples/orpo.yaml
+# Rows: {"prompt": ..., "chosen": ..., "rejected": ...}, strings or message lists.
+method: orpo
+model: ~/mlx-models/Qwen3.6-35B-A3B-4bit
+data: data/prefs.jsonl
+epochs: 1
+beta: 0.1                        # weight of the odds-ratio term
+template_kwargs:
+  enable_thinking: false
+lora:
+  rank: 16
+  alpha: 32

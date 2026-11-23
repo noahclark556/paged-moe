@@ -28,6 +28,7 @@ points:
 | `paged-moe` | status, hook install, which, detect, serve, bench, machine, ladder |
 | `paged-moe-server` | OpenAI-compatible HTTP server |
 | `paged-moe-pretrain` | sidecar warm-start / fit / unlock |
+| `paged-moe-train` | LoRA fine-tuning (same as `python -m pagedmoe.train`) |
 | `python run.py` | one-shot or chat REPL from a clone |
 | `python -m pagedmoe.server` | same server as `paged-moe-server` |
 
@@ -612,6 +613,34 @@ Prefix-disk details: [PREFIX_CACHE.md](./PREFIX_CACHE.md).
 
 ---
 
+## Training
+
+The same engine fine-tunes. `pagedmoe.train` trains LoRA adapters on MoE
+checkpoints, including ones much bigger than RAM: the backbone stays
+resident, experts page from the SSD each step, and the trainer plans mode,
+memory, batch and cache for this Mac the same way the server does.
+
+```bash
+paged-moe-train plan sft --model ~/mlx-models/Qwen3.6-35B-A3B-4bit --data chat.jsonl   # plan only
+paged-moe-train sft --model ~/mlx-models/Qwen3.6-35B-A3B-4bit --data chat.jsonl --epochs 2
+paged-moe-train resume ~/.paged_moe/train/runs/<run>
+paged-moe-train chat ~/.paged_moe/train/runs/<run>          # talk to a checkpoint
+paged-moe-train bench run                                   # training bench on this Mac
+```
+
+Methods: SFT, CPT, ORPO, DPO, SimPO, CPO, KTO, GRPO, plus custom objectives
+and inputs. Adapters come out in mlx-lm format and load with
+`pagedmoe.load(path, adapter_path=...)` or `mlx_lm`. Training always runs the
+exact model: prune, drafts and the other decode shortcuts are off and checked
+after load. It is a GPU job like the server, so stop the server first.
+
+Everything else (data formats, every config field, checkpoints, evaluation,
+custom objectives) is in [paged-training.md](./paged-training.md). The Mac app
+[Paged Trainer](https://pagedmoe.com/train) is a UI over the same
+trainer, with a 7-day free trial.
+
+---
+
 ## Troubleshooting
 
 | Symptom | What to check |
@@ -644,6 +673,8 @@ paged-moe detect /path/to/model --speed auto
 | [INSTALL.md](./INSTALL.md) | install, hook, first curl |
 | [DESIGN.md](./DESIGN.md) | data flow, cache, slab, correctness |
 | [why-it-fits.md](./why-it-fits.md) | short capacity story |
+| [paged-training.md](./paged-training.md) | fine-tuning: methods, data, config, bench |
+| [why-it-trains.md](./why-it-trains.md) | short version of how training fits |
 | [PREFIX_CACHE.md](./PREFIX_CACHE.md) | on-disk front-matter KV |
 | [CLIENT_CONTEXT.md](./CLIENT_CONTEXT.md) | how a host should shape prompts |
 | [tinymodel-improvements.md](./tinymodel-improvements.md) | sidecar heads |

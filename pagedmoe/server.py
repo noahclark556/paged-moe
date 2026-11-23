@@ -30,7 +30,7 @@ This is mlx-lm's production server with a few changes:
      weight once for k tokens instead of k times. Greedy output is identical
      to non-speculative decoding (acceptance is exact token match).
   7. warm_prefix=true on /v1/chat/completions: prefill + store that exact
-     prompt in the LRU and skip decode (any client, e.g. right after a turn ends).
+     prompt in the LRU and skip decode (any client; ga uses this after Done).
 
 Every default can still be overridden by passing the flag explicitly.
 
@@ -51,6 +51,7 @@ import sys
 import threading
 import time
 from collections import OrderedDict, deque
+from types import SimpleNamespace
 from typing import Any, Optional
 
 import mlx.core as mx
@@ -215,7 +216,7 @@ def _salvage_tool_call(text: str) -> dict | None:
     """Pull name (+ arguments when possible) out of broken tool JSON.
 
     mlx-lm's tool state machine never puts the raw markup into `content`, so a
-    failed parse is an empty turn for the client. Returning a name with best-effort
+    failed parse is an empty turn for ga. Returning a name with best-effort
     args is better than dropping the call.
     """
     s = (text or "").strip()
@@ -2607,6 +2608,19 @@ def _install_config_route() -> None:
 
     _orig_do_get = _mlx_server.APIHandler.do_GET
     _orig_do_post = _mlx_server.APIHandler.do_POST
+    _orig_scan = _mlx_server.scan_cache_dir
+
+    # /v1/models scans the HF cache after the 200 is sent, and a Mac that
+    # never downloaded from HF has no cache dir, so treat that as empty.
+    def _scan_cache_dir(*args, **kwargs):
+        try:
+            return _orig_scan(*args, **kwargs)
+        except Exception as e:
+            if type(e).__name__ != "CacheNotFound":
+                raise
+            return SimpleNamespace(repos=())
+
+    _mlx_server.scan_cache_dir = _scan_cache_dir
 
     # Debuggers and browser tooling probe local ports (GET /json/version) and
     # hang up before the 404 body is written.
@@ -3379,8 +3393,7 @@ def _install_tool_stream():
     write, decode keeps the GPU for the rest of max_tokens. Comment lines
     (": ga-tool <tokens> <json text>") keep the socket live, let a disconnect stop
     decode through the handler's ctx.stop(), and are ignored by plain SSE
-    clients. The "ga-" prefix comes from Global Agent, the first client to
-    read them.
+    clients.
     """
     handler_cls = getattr(_mlx_server, "APIHandler", None)
     gen_cls = getattr(_mlx_server, "ResponseGenerator", None)

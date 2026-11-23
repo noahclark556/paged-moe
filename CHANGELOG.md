@@ -4,7 +4,39 @@ Notable changes to PagedMoE.
 
 Format loosely follows Keep a Changelog. Versioning aims for SemVer.
 
-## [Unreleased]
+## [0.4.0] - 2026-11-22
+
+Training. `pagedmoe.train` fine-tunes MoE checkpoints with LoRA / DoRA,
+including ones much bigger than RAM: the backbone stays resident and the
+experts page from the SSD every step, through the same read path as the
+server. Methods are SFT, CPT, ORPO, DPO (sigmoid / IPO / hinge), SimPO, CPO,
+KTO and GRPO, plus custom objectives, custom rows and trainable input
+encoders. Adapters are mlx-lm format and load with `pagedmoe.load` or
+`mlx_lm`.
+
+- `paged-moe-train` (same as `python -m pagedmoe.train`): train, `plan`,
+  `resume`, `chat` and `eval` against any checkpoint, and `bench` for a
+  training benchmark that compares across Macs.
+- The run is planned from the Mac: resident or streamed, rows per step,
+  micro-batches and the expert cache, from a short probe of real steps. The
+  first steps check the plan, and a memory guard gives memory back under
+  macOS pressure without changing the gradients.
+- Streamed steps run layer by layer for the whole batch, so the expert mass
+  is read about twice per step. Frozen quantized weights get a cheaper
+  backward (1.0 s to ~0.6 s per 235B layer at 8k tokens), and hybrid linear
+  attention trains in chunks instead of a per-token loop.
+- Resume restores the optimizer and data position exactly. Checkpoints keep
+  the last N and save on SIGTERM.
+- Tests: every method on a tiny MoE, streamed against resident gradients,
+  the fast backwards against MLX's own, the chunked gated delta against the
+  per-token loop.
+- Optional extra `pip install -e ".[train]"` for parquet and Hugging Face
+  datasets.
+- Docs: [docs/paged-training.md](./docs/paged-training.md) and
+  [docs/why-it-trains.md](./docs/why-it-trains.md).
+  [Paged Trainer](https://pagedmoe.com/train) is a Mac app that runs the
+  same trainer from a UI. Runs started from the CLI or
+  Python print one line about it; `PAGED_MOE_TRAIN_HINT=0` hides it.
 
 `paged-moe serve <model>` starts the server from just a model path, no config
 needed. It reads the checkpoint (size, active params, bit width) and runs exact
@@ -100,6 +132,10 @@ shows what it picked and where each value came from.
 Anything the request sends still wins, and so do `--temp`, `--top-p`, `--top-k`
 and `--min-p` on the server. `PAGED_MOE_SAMPLING_DEFAULTS=0` goes back to
 mlx-lm's defaults.
+
+A model path that doesn't exist (`/...`, `~/...` or `./...`) now fails with
+"model folder not found" instead of being sent to Hugging Face as a repo id,
+which used to end in a confusing `HFValidationError`.
 
 ## [0.3.2] - 2026-11-14
 

@@ -88,6 +88,12 @@ def _read_json(path: Path) -> dict:
 
 def _ram_gb() -> float:
     try:
+        fake = float(os.environ.get("PAGED_MOE_SIMULATE_RAM_GB") or 0)
+    except ValueError:
+        fake = 0.0
+    if fake > 0:
+        return fake
+    try:
         return os.sysconf("SC_PAGE_SIZE") * os.sysconf("SC_PHYS_PAGES") / (1 << 30)
     except (ValueError, OSError):
         return 48.0
