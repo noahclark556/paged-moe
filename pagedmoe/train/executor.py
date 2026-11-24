@@ -222,7 +222,11 @@ class _Base:
             )
         x0 = _hidden_arg(*rec[0])
         # bytes per token at a layer boundary, as the model really passes it
-        self.boundary_bytes = int(x0.shape[-1]) * x0.dtype.size
+        # (mHC models pass [B, T, streams, H])
+        width = 1
+        for d in x0.shape[2:]:
+            width *= int(d)
+        self.boundary_bytes = width * x0.dtype.size
         return x0, rec
 
     def inputs(self, batch: Batch, x0: mx.array, enc_params=None) -> mx.array:

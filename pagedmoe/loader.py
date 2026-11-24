@@ -91,10 +91,18 @@ def _headroom_bytes() -> int:
     return int(float(config.HEADROOM_GB) * (1 << 30))
 
 
-def _drop_mtp(head_bytes: int, cache_bytes: int):
+def _mtp_max_frac(model) -> float:
+    """Head budget as a share of the expert cache. An arch can raise it
+    (mtp_max_frac) where it was measured; the env var always wins."""
+    if "PAGED_MOE_MTP_MAX_FRAC" in os.environ:
+        return config.MTP_MAX_FRAC
+    return max(config.MTP_MAX_FRAC, float(getattr(model, "mtp_max_frac", 0) or 0))
+
+
+def _drop_mtp(head_bytes: int, cache_bytes: int, frac: float):
     print(
         f"[mtp] head ({head_bytes / 1e9:.2f} GB) is more than "
-        f"{config.MTP_MAX_FRAC:.0%} of the {cache_bytes / 1e9:.1f} GB expert cache, "
+        f"{frac:.0%} of the {cache_bytes / 1e9:.1f} GB expert cache, "
         "loading without it",
         flush=True,
     )
@@ -458,7 +466,7 @@ def load(
     # Vision / MTP are not loaded for text; PLE n-gram shards are paged from
     # disk (see ple_offload). Both must leave the resident-backbone figure or
     # Flash-class checkpoints report a negative expert cache on a 48 GB Mac.
-    skip_names = skipped_resident_tensor_names(tensor_index)
+    skip_names = skipped_resident_tensor_names(tensor_index, cfg)
     skip_bytes = sum(tensor_index[n].nbytes for n in skip_names)
     backbone_bytes = total_bytes - expert_bytes - skip_bytes
 
@@ -483,8 +491,9 @@ def load(
         elif glus:
             mode = "streamed"
         else:
-            # Dense layer streaming is shelved and not in this repo, so this
-            # falls through to the ordinary "does not fit" error.
+            # Dense layer streaming is shelved (private/dense_shelved).
+            # Without that package this falls through to the ordinary
+            # "does not fit" error.
             mode = "dense" if _dense_enabled() else "resident"
 
     # Streamed only: a smaller budget there costs cache slots, while resident
@@ -552,11 +561,35 @@ def load(
     dense_extra = None
     mtp_prep = None
     head_bytes = 0
+    mtp_frac = _mtp_max_frac(model)
     if ((mode == "streamed" and glus) or mode == "resident") and config.MTP:
         from . import mtp as _mtp
 
-        mtp_prep = _mtp.prepare(model, cfg, model_path)
-        head_bytes = mtp_prep.nbytes if mtp_prep is not None else 0
+        # Same limits as below, checked on the size on disk so a head that
+        # can't fit (GLM-5.3's is 4.6 GB) isn't read and converted every start.
+        est = _mtp.estimate_bytes(model_path)
+        too_big = False
+        if est and mode == "resident":
+            too_big = total_bytes + est + _headroom_bytes() > budget
+            if too_big:
+                print(
+                    f"[mtp] head ({est / 1e9:.2f} GB) does not fit next to the "
+                    f"{info['total_gb']} GB resident model on a {info['ram_budget_gb']} GB "
+                    "budget, loading without it",
+                    flush=True,
+                )
+        elif est:
+            if cache_gb is not None:
+                planned = int(cache_gb * 1e9)
+            else:
+                planned = min(budget - backbone_bytes - headroom,
+                              int(config.MAX_CACHE_GB * 1e9) + cap_lift)
+            if est > mtp_frac * planned:
+                too_big = True
+                _drop_mtp(est, planned, mtp_frac)
+        if not too_big:
+            mtp_prep = _mtp.prepare(model, cfg, model_path)
+            head_bytes = mtp_prep.nbytes if mtp_prep is not None else 0
     if head_bytes and mode == "resident" and total_bytes + head_bytes + _headroom_bytes() > budget:
         # Resident has no expert cache to give the head room, so it only rides
         # along when the whole model plus the head still clears the budget.
@@ -604,8 +637,8 @@ def load(
             # context has 4 GB spare that auto mode would leave idle - so honor
             # it, and only clamp to what the backbone and decode activations
             # physically leave. Auto mode is the safe, KV-aware default.
-            if head_bytes and head_bytes > config.MTP_MAX_FRAC * cache_bytes:
-                mtp_prep, head_bytes = _drop_mtp(head_bytes, cache_bytes)
+            if head_bytes and head_bytes > mtp_frac * cache_bytes:
+                mtp_prep, head_bytes = _drop_mtp(head_bytes, cache_bytes, mtp_frac)
             hard_cap = budget - backbone_bytes - _activation_bytes() - head_bytes
             if hard_cap > 0:
                 cache_bytes = min(cache_bytes, hard_cap)
@@ -632,8 +665,8 @@ def load(
             if head_bytes:
                 # The head comes out of whatever MAX_CACHE_GB left unused first.
                 room = budget - backbone_bytes - headroom
-                if head_bytes > config.MTP_MAX_FRAC * cache_bytes:
-                    mtp_prep, head_bytes = _drop_mtp(head_bytes, cache_bytes)
+                if head_bytes > mtp_frac * cache_bytes:
+                    mtp_prep, head_bytes = _drop_mtp(head_bytes, cache_bytes, mtp_frac)
                 else:
                     cache_bytes = min(cache_bytes, room - head_bytes)
             # If every routed expert fits in the RAM budget, hold them. The
@@ -686,7 +719,7 @@ def load(
         #
         # Predictor precision is only 0.31-0.43, so it spends 0.36-0.75 GB per
         # token on reads nothing asks for - and once the drive is saturated
-        # (tok/s x GB/token pins at ~5.8 GB/s) a wasted prefetch is
+        # (notes.md: tok/s x GB/token pins at ~5.8 GB/s) a wasted prefetch is
         # bandwidth taken directly from a read something is waiting on. Being
         # disk-bound is the reason prediction cannot pay here, not the reason it
         # must. The governor measures instead of assuming, so let it.
@@ -946,7 +979,7 @@ def load(
         if install_closed_stitch(model):
             info["stitch_closed"] = True
 
-    # Dev-only activation debugger (no-op when PAGED_MOE_MITM=0 or the module is missing).
+    # Dev-only activation MITM (no-op when PAGED_MOE_MITM=0 or private/ missing).
     try:
         from . import dev_mitm
 

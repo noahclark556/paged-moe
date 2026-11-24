@@ -103,8 +103,15 @@ def kv_bytes_per_token(model_config: dict, *, bits: int | None = 8) -> int:
         # MLA (DeepSeek-V3 family): the cache holds one compressed latent plus
         # the RoPE part per token, not K and V per head - an order of magnitude
         # less than the dense formula would claim.
-        rope_dim = int(model_config.get("qk_rope_head_dim", 64) or 64)
-        elems = layers * (int(lora_rank) + rope_dim)
+        rope = model_config.get("qk_rope_head_dim")
+        rope_dim = 64 if rope is None else int(rope)
+        # Hybrid MLA (glm5_next): linear-attention layers hold a fixed-size
+        # recurrent state instead, so only the attention layers grow with context.
+        attn_layers = layers
+        kinds = model_config.get("layer_types")
+        if isinstance(kinds, list) and kinds:
+            attn_layers = sum(1 for k in kinds[:layers] if k != "linear_attention")
+        elems = attn_layers * (int(lora_rank) + rope_dim)
         index_dim = int(model_config.get("index_head_dim") or 0)
         if index_dim and model_config.get("index_topk"):
             # DSA (deepseek_v32 family) keeps a CacheList per layer, which
@@ -113,7 +120,10 @@ def kv_bytes_per_token(model_config: dict, *, bits: int | None = 8) -> int:
             from .dsa_shared import indexer_types
 
             types = indexer_types(model_config)
-            elems += (types.count("full") if types else layers) * index_dim
+            n_idx = min(types.count("full") if types else layers, attn_layers)
+            # k-pooled indexers also cache a gate row and a valid flag.
+            width = 2 * index_dim + 1 if model_config.get("index_kpool_compress") else index_dim
+            elems += n_idx * width
             per_elem = 2.0
         return int(elems * per_elem)
 

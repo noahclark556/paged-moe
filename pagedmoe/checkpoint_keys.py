@@ -2,10 +2,11 @@
 # SPDX-License-Identifier: AGPL-3.0-or-later
 """Map module-tree paths to on-disk safetensors keys.
 
-Multimodal checkpoints (qwen4_exp / Flash) keep text weights under
-`language_model.model....` while sanitize() strips that prefix into the module
-tree (`model....`). Expert streaming must resolve both spellings or it treats
-the entire MoE mass as resident backbone.
+Multimodal checkpoints keep text weights under a wrapper prefix while
+sanitize() strips it into the module tree (`model.*`): qwen4_exp / Flash use
+`language_model.model.*`, GLM-5.3-Flash uses `model.language_model.*`.
+Expert streaming must resolve every spelling or it treats the entire MoE mass
+as resident backbone.
 """
 
 from __future__ import annotations
@@ -18,6 +19,8 @@ def tensor_key_candidates(path: str) -> list[str]:
     keys = [path]
     if not path.startswith("language_model."):
         keys.append(f"language_model.{path}")
+    if path.startswith("model.") and not path.startswith("model.language_model."):
+        keys.append(f"model.language_model.{path[len('model.'):]}")
     return keys
 
 

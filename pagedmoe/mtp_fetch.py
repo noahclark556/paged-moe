@@ -38,7 +38,7 @@ HEAD_VERSION = 3
 
 # model_type -> how the checkpoint names its MTP tensors.
 #   "mtp":   a separate `mtp.*` block (Qwen3-Next, Qwen3.5, Qwen4-exp)
-#   "nextn": extra decoder layers past num_hidden_layers (DeepSeek-V3, GLM-4.x)
+#   "nextn": extra decoder layers past num_hidden_layers (DeepSeek-V3, GLM-4.x, GLM-5.3)
 SCHEMES = {
     "qwen4_exp": "mtp",
     "qwen3_next": "mtp",
@@ -47,6 +47,7 @@ SCHEMES = {
     "deepseek_v3": "nextn",
     "kimi_k2": "nextn",
     "glm4_moe": "nextn",
+    "glm5_next": "nextn",
 }
 
 HF = os.environ.get("HF_ENDPOINT", "https://huggingface.co").rstrip("/")

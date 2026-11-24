@@ -13,6 +13,9 @@ that adds the architecture takes over without any change here.
 
 A checkpoint that is a known architecture but omitted the module file gets
 that file written beside the weights. Anything already present is not replaced.
+
+Package ports (arches/<model_type>/) are registered from the bundled package
+directly and are not copied into the checkpoint.
 """
 
 from __future__ import annotations
@@ -58,16 +61,52 @@ def _qwen4_exp_config(cfg: dict) -> bool:
     return True
 
 
-# model_type -> predicate. The module text lives in arches/<model_type>.py.
-# Only types mlx-lm does not ship belong here. qwen3_next and qwen3_5_moe
-# already load from mlx-lm, so a missing sidecar is not a problem for them.
+def _glm5_next_config(cfg: dict) -> bool:
+    """True for GLM-5.3-Flash / glm5_next hybrid MoE (text_config or flat)."""
+    if cfg.get("model_type") != "glm5_next":
+        return False
+    text = cfg.get("text_config") if isinstance(cfg.get("text_config"), dict) else cfg
+    if not isinstance(text, dict):
+        return False
+    for key in (
+        "hidden_size",
+        "num_hidden_layers",
+        "n_routed_experts",
+        "num_experts_per_tok",
+        "hc_mult",
+        "index_n_heads",
+        "index_topk",
+    ):
+        if not _positive_int(text.get(key)):
+            return False
+    layers = text.get("layer_types")
+    if not isinstance(layers, list) or not layers:
+        return False
+    kinds = set(layers)
+    # sparse layers are named deepseek_sparse_attention in the HF config
+    if "linear_attention" not in kinds:
+        return False
+    if not (kinds <= {"linear_attention", "deepseek_sparse_attention", "full_attention"}):
+        return False
+    mlp = text.get("mlp_layer_types")
+    if not isinstance(mlp, list) or not mlp:
+        return False
+    return True
+
+
+# model_type -> predicate. Single-file ports live in arches/<model_type>.py;
+# package ports live in arches/<model_type>/ with an __init__.py that exports
+# Model and ModelArgs. Only types mlx-lm does not ship belong here.
 _PORTS = {
     "qwen4_exp": _qwen4_exp_config,
+    "glm5_next": _glm5_next_config,
 }
+
+_ARCHES = Path(__file__).resolve().parent / "arches"
 
 
 def _port_text(model_type: str) -> str | None:
-    path = Path(__file__).resolve().parent / "arches" / f"{model_type}.py"
+    path = _ARCHES / f"{model_type}.py"
     try:
         text = path.read_text(encoding="utf-8")
     except OSError:
@@ -77,6 +116,13 @@ def _port_text(model_type: str) -> str | None:
     if not text.endswith("\n"):
         text += "\n"
     return text
+
+
+def _port_package(model_type: str) -> Path | None:
+    path = _ARCHES / model_type
+    if path.is_dir() and (path / "__init__.py").is_file():
+        return path
+    return None
 
 
 def _mlx_provides(module_name: str) -> bool:
@@ -100,12 +146,50 @@ def _mlx_provides(module_name: str) -> bool:
     return True
 
 
+def _register_package(name: str, pkg: Path) -> str:
+    """Load arches/<type>/ as mlx_lm.models.<type> (with its submodules)."""
+    init = pkg / "__init__.py"
+    spec = importlib.util.spec_from_file_location(
+        name, init, submodule_search_locations=[str(pkg)]
+    )
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load architecture package {pkg}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(name, None)
+        # drop any submodules that got half-registered
+        prefix = name + "."
+        for key in [k for k in sys.modules if k == name or k.startswith(prefix)]:
+            sys.modules.pop(key, None)
+        raise
+    if not hasattr(module, "Model") or not hasattr(module, "ModelArgs"):
+        sys.modules.pop(name, None)
+        raise ImportError(f"{pkg} must export Model and ModelArgs")
+    return str(pkg)
+
+
+def _register_file(name: str, src: Path) -> str:
+    spec = importlib.util.spec_from_file_location(name, src)
+    if spec is None or spec.loader is None:
+        raise ImportError(f"cannot load architecture file {src}")
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[name] = module
+    try:
+        spec.loader.exec_module(module)
+    except Exception:
+        sys.modules.pop(name, None)
+        raise
+    return str(src)
+
+
 def ensure(model_path) -> str | None:
     """Write a known architecture file when this checkpoint is missing one.
 
-    Returns the path written. Returns None when the folder is left untouched,
-    including when the file is already there or the config is not a known port.
-    A failed write is ignored so load fails the way it did before.
+    Package ports are not copied into the checkpoint; register() loads them
+    from the bundled package. Returns the path written, or None.
     """
     p = Path(model_path)
     try:
@@ -121,6 +205,9 @@ def ensure(model_path) -> str | None:
     if not match(cfg):
         return None
     if _mlx_provides(f"mlx_lm.models.{mt}"):
+        return None
+    # packages stay bundled; nothing to write next to the weights
+    if _port_package(mt) is not None:
         return None
     try:
         dest_dir = p.resolve()
@@ -163,9 +250,10 @@ def ensure(model_path) -> str | None:
 
 
 def register(model_path) -> str | None:
-    """Register `<model_path>/<model_type>.py` if mlx-lm lacks the type.
+    """Register a local or bundled architecture if mlx-lm lacks the type.
 
-    Returns the registered file, or None when nothing was needed.
+    Order: mlx-lm's own module, then `<model_path>/<type>.py` (after ensure),
+    then a bundled package under arches/<type>/.
     """
     p = Path(model_path)
     try:
@@ -185,27 +273,31 @@ def register(model_path) -> str | None:
     name = f"mlx_lm.models.{mt}"
     if _mlx_provides(name):
         return None
-    src = p / f"{mt}.py"
-    if not src.is_file():
-        ensure(p)
-    if not src.is_file():
-        return None
     if name in sys.modules:
         return None
 
-    spec = importlib.util.spec_from_file_location(name, src)
-    if spec is None or spec.loader is None:
+    src = p / f"{mt}.py"
+    if not src.is_file():
+        ensure(p)
+    if src.is_file():
+        path = _register_file(name, src)
+        print(
+            f"[paged-moe] model type {mt} is not in this mlx-lm, "
+            f"using {src.name} from the checkpoint",
+            flush=True,
+        )
+        return path
+
+    match = _PORTS.get(mt)
+    pkg = _port_package(mt)
+    if match is None or pkg is None:
         return None
-    module = importlib.util.module_from_spec(spec)
-    sys.modules[name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception:
-        sys.modules.pop(name, None)
-        raise
+    if not match(cfg):
+        return None
+    path = _register_package(name, pkg)
     print(
         f"[paged-moe] model type {mt} is not in this mlx-lm, "
-        f"using {src.name} from the checkpoint",
+        f"using bundled arches/{mt}/",
         flush=True,
     )
-    return str(src)
+    return path

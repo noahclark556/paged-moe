@@ -132,6 +132,21 @@ class _Parts:
         self.hidden = int(args.hidden_size)
         self.eps = float(getattr(args, "rms_norm_eps", 1e-6))
         self.hc = int(getattr(args, "hc_count", 0) or 0)
+        self.quant = _quant_lookup(model)
+        self.default_quant = _default_quant(cfg)
+
+        # An arch whose MTP block matches no backbone layer (glm5_next: no
+        # mHC on it) builds the block and its cache itself.
+        self.custom = model if callable(getattr(model, "mtp_layer", None)) else None
+        if self.custom is not None:
+            self.proxy = int(model.mtp_proxy)
+            self.dense = False
+            self.layer_cls = None
+            self.cache_cls = model.mtp_cache
+            final = getattr(inner, "norm", None)
+            self.norm_cls = type(final) if final is not None else nn.RMSNorm
+            self.mixer_cls = None
+            return
 
         # A full-attention MoE layer to clone. Picked before patch_model swaps
         # the expert blocks, so its class and quantization are the stock ones.
@@ -176,8 +191,6 @@ class _Parts:
             self.cache_cls = cls
         except Exception:
             pass
-        self.quant = _quant_lookup(model)
-        self.default_quant = _default_quant(cfg)
         # Classes come off live instances: a checkpoint's own model file is
         # not always importable by name.
         if self.hc:
@@ -238,12 +251,15 @@ def _build(parts: _Parts, experts: int | None = None) -> _Head:
     args = parts.args
     # A pruned backbone has fewer routed experts than the head, which was
     # never pruned. The head layer is built at its own count.
-    names = [a for a in _EXPERT_ARGS if isinstance(getattr(args, a, None), int)]
-    if experts and names and getattr(args, names[0]) != experts:
-        args = copy.copy(args)
-        for a in names:
-            setattr(args, a, experts)
-    layer = parts.layer_cls(args, parts.proxy)
+    if parts.custom is not None:
+        layer = parts.custom.mtp_layer(experts)
+    else:
+        names = [a for a in _EXPERT_ARGS if isinstance(getattr(args, a, None), int)]
+        if experts and names and getattr(args, names[0]) != experts:
+            args = copy.copy(args)
+            for a in names:
+                setattr(args, a, experts)
+        layer = parts.layer_cls(args, parts.proxy)
     head.layers = [layer]
     if parts.scheme == "mtp" and parts.hc:
         mixer_cls = parts.mixer_cls
@@ -481,6 +497,38 @@ class Prepared:
         self.parts = parts
         self.nbytes = nbytes
         self.source = source
+
+
+def estimate_bytes(model_path) -> int:
+    """What prepare() would hold, read from disk without building anything.
+
+    0 when it can't be known up front (float heads get quantized on build),
+    and the caller then builds the head and checks its real size.
+    """
+    model_path = Path(model_path)
+    try:
+        st = mtp_fetch.local_status(model_path)
+        if st.get("state") == "ready":
+            return int(st.get("bytes") or 0)
+        if st.get("state") != "bundled":
+            return 0
+        cfg = mtp_fetch._read_json(model_path / "config.json") or {}
+        n, depth = mtp_fetch.num_layers(cfg), mtp_fetch.declared_layers(cfg) or 1
+        idx = mtp_fetch._read_json(model_path / "model.safetensors.index.json") or {}
+        wmap = idx.get("weight_map") or {n_: "model.safetensors" for n_ in mtp_fetch.local_names(model_path)}
+        names = [k for k in wmap if mtp_fetch.is_mtp_name(k, st["scheme"], n, depth)]
+        if not any(k.endswith(".scales") for k in names):
+            return 0
+        total = 0
+        for f in sorted({wmap[k] for k in names}):
+            hdr = mtp_fetch._local_header(model_path / f)
+            for k in names:
+                if wmap[k] == f and k in hdr:
+                    a, b = hdr[k]["data_offsets"]
+                    total += b - a
+        return total
+    except (OSError, ValueError, KeyError, TypeError):
+        return 0
 
 
 def prepare(model, cfg: dict, model_path) -> Prepared | None:

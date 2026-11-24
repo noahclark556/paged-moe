@@ -365,9 +365,14 @@ def main(argv: list[str] | None = None) -> int:
             "[status|install|uninstall|ensure-config|which <model-path>|"
             "detect <model-path> [--speed S]|serve <model-path> [--speed S] [server flags]|"
             "bench <model-path> [--speed S|--exact] [--quick]|"
-            "machine|ladder] [--models-dir PATH]"
+            "machine|ladder|convert plan|run|check|presets|upload ...] [--models-dir PATH]"
         )
         return 0
+
+    if cmd == "convert":
+        from .convert.cli import main as convert_main
+
+        return convert_main(argv[1:])
 
     if cmd == "bench":
         from .benchmark import main as bench_main

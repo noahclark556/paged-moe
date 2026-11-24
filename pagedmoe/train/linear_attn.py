@@ -1,6 +1,7 @@
 # Copyright (C) 2026 Noah Clark
 # SPDX-License-Identifier: AGPL-3.0-or-later
-"""Chunked gated delta rule for training the qwen3_next / qwen3_5 hybrids.
+"""Chunked gated delta rule for training the qwen3_next / qwen3_5 hybrids,
+and the per-channel (Kimi delta) form for glm5_next.
 
 mlx-lm's Metal kernel for gated delta has no gradient, so in train mode it
 falls back to gated_delta_ops: a Python loop with one small step per token.
@@ -146,6 +147,100 @@ def chunked(q, k, v, log_g, beta, chunk: int = CHUNK):
     return y, S.swapaxes(-1, -2)
 
 
+# Kimi delta attention decays each key channel separately, so the in-chunk
+# decay is exp(G_i - G_j) per channel and cannot be pulled out as a scalar.
+# It is factored as (k * e^G) @ (k * e^-G)^T instead, which needs e^-G to stay
+# finite in fp32: with the gate's lower bound b, a chunk of C steps reaches
+# e^(C * |b|). 16 steps at b = -5 is e^80, well inside fp32.
+KDA_CHUNK = 16
+_KDA_MAX_LOG = 80.0
+
+
+def chunked_kda(q, k, v, log_g, beta, chunk: int = KDA_CHUNK):
+    """Gated delta rule with a per-channel decay, whole sequence, zero state.
+
+    q, k     [B, T, H, Dk]   (already normalized and scaled)
+    v        [B, T, H, Dv]
+    log_g    [B, T, H, Dk]   log of the per-step, per-channel decay
+    beta     [B, T, H]
+    returns  y [B, T, H, Dv] in q's dtype, final state [B, H, Dv, Dk] f32
+    """
+    out_dtype = q.dtype
+    B, T, H, Dk = q.shape
+    Dv = v.shape[-1]
+    f32 = mx.float32
+    q, k, v, log_g = (t.astype(f32).transpose(0, 2, 1, 3) for t in (q, k, v, log_g))
+    beta = beta.astype(f32).transpose(0, 2, 1)
+
+    C = int(chunk)
+    pad = (C - T % C) % C
+    if pad:
+        q, k, v, log_g = (
+            mx.pad(t, [(0, 0), (0, 0), (0, pad), (0, 0)]) for t in (q, k, v, log_g)
+        )
+        beta = mx.pad(beta, [(0, 0), (0, 0), (0, pad)])
+    N = (T + pad) // C
+
+    q, k, v = (t.reshape(B, H, N, C, -1) for t in (q, k, v))
+    beta = beta.reshape(B, H, N, C)
+    gc = mx.cumsum(log_g.reshape(B, H, N, C, Dk), axis=-2)  # [B, H, N, C, Dk]
+    eg = mx.exp(gc)
+    # Pair the in-chunk factors around the chunk midpoint: e^(G_i - m) and
+    # e^(m - G_j) span half the range of e^G and e^-G, which keeps the GPU's
+    # reduced-precision fp32 matmuls accurate.
+    mid = mx.stop_gradient(gc[..., C // 2 - 1 : C // 2, :]) if C > 1 else 0.0
+    eg_c = mx.exp(gc - mid)
+    k_in = k * mx.exp(mid - gc)
+
+    k_beta = k * beta[..., None]
+    v_beta = v * beta[..., None]
+
+    lower = mx.tril(mx.ones((C, C), dtype=mx.bool_), k=-1)
+    causal = mx.tril(mx.ones((C, C), dtype=mx.bool_), k=0)
+
+    A = mx.where(lower, -((k_beta * eg_c) @ k_in.swapaxes(-1, -2)), 0.0)
+    W = _inv_grad(A)
+    u = W @ v_beta  # [B, H, N, C, Dv]
+    w = W @ (k_beta * eg)  # [B, H, N, C, Dk]
+
+    qe = q * eg
+    qk = mx.where(causal, (q * eg_c) @ k_in.swapaxes(-1, -2), 0.0)
+    g_last = gc[..., -1:, :]  # [B, H, N, 1, Dk]
+    k_tail = k * mx.exp(g_last - gc)  # decay to chunk end
+
+    S = mx.zeros((B, H, Dk, Dv), dtype=f32)
+    ys = []
+    for n in range(N):
+        v_new = u[:, :, n] - w[:, :, n] @ S
+        ys.append(qe[:, :, n] @ S + qk[:, :, n] @ v_new)
+        S = S * mx.exp(g_last[:, :, n, 0])[..., None] + k_tail[:, :, n].swapaxes(-1, -2) @ v_new
+
+    y = mx.stack(ys, axis=2).reshape(B, H, N * C, Dv)[:, :, :T]
+    return y.transpose(0, 2, 1, 3).astype(out_dtype), S.swapaxes(-1, -2)
+
+
+_kda_orig: dict[int, object] = {}
+
+
+def _kda_update_for(orig):
+    def update(q, k, v, a, b, A_log, dt_bias, state=None, mask=None, use_kernel=True,
+               lower_bound=None):
+        # Unbounded gates (no safe lower bound) could overflow e^-G; keep those
+        # on the model's own path, as are cached and masked calls.
+        if mask is not None or state is not None or lower_bound is None:
+            return orig(q, k, v, a, b, A_log, dt_bias, state, mask, use_kernel, lower_bound)
+        if abs(float(lower_bound)) * KDA_CHUNK > _KDA_MAX_LOG:
+            return orig(q, k, v, a, b, A_log, dt_bias, state, mask, use_kernel, lower_bound)
+        beta = mx.sigmoid(b)
+        log_g = lower_bound * mx.sigmoid(
+            mx.exp(A_log.astype(mx.float32)) * (a.astype(mx.float32) + dt_bias.astype(mx.float32))
+        )
+        return chunked_kda(q, k, v, log_g, beta)
+
+    update.kda_chunked = True
+    return update
+
+
 def _update(q, k, v, a, b, A_log, dt_bias, state=None, mask=None, use_kernel=True):
     if mask is not None or state is not None:
         return _original(q, k, v, a, b, A_log, dt_bias, state, mask, use_kernel)
@@ -169,9 +264,20 @@ def model_scopes(model) -> list[dict]:
 
 
 def _patch(ns: dict) -> None:
-    if ns.get("gated_delta_update") is _original and all(ns is not p for p in _patched):
+    if any(ns is p for p in _patched):
+        return
+    fn = ns.get("gated_delta_update")
+    if fn is _original:
         ns["gated_delta_update"] = _update
         _patched.append(ns)
+    elif getattr(fn, "kda", False):
+        _kda_orig[id(ns)] = fn
+        ns["gated_delta_update"] = _kda_update_for(fn)
+        _patched.append(ns)
+
+
+def _is_chunked(fn) -> bool:
+    return fn is _update or getattr(fn, "kda_chunked", False)
 
 
 def install(model=None) -> bool:
@@ -204,14 +310,17 @@ def install(model=None) -> bool:
 
 def unpatched(model) -> int:
     """How many of the model's gated delta namespaces still use the loop."""
-    return sum(1 for ns in model_scopes(model) if ns.get("gated_delta_update") is not _update)
+    return sum(1 for ns in model_scopes(model) if not _is_chunked(ns.get("gated_delta_update")))
 
 
 def uninstall() -> bool:
-    """Restore mlx-lm's function. True if it was installed."""
+    """Restore the original functions. True if it was installed."""
     was = bool(_patched)
     for ns in _patched:
-        if ns.get("gated_delta_update") is _update:
+        fn = ns.get("gated_delta_update")
+        if fn is _update:
             ns["gated_delta_update"] = _original
+        elif getattr(fn, "kda_chunked", False) and id(ns) in _kda_orig:
+            ns["gated_delta_update"] = _kda_orig.pop(id(ns))
     _patched.clear()
     return was

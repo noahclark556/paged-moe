@@ -53,6 +53,7 @@ _DSA_MODEL_TYPES = frozenset(
         "deepseek_v32",
         "glm4_moe_lite",  # shares deepseek DSA attention in mlx-lm
         "glm_moe_dsa",
+        "glm5_next",  # hybrid linear + sparse MLA with lightning indexer
     }
 )
 

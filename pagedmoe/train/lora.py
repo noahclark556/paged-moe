@@ -67,6 +67,12 @@ def _is_router(name: str) -> bool:
     return last in _ROUTER_NAMES or "router" in last
 
 
+def _is_selector(name: str) -> bool:
+    # DSA lightning indexers only feed a top-k pick, which has no gradient,
+    # so a LoRA there would never train.
+    return ".indexer." in f".{name}."
+
+
 def discover_keys(layers, target: str, streamed: bool) -> list[str]:
     from mlx_lm.models.switch_layers import QuantizedSwitchLinear, SwitchLinear
 
@@ -75,7 +81,7 @@ def discover_keys(layers, target: str, streamed: bool) -> list[str]:
     keys: set[str] = set()
     for layer in layers:
         for name, m in layer.named_modules():
-            if not name or _is_router(name):
+            if not name or _is_router(name) or _is_selector(name):
                 continue
             if isinstance(m, switch):
                 if target == "experts" and not streamed:

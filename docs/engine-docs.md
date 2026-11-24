@@ -238,6 +238,7 @@ paged-moe [status|install|uninstall|ensure-config|
            which <model>|detect <model> [--speed S]|
            serve <model> [--speed S] [server flags]|
            bench <model> [--speed S|--exact] [--quick]|
+           convert plan|run|check|upload|presets ...|
            machine|ladder] [--models-dir PATH]
 ```
 
@@ -251,8 +252,38 @@ paged-moe [status|install|uninstall|ensure-config|
 | `paged-moe detect <path> [--speed S]` | checkpoint summary and what `--speed` would set, no load |
 | `paged-moe serve <path> ...` | server with launch_env applied |
 | `paged-moe bench <path> ...` | agent-task bench on this Mac |
+| `paged-moe convert ...` | Hugging Face to MLX with a per-part recipe (below) |
 | `paged-moe machine ...` | show / detect / probe / catalog / apply |
 | `paged-moe ladder` | per-Mac fit table (`--profile`, `--json`) |
+
+### convert
+
+```bash
+paged-moe convert presets
+paged-moe convert plan <repo|folder> [--preset P] [--compare] [--out DIR] [--json]
+paged-moe convert run <repo|folder> <out> [recipe flags] [--adapter RUN] [--upload REPO]
+paged-moe convert check <converted> <reference> [--tokens N] [--prompts FILE]
+paged-moe convert upload <converted> <repo> [--public]
+```
+
+Recipe flags: `--preset`, `--recipe FILE` (a JSON recipe or an earlier
+`pagedmoe_conversion.json`), one flag per part (`--experts`,
+`--experts-down`, `--shared-experts`, `--attention`, `--dense-mlp`,
+`--router`, `--embed`, `--lm-head`, `--other`), `--mode`, `--group-size`,
+`--dtype`, `--edge-layers N --edge-bits B [--edge-experts]`,
+`--rule 'REGEX=S'` (repeatable, first match wins) and `--target
+auto|resident|streamed` for the `fit` preset. A part setting is bits (`4`),
+bits and group (`6/32`), `mxfp4`, `mxfp8`, `nvfp4`, `keep` (float) or
+`model` (the architecture's own choice, routers default to it).
+
+Run flags: `--revision`, `--no-stream` (download the whole source first),
+`--shard-gb`, `--keep-source`, `--overwrite`, `--no-resume`, `--no-measure`
+(skip the per-part error numbers), `--ignore-disk`. Ctrl-C stops after the
+current layer, a second one quits. Run the same command again to resume.
+
+Hub downloads stage in `<out>/.source` and get deleted once nothing still
+needs them. Repo metadata (config, tokenizer, headers) is kept under
+`~/.paged_moe/convert` (`PAGED_MOE_CONVERT_DIR` to move it).
 
 Related binaries:
 
@@ -442,6 +473,7 @@ prefill keeps attention Metal-safe without re-reading the expert mass.
 | `PAGED_MOE_VERIFY_FIDELITY` | `plain` | `exact` = every accepted token is the exact model's pick |
 | `PAGED_MOE_SELF_DRAFT` | `auto` | self-draft when prune is 0 |
 | `PAGED_MOE_MTP` | `1` | use a checkpoint MTP head as a drafter when present |
+| `PAGED_MOE_MTP_MAX_FRAC` | `0.12` | most of the expert cache the head can take; an arch can raise it (GLM-5.3: 0.4), setting this wins |
 | `PAGED_MOE_STITCH` | `1` | when every routed expert fits in RAM, hold them all and run each token as one graph (exact relative to the speed setting) |
 | `PAGED_MOE_EARLY_DECODE` | `0` | prefetch experts common right after prefill |
 | `PAGED_MOE_TOOL_WARM` | `1` | prefetch experts seen in tool-call bodies |

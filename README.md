@@ -215,6 +215,14 @@ goes:
   instead of one token at a time, which used to be ~95% of the step.
 - Streamed gradients match the fully loaded path. The tests check it.
 
+**Converting.** `paged-moe convert` turns a Hugging Face checkpoint into MLX
+with the precision you pick per part. Paged Trainer has the same thing as
+its Convert tab. See [Converting models](#converting-models).
+
+**GLM-5.3.** GLM-5.3-Flash runs and trains. Its MTP layer drafts for verify
+decode, 0.54 to 0.93 tok/s on a 48 GB Mac with the same tokens. Needs an
+MLX build, GGUF won't load.
+
 ---
 
 ## What's new in 0.3
@@ -575,6 +583,51 @@ it fits is [docs/why-it-trains.md](./docs/why-it-trains.md).
 
 ---
 
+## Converting models
+
+New models usually hit Hugging Face before there's an MLX build.
+`paged-moe convert` takes the original safetensors and writes an MLX
+checkpoint with the precision you pick per part of the model. If you'd
+rather not use the terminal, [Paged Trainer](https://pagedmoe.com/train)
+has it as the Convert tab: pick a model and a preset and it shows the size
+and fit before you start.
+
+On an MoE almost all the bytes are experts, so expert bits set the size and
+the backbone gets extra bits nearly for free. The default, `balanced`, is
+4-bit experts with a 6-bit backbone, about the size of a plain 4-bit build.
+
+```bash
+# sizes, fit on this Mac and disk needed, from the headers only. Nothing downloads.
+paged-moe convert plan Qwen/Qwen3-30B-A3B --compare
+
+# convert
+paged-moe convert run Qwen/Qwen3-30B-A3B ~/mlx-models/qwen3-30b-balanced
+
+# your own mix: 3-bit expert gate/up, 5-bit down, 8-bit first and last 2 layers
+paged-moe convert run Qwen/Qwen3-30B-A3B ~/mlx-models/qwen3-30b-mix \
+  --experts 3 --experts-down 5 --edge-layers 2 --rule 'lm_head=8'
+
+# how close it is to a reference: top-1 agreement, KL, perplexity
+paged-moe convert check ~/mlx-models/qwen3-30b-mix ~/mlx-models/Qwen3-30B-A3B-8bit
+```
+
+- Presets: `balanced`, `standard` (4-bit everywhere), `quality`, `max`,
+  `compact` (3-bit experts), `float`, and `fit` (best one that fits this Mac).
+- Per part settings (experts, attention, embeddings, ...): bits, group size,
+  `mxfp4` / `mxfp8` / `nvfp4`, or float, plus regex rules on top.
+- Hub sources download a few layers at a time, so a 400 GB model doesn't
+  need 400 GB free. Run the same command again to resume.
+- `--adapter <run>` merges a trained adapter first. Already-quantized
+  sources get requantized with your recipe.
+- Every output is load-checked in mlx-lm before it's done. `--upload me/repo`
+  pushes it.
+
+The output is a normal mlx-lm checkpoint. A `standard` conversion is
+bit-identical to `mlx_lm.convert -q`, the tests check it. From Python it's
+`pagedmoe.convert.make_plan` and `pagedmoe.convert.convert`.
+
+---
+
 ## How it works
 
 mlx-lm sends all MoE expert compute through one module, `SwitchGLU`. PagedMoE
@@ -783,6 +836,7 @@ them:
 | Qwen3-Next, Qwen3.8-Flash-Next | Hybrid attention, branching and replay handled |
 | GLM-4.5 / 4.6 / 4.7 | GLM-4.5-Air is a great fit for 48 GB |
 | GLM-5.2, DeepSeek-V3.2 | DSA sparse attention, sparse prefill path |
+| GLM-5.3-Flash (`glm5_next`) | Runs and trains, text only. MLX builds only (e.g. `mlx-community/GLM-5.3-Flash-4bit`, or convert the original), GGUF won't load. MTP drafting on by default |
 | DeepSeek-V2 / V3, Kimi-K2 | MLA. Kimi needs `tiktoken` (installed by default) |
 | MiniMax-M2 / M3 | Sigmoid routers, XML tool calls, `<mm:think>` tags |
 | Mixtral, OLMoE, others | If it's SwitchGLU it should stream |
@@ -815,6 +869,7 @@ worth touching). The ones worth knowing:
 | `PAGED_MOE_VERIFY_FIDELITY` | `plain` | `exact` = every token is the exact model's pick |
 | `PAGED_MOE_SELF_DRAFT` | `auto` | self-drafting, only when prune is 0 |
 | `PAGED_MOE_MTP` | `1` | MTP head as a drafter when the checkpoint has one |
+| `PAGED_MOE_MTP_MAX_FRAC` | `0.12` | most of the expert cache the head can take (GLM-5.3 uses 0.4 unless this is set) |
 | `PAGED_MOE_FUSED_PREFILL` | `1` | attention sub-chunks, one MoE pass per chunk |
 | `PAGED_MOE_PREFILL_CHUNK` | `32768` | max tokens per prefill pass |
 | `PAGED_MOE_PREFILL_AHEAD` | `1` | start the next layer's prefill reads early |
@@ -880,6 +935,7 @@ them). More in [docs/tinymodel-improvements.md](./docs/tinymodel-improvements.md
 | `paged-moe serve <model> [--speed S]` | server from just a model path |
 | `paged-moe detect <model> [--speed S]` | what it reads off a checkpoint and what `--speed` would set |
 | `paged-moe bench <model> [--speed S\|--exact] [--quick]` | agent-task bench on this Mac, speed and exact |
+| `paged-moe convert plan\|run\|check\|upload\|presets` | Hugging Face to MLX with a per-part recipe |
 | `paged-moe-server ...` | OpenAI-compatible server |
 | `paged-moe-pretrain ...` | sidecar warm-start / fit / unlock |
 | `paged-moe-train <method> ...` | fine-tune (`sft`, `dpo`, `grpo`, ...), also `plan`, `resume`, `chat`, `eval` |

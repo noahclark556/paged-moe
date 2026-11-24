@@ -88,6 +88,20 @@ def _is_hyper_moe_layer(layer: Any) -> bool:
     )
 
 
+def _is_mhc_block_layer(layer: Any) -> bool:
+    """glm5_next: mHC residual streams, split into _attn_block / _ffn_block.
+
+    Has the standard pre-norm attribute names too, so this must be checked
+    first: the plain fused path would skip the hyper-connections.
+    """
+    return (
+        callable(getattr(layer, "_attn_block", None))
+        and callable(getattr(layer, "_ffn_block", None))
+        and hasattr(layer, "attn_hc")
+        and hasattr(layer, "ffn_hc")
+    )
+
+
 def _ffn(layer: Any):
     """The layer's feed-forward block, or None.
 
@@ -118,7 +132,11 @@ def layer_is_fusable(layer: Any) -> bool:
     and full-attention instances; the fused wrapper falls back to stock on
     linear layers (no score-matrix bound) and only splits full-attention.
     """
-    return _is_hyper_moe_layer(layer) or _is_standard_pre_norm(layer)
+    return (
+        _is_mhc_block_layer(layer)
+        or _is_hyper_moe_layer(layer)
+        or _is_standard_pre_norm(layer)
+    )
 
 
 def _is_linear_attn_layer(layer: Any) -> bool:
@@ -308,6 +326,42 @@ def _fused_hyper_layer_call(orig):
     return __call__
 
 
+def _fused_mhc_layer_call(orig):
+    """glm5_next DecoderLayer: x is [B, L, hc, D] mHC streams.
+
+    The attention half (collapse, norm, attention, expand) is per token apart
+    from attention itself, so running it on row slices against the growing
+    cache gives the same rows as one call. The FFN half then runs once.
+    """
+
+    def __call__(self, x, mask=None, cache=None, **kw):
+        if kw or x.ndim != 4 or x.shape[1] <= _MIN_SPLIT_TOKENS:
+            return orig(self, x, mask, cache, **kw)
+        if _is_linear_attn_layer(self):
+            return orig(self, x, mask, cache)
+
+        total = int(x.shape[1])
+        offset = _cache_offset(cache)
+        plan = attention_plan(self, total, offset)
+        if len(plan) <= 1:
+            return orig(self, x, mask, cache)
+
+        parts = []
+        for start, end in plan:
+            m = _slice_mask(mask, start, end, offset + end)
+            h = self._attn_block(x[:, start:end], m, cache)
+            state = _cache_state(cache)
+            mx.eval(h) if state is None else mx.eval(h, state)
+            stage_gentle.wait_for_pause()
+            parts.append(h)
+        h = mx.concatenate(parts, axis=1) if len(parts) > 1 else parts[0]
+        del parts
+        return self._ffn_block(h)
+
+    __call__.__wrapped__ = orig
+    return __call__
+
+
 # ----------------------------------------------------------------- install
 
 
@@ -349,6 +403,7 @@ def install(model: Any) -> bool:
     total = 0
     first = None
     hyper = False
+    mhc = False
     for layer in layers:
         if layer is None:
             continue
@@ -357,12 +412,17 @@ def install(model: Any) -> bool:
         if cls in _installed:
             patched += 1
             first = first or layer
-            if _is_hyper_moe_layer(layer):
+            if _is_mhc_block_layer(layer):
+                mhc = True
+            elif _is_hyper_moe_layer(layer):
                 hyper = True
             continue
         if not layer_is_fusable(layer):
             continue
-        if _is_hyper_moe_layer(layer):
+        if _is_mhc_block_layer(layer):
+            cls.__call__ = _fused_mhc_layer_call(cls.__call__)
+            mhc = True
+        elif _is_hyper_moe_layer(layer):
             cls.__call__ = _fused_hyper_layer_call(cls.__call__)
             hyper = True
         else:
@@ -390,7 +450,7 @@ def install(model: Any) -> bool:
             probe = layer
             break
     sub = adaptive_prefill.attention_sub_chunk(probe, 0)
-    kind = "qwen4_exp hyper-MoE" if hyper else "pre-norm"
+    kind = "mHC" if mhc else "qwen4_exp hyper-MoE" if hyper else "pre-norm"
     print(
         f"[paged-moe] fused prefill ON ({patched}/{total} layers, {kind}): "
         f"attention sub-chunks (<= {sub} tokens at cold KV), experts streamed "

@@ -20,6 +20,7 @@ shard cost ~9 ms of every decode token and most of a long prefill.
 from __future__ import annotations
 
 import os
+import re
 import threading
 from collections import OrderedDict
 from concurrent.futures import ThreadPoolExecutor
@@ -48,7 +49,34 @@ def ngram_shard_tensor_names(tensor_index: dict[str, TensorLoc]) -> set[str]:
     return {n for n in tensor_index if _NGRAM_SHARD_MARK in n}
 
 
-def skipped_resident_tensor_names(tensor_index: dict[str, TensorLoc]) -> set[str]:
+# Families whose sanitize drops an MTP block stored as extra decoder layers
+# (index >= num_hidden_layers). Others either strip it at convert time or load
+# it for speculative decode, so their trailing layers stay counted.
+_TRAILING_MTP_LAYERS = frozenset({"glm5_next"})
+_LAYER_NUM = re.compile(r"(?:^|\.)layers\.(\d+)\.")
+
+
+def _trailing_layer_names(tensor_index: dict[str, TensorLoc], model_config) -> set[str]:
+    if not isinstance(model_config, dict):
+        return set()
+    if model_config.get("model_type") not in _TRAILING_MTP_LAYERS:
+        return set()
+    text = model_config.get("text_config")
+    text = text if isinstance(text, dict) else model_config
+    n = int(text.get("num_hidden_layers") or 0)
+    if n <= 0:
+        return set()
+    out = set()
+    for name in tensor_index:
+        m = _LAYER_NUM.search(name)
+        if m and int(m.group(1)) >= n and "visual." not in name:
+            out.add(name)
+    return out
+
+
+def skipped_resident_tensor_names(
+    tensor_index: dict[str, TensorLoc], model_config: dict | None = None
+) -> set[str]:
     """Tensors counted out of the resident backbone budget.
 
     Vision / MTP are dropped by sanitize for text runtime; n-gram shards are
@@ -63,6 +91,7 @@ def skipped_resident_tensor_names(tensor_index: dict[str, TensorLoc]) -> set[str
         )
         if bare.startswith(_SKIP_PREFIXES) or name.startswith(_SKIP_PREFIXES):
             out.add(name)
+    out |= _trailing_layer_names(tensor_index, model_config)
     return out
 
 

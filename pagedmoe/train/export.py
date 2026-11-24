@@ -34,6 +34,17 @@ from pathlib import Path
 
 _LAYER = re.compile(r"^(.*?)(layers\.\d+\..+)$")
 
+# Modules transformers moves at load time, so the checkpoint's tensor name
+# and the module PEFT targets differ: (runtime piece, on-disk piece).
+# GLM-5.3-Flash keeps the KDA forget gate under self_attn.forget_gate.
+_LOAD_RENAMES = ((".self_attn.forget_gate.", ".self_attn."),)
+
+
+def _on_disk(rest: str) -> str:
+    for runtime, disk in _LOAD_RENAMES:
+        rest = rest.replace(runtime, disk)
+    return rest
+
 
 class ExportError(ValueError):
     pass
@@ -188,7 +199,7 @@ def map_names(mods: dict, ref: dict[str, tuple], check_shapes: bool) -> dict[str
         if not m:
             raise ExportError(f"{path} is not inside a decoder layer; nothing to map it to")
         rests[path] = m.group(2)
-        votes.update(by_rest.get(m.group(2), ()))
+        votes.update(by_rest.get(m.group(2), ()) or by_rest.get(_on_disk(m.group(2)), ()))
     if not votes:
         sample = next(iter(rests.values()), "?")
         raise ExportError(f"none of the adapted layers exist in the base model (first: {sample}). "
@@ -197,13 +208,14 @@ def map_names(mods: dict, ref: dict[str, tuple], check_shapes: bool) -> dict[str
     prefix = max(votes, key=lambda p: (votes[p], "mtp" not in p, "model" in p))
     out, missing, shape_bad = {}, [], []
     for path, rest in rests.items():
-        if prefix not in by_rest.get(rest, ()):
+        disk = rest if prefix in by_rest.get(rest, ()) else _on_disk(rest)
+        if prefix not in by_rest.get(disk, ()):
             missing.append(rest)
             continue
         hf = prefix + rest
         out[path] = hf
         if check_shapes:
-            want = ref.get(hf + ".weight")
+            want = ref.get(prefix + disk + ".weight")
             a, b = mods[path]["a"], mods[path]["b"]
             got = (b.shape[1], a.shape[0])
             if want and len(want) == 2 and tuple(want) != got:

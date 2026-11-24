@@ -130,5 +130,95 @@ def tail():
     print("OK")
 
 
+def kda_inputs(B, T, H, Dk, Dv, seed=0, bound=-5.0):
+    mx.random.seed(seed)
+    q = mx.random.normal((B, T, H, Dk))
+    q = q / mx.linalg.norm(q, axis=-1, keepdims=True) * Dk**-0.5
+    k = mx.random.normal((B, T, H, Dk))
+    k = k / mx.linalg.norm(k, axis=-1, keepdims=True)
+    v = mx.random.normal((B, T, H, Dv))
+    a = mx.random.normal((B, T, H, Dk))
+    b = mx.random.normal((B, T, H))
+    A_log = mx.random.uniform(-1, 1, (H, 1))
+    dt_bias = mx.random.normal((H, Dk)) * 0.5
+    return q, k, v, a, b, A_log, dt_bias
+
+
+def kda_log_g(a, A_log, dt_bias, bound=-5.0):
+    return bound * mx.sigmoid(mx.exp(A_log) * (a + dt_bias))
+
+
+def kda_ref(q, k, v, a, b, A_log, dt_bias):
+    g = mx.exp(kda_log_g(a, A_log, dt_bias))
+    return gated_delta_ops(q, k, v, g, mx.sigmoid(b), None, None)
+
+
+def kda_new(q, k, v, a, b, A_log, dt_bias):
+    return linear_attn.chunked_kda(q, k, v, kda_log_g(a, A_log, dt_bias), mx.sigmoid(b))
+
+
+def kda_check(tol, gtol):
+    for B, T, H, Dk, Dv in [(2, 100, 2, 32, 16), (1, 7, 2, 8, 8), (1, 300, 2, 32, 32)]:
+        args = kda_inputs(B, T, H, Dk, Dv)
+        y0, s0 = kda_ref(*args)
+        y1, s1 = kda_new(*args)
+        cot = mx.random.normal(y0.shape)
+        idx = list(range(7))
+        g0 = mx.grad(lambda *a: (kda_ref(*a)[0] * cot).sum(), argnums=idx)(*args)
+        g1 = mx.grad(lambda *a: (kda_new(*a)[0] * cot).sum(), argnums=idx)(*args)
+        dy, ds = rel(y0, y1), rel(s0, s1)
+        dg = max(rel(x, y) for x, y in zip(g0[:5], g1[:5]))
+        # A_log / dt_bias grads sum per-token terms that mostly cancel, so GPU
+        # matmul rounding shows up larger there. LoRA never trains them.
+        dd = max(rel(x, y) for x, y in zip(g0[5:], g1[5:]))
+        print(f"  kda B{B} T{T} H{H}: y {dy:.1e}  state {ds:.1e}  grads {dg:.1e}  decay grads {dd:.1e}")
+        assert max(dy, ds) < tol and dg < gtol and dd < 2 * gtol, "chunked kda drifted"
+    # every step at the lower bound: the most decay a chunk can see
+    q, k, v, a, b, A_log, dt_bias = kda_inputs(1, 64, 2, 32, 16, seed=3)
+    a = mx.full(a.shape, 30.0)
+    y0, _ = kda_ref(q, k, v, a, b, A_log, dt_bias)
+    y1, _ = kda_new(q, k, v, a, b, A_log, dt_bias)
+    assert not mx.isnan(y1).any().item() and rel(y0, y1) < tol
+
+
+def kda_main():
+    # CPU proves the rearrangement is exact. The GPU grad bound is looser
+    # than the scalar form's: the per-channel factors make more matmuls, and
+    # tiny shapes have small grads, but it stays under bf16 training rounding.
+    for dev, tol, gtol in ((mx.cpu, 1e-4, 1e-4), (mx.gpu, 5e-3, 2e-2)):
+        mx.set_default_device(dev)
+        print(dev)
+        kda_check(tol, gtol)
+    mx.set_default_device(mx.gpu)
+
+    # glm5_next's wrapper is swapped for the chunked form and restored
+    import importlib
+
+    from pagedmoe.local_arch import _register_package, _port_package
+    name = "mlx_lm.models.glm5_next"
+    if name not in sys.modules:
+        _register_package(name, _port_package("glm5_next"))
+    lang = importlib.import_module(name + ".language")
+    orig = lang.gated_delta_update
+    assert linear_attn.install()
+    assert getattr(lang.gated_delta_update, "kda_chunked", False)
+    args = kda_inputs(1, 40, 2, 32, 16)
+    y0, _ = orig(*args, use_kernel=False, lower_bound=-5.0)
+    y1, _ = lang.gated_delta_update(*args, lower_bound=-5.0)
+    assert rel(y0, y1) < 5e-3, rel(y0, y1)
+    linear_attn.uninstall()
+    assert lang.gated_delta_update is orig
+    print("kda OK")
+
+
+def test_train_linear_attn():
+    main()
+
+
+def test_train_kda():
+    kda_main()
+
+
 if __name__ == "__main__":
     main()
+    kda_main()

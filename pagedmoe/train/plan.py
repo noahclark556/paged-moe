@@ -116,7 +116,7 @@ def model_facts(path: str) -> ModelFacts:
     index = read_headers(p)
     total = sum(loc.nbytes for loc in index.values())
     # same split as the engine loader, so the plan and the load agree
-    skip = skipped_resident_tensor_names(index)
+    skip = skipped_resident_tensor_names(index, cfg)
     skip_bytes = sum(index[n].nbytes for n in skip)
     expert = sum(
         loc.nbytes for name, loc in index.items()

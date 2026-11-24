@@ -6,6 +6,51 @@ Format loosely follows Keep a Changelog. Versioning aims for SemVer.
 
 ## [0.4.0] - 2026-11-23
 
+GLM-5.3-Flash (`glm5_next`): the engine now runs and trains the hybrid
+architecture (KDA linear attention + sparse MLA, mHC, SwitchGLU MoE) through
+a bundled port, so MLX checkpoints like `mlx-community/GLM-5.3-Flash-4bit`
+stream. Matches the transformers reference, and LoRA exports to PEFT. Text
+only for now, the vision tower is dropped at load. GGUF builds won't load,
+use an MLX build or convert the original with `paged-moe convert`.
+
+- The MTP layer is a verify drafter now. It's a plain residual sparse MLA +
+  MoE block with no mHC, so the model builds it itself instead of cloning a
+  backbone layer. On a 48 GB Mac decode goes from 0.54 to 0.93 tok/s with
+  the same tokens. The head is 4.6 GB and comes out of the expert cache
+  (12.8 to 8.7 GB there), which barely matters with 105 GB of experts, so
+  this model lets the head take up to 40% of the cache instead of the usual
+  12%. `PAGED_MOE_MTP_MAX_FRAC` still overrides it.
+- A head that can't fit is skipped before it's read, so it doesn't add to
+  load time.
+- Fixed the sparse attention indexer reusing its pooled keys after a cache
+  trim. A single token step right after a trim past `index_topk` could read
+  pools that covered dropped tokens or crash on an empty pool.
+
+Conversion. `paged-moe convert` (and `pagedmoe.convert`) turns a Hugging Face
+safetensors checkpoint into an MLX one with a per-part recipe.
+
+- Presets (`balanced`, `standard`, `quality`, `max`, `compact`, `float`,
+  `fit`) and per-part settings for routed experts (gate/up and down),
+  shared experts, attention, dense MLP, router, embeddings and output head:
+  affine bits and group size, `mxfp4` / `mxfp8` / `nvfp4`, or float. Edge
+  layers and regex rules on top.
+- `plan` reads only the safetensors headers: output size, bits per weight,
+  resident or streamed on this Mac, disk and peak memory, and `--compare`
+  for every preset side by side.
+- Hub sources stream a few layers at a time (download, convert, delete), so
+  the disk only needs the output plus a little staging. Shards are written
+  in place with uncached writes, and a stopped run resumes from the last
+  finished layer.
+- `--adapter` merges a LoRA / DoRA adapter before quantizing, same math as
+  `mlx_lm.fuse`. Quantized sources are dequantized and requantized.
+- Every output is loaded by mlx-lm in strict mode before it's done. The
+  folder gets a model card and `pagedmoe_conversion.json` with the recipe and
+  per-part weight SNR. `check` compares against a reference (top-1, KL,
+  perplexity), `upload` pushes to the Hub.
+- `standard` gives the same weights as `mlx_lm.convert -q`. Tests cover
+  that, resume, streamed against whole-checkpoint output, adapter merge and
+  requantizing.
+
 Training. `pagedmoe.train` fine-tunes MoE checkpoints with LoRA / DoRA,
 including ones much bigger than RAM: the backbone stays resident and the
 experts page from the SSD every step, through the same read path as the
