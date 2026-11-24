@@ -4,7 +4,7 @@ Notable changes to PagedMoE.
 
 Format loosely follows Keep a Changelog. Versioning aims for SemVer.
 
-## [0.4.0] - 2026-11-22
+## [0.4.0] - 2026-11-23
 
 Training. `pagedmoe.train` fine-tunes MoE checkpoints with LoRA / DoRA,
 including ones much bigger than RAM: the backbone stays resident and the
@@ -17,6 +17,12 @@ encoders. Adapters are mlx-lm format and load with `pagedmoe.load` or
 - `paged-moe-train` (same as `python -m pagedmoe.train`): train, `plan`,
   `resume`, `chat` and `eval` against any checkpoint, and `bench` for a
   training benchmark that compares across Macs.
+- `paged-moe-train export <run>` writes the adapter in Hugging Face PEFT
+  format for GPU users (transformers, vLLM, SGLang, llama.cpp's
+  `convert_lora_to_gguf.py`). Names and shapes are checked against the
+  original model's safetensors headers, no weights downloaded. Works for
+  any run or checkpoint, or at the end of a run with `export_peft: true`.
+  Routed-expert LoRA is skipped.
 - The run is planned from the Mac: resident or streamed, rows per step,
   micro-batches and the expert cache, from a short probe of real steps. The
   first steps check the plan, and a memory guard gives memory back under

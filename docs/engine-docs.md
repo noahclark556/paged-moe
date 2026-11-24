@@ -630,7 +630,8 @@ paged-moe-train bench run                                   # training bench on 
 
 Methods: SFT, CPT, ORPO, DPO, SimPO, CPO, KTO, GRPO, plus custom objectives
 and inputs. Adapters come out in mlx-lm format and load with
-`pagedmoe.load(path, adapter_path=...)` or `mlx_lm`. Training always runs the
+`pagedmoe.load(path, adapter_path=...)` or `mlx_lm`; `paged-moe-train export
+<run>` writes a PEFT copy for transformers, vLLM or llama.cpp on a GPU. Training always runs the
 exact model: prune, drafts and the other decode shortcuts are off and checked
 after load. It is a GPU job like the server, so stop the server first.
 

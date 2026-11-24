@@ -935,6 +935,15 @@ class Trainer:
             "adapter": str(self.out),
             "stopped_early": self._stop,
         }
+        if cfg.export_peft:
+            # a failed export never fails the run; the adapter is already saved
+            try:
+                from .export import to_peft
+
+                summary["peft"] = to_peft(self.out)["out"]
+            except Exception as e:
+                print(f"[export] PEFT export failed: {e}. Retry with: "
+                      f"python -m pagedmoe.train export {self.out}", flush=True)
         self._write_run(summary)
         for cb in self.callbacks:
             cb.on_train_end(self, summary)
@@ -1073,6 +1082,12 @@ class Trainer:
         st = self.state
         ck = self.out / "checkpoints" / f"step-{st['step']:06d}"
         extra = {"base_model": self.facts.path, "method": self.method}
+        if getattr(self, "_base_repo", None) is None:
+            from .export import base_repo_of
+
+            self._base_repo = base_repo_of(self.facts.path) or ""
+        if self._base_repo:
+            extra["base_repo"] = self._base_repo
         train_lora.save(self.model, ck, extra=extra)
         mx.save_safetensors(str(ck / "optimizer.safetensors"), dict(tree_flatten(self.optimizer.state)))
         if self.encoder is not None:

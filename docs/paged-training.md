@@ -5,7 +5,8 @@ Same idea as the engine: the backbone stays resident, the experts page from
 the SSD through a budgeted cache, and everything that can be measured or
 detected is planned for you. LoRA adapters come out in mlx-lm format, so they
 load with `mlx_lm`, `pagedmoe.load(adapter_path=...)` and anything built on
-those.
+those, and `export` writes a PEFT copy for GPU users (see
+[On a GPU](#on-a-gpu-peft-export)).
 
 Methods: SFT, CPT (continued pretraining), ORPO, DPO (sigmoid / IPO / hinge),
 SimPO, CPO, KTO, GRPO. Custom objectives, custom rows, custom input
@@ -120,6 +121,7 @@ The checks:
 | `tests/test_train_methods.py` | every method trains end to end on a tiny MoE, resident and streamed (streamed losses equal resident ones), resume, adapter round trip through `mlx_lm` and `pagedmoe.load`, per-row embeds, trainable encoder |
 | `tests/test_train_fastgrad.py` | the fast backwards give MLX's forward exactly and its gradients to bf16 rounding (dense, expert, paired gate / up, token sort, long causal attention, LoRA through an installed model) |
 | `tests/test_train_data.py` | chat templates that reject null content, broken templates, and the micro-batch split (limits held, never worse than a greedy fill) |
+| `tests/test_train_export.py` | PEFT export: name mapping (multimodal split, mtp skipped), transposes and alpha, DoRA, routed experts skipped, wrong-model errors, `export_peft` at the end of a run and the CLI, and a PEFT load when torch and peft are installed |
 | `bench/train_parity_real.py` | the same parity on a real checkpoint: `python bench/train_parity_real.py ~/mlx-models/Qwen3.6-35B-A3B-4bit --cache-gb 4` |
 
 One GPU job at a time: stop any engine server or other MLX app before a real run.
@@ -305,6 +307,7 @@ Shared fields (`TrainConfig`). Anything left at None is planned.
 | `resume` | false | true / "latest" / a checkpoint path |
 | `eval_steps`, `eval_batches` | None, 16 | |
 | `log_steps`, `report_to`, `verbose` | 1, [], true | `report_to: [wandb]` |
+| `export_peft` | false | also write `<run>/peft/` (PEFT format) when the run ends, see [On a GPU](#on-a-gpu-peft-export) |
 
 LoRA (`lora:` block or `--lora.<field>`):
 
@@ -331,6 +334,7 @@ that would make the trained model route differently from the weights on disk.
   metrics.jsonl               one line per step and per eval
   run.json                    config, plan, CLI extras, summary
   reference_logps.npy/.json   DPO / KTO reference cache
+  peft/                       PEFT copy of the adapter, after an export
   checkpoints/
     latest
     step-000050/              adapters, optimizer state, trainer_state.json (+ encoder)
@@ -418,6 +422,77 @@ mlx_lm.fuse --model ~/mlx-models/Qwen3.6-35B-A3B-4bit --adapter-path <run>   # b
 
 A trained encoder is a normal MLX module: rebuild it and
 `encoder.load_weights("<run>/encoder.safetensors")`.
+
+### On a GPU (PEFT export)
+
+The mlx-lm adapter only loads in MLX. For NVIDIA / AMD, export it to Hugging
+Face PEFT format, which transformers, vLLM and SGLang load directly and
+llama.cpp converts to GGUF:
+
+```bash
+python -m pagedmoe.train export ~/.paged_moe/train/runs/<run>                         # -> <run>/peft/
+python -m pagedmoe.train export <run> --checkpoint step-000200 --out ~/my-adapter-peft
+python -m pagedmoe.train export <run> --base Qwen/Qwen3.6-35B-A3B   # when it can't tell the original model
+```
+
+```python
+from pagedmoe.train import to_peft
+to_peft("~/.paged_moe/train/runs/<run>")      # or a checkpoint folder
+```
+
+`export_peft: true` in a config (or `--export-peft true`) does it at the end
+of the run. Paged Trainer has an **Export for GPU (PEFT)** button on each run
+and an option to export when a run finishes.
+
+What it does:
+
+- Converts only the adapter (lora_a / lora_b transposed into PEFT's lora_A /
+  lora_B, `lora_alpha = scale * rank`, DoRA magnitudes when it's DoRA), so it
+  takes seconds on any size of model.
+- Finds the original HF repo from the checkpoint's model card (`base_model:`
+  or "converted to MLX format from ..."). Runs also save that repo in
+  `adapter_config.json`, so a moved or unmounted model folder doesn't matter.
+- Maps the MLX layer names to the original model's and checks every name and
+  shape against its safetensors headers on Hugging Face (headers only, no
+  weights). A multimodal Qwen3.5 / 3.6 is `language_model.model.layers.N` in
+  MLX and `model.language_model.layers.N` in HF, for example. Anything that
+  doesn't line up stops the export. Offline it still exports from the MLX
+  names and says they weren't checked.
+- Writes `adapter_model.safetensors`, `adapter_config.json` and a README with
+  the load commands.
+
+Load it on the original full precision model:
+
+```python
+from peft import PeftModel
+from transformers import AutoModelForCausalLM
+
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3.6-35B-A3B", torch_dtype="auto", device_map="auto")
+model = PeftModel.from_pretrained(model, "<run>/peft")
+```
+
+```bash
+vllm serve Qwen/Qwen3.6-35B-A3B --enable-lora --lora-modules mine=<run>/peft
+python convert_lora_to_gguf.py <run>/peft --base <original model folder>   # llama.cpp
+```
+
+Things to know:
+
+- It was trained against the 4-bit weights, so on the full precision model it
+  works like a QLoRA adapter: same fine-tune, small numeric drift. If you want
+  it exact, `mlx_lm.fuse --dequantize` still works on a model that fits.
+- Routed-expert LoRA (`lora.target: experts`) is skipped with a note: MLX
+  stacks the experts into one tensor and there's no one PEFT layout for that.
+  Attention, shared experts and dense MLPs export.
+- A run on a pruned PagedMoE package (the 27B) exports for the full model and
+  says so. The full model also has the experts the pruned copy dropped.
+- A trained input encoder isn't part of a PEFT adapter and isn't exported.
+
+Checked by loading the export with PEFT and comparing the adapter's effect
+against MLX (LoRA and DoRA) on Llama, Qwen3-MoE, Qwen3-Next, DeepSeek V3 /
+Kimi, GLM-4.5 and up and Mixtral, plus name and shape checks on gpt-oss and
+the real Qwen3.6-35B, 27B and Qwen3-Coder-480B. `tests/test_train_export.py`
+covers the mapping, DoRA, the errors and the end-of-run export.
 
 ---
 
@@ -773,8 +848,9 @@ step (the probe, usually during construction) with a message saying which.
 - No probe (and no estimate) when training an encoder.
 - Rows in one micro-batch must share an `embeds` shape and `embeds_at`; pad
   them in the formatter.
+- The PEFT export leaves out routed-expert LoRA and trained encoders.
 
 Files: `pagedmoe/train/` (`trainer.py` loop and methods, `executor.py`,
 `experts.py`, `fastgrad.py`, `linear_attn.py`, `objectives.py`, `data.py`, `plan.py`,
-`lora.py`, `rollout.py`, `rewards.py`, `stats.py`, `env.py`, `cli.py`),
+`lora.py`, `rollout.py`, `rewards.py`, `stats.py`, `env.py`, `cli.py`, `export.py`),
 examples in `pagedmoe/train/examples/`.

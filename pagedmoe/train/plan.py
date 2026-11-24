@@ -99,6 +99,18 @@ def model_facts(path: str) -> ModelFacts:
     from ..safetensors_index import read_headers
 
     p = resolve_model_path(path)
+    if not (p / "config.json").is_file():
+        inside = sorted(c.parent.name for c in p.glob("*/config.json"))
+        if inside:
+            raise FileNotFoundError(
+                f"{p} is a folder of models, not a model. Point at one checkpoint "
+                f"inside it, e.g. {p / inside[0]} ({len(inside)} found: {', '.join(inside[:5])}"
+                f"{', ...' if len(inside) > 5 else ''})"
+            )
+        raise FileNotFoundError(
+            f"{p} isn't a model folder (no config.json). Point at the checkpoint "
+            "folder itself, the one with config.json and the .safetensors files."
+        )
     cfg = json.loads((p / "config.json").read_text())
     tc = cfg.get("text_config", cfg)
     index = read_headers(p)

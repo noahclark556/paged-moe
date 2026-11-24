@@ -70,6 +70,7 @@ class TrainConfig:
     log_steps: int = 1
     report_to: list[str] = field(default_factory=list)  # "wandb"
     verbose: bool = True
+    export_peft: bool = False  # also write <run>/peft/ for GPUs when the run ends
 
     method: str = "sft"
 

@@ -8,6 +8,7 @@
   python -m pagedmoe.train resume RUN_DIR              continue a run
   python -m pagedmoe.train chat RUN_DIR                talk to a run's adapter
   python -m pagedmoe.train eval RUN_DIR --data D       loss and answers per checkpoint
+  python -m pagedmoe.train export RUN_DIR              adapter as PEFT, for GPUs
   python -m pagedmoe.train bench run MODEL ...         speed and memory benchmark
 
 Any config field works as a flag (--batch-size 16, --lora.rank 32,
@@ -217,6 +218,10 @@ def main(argv: list[str] | None = None) -> int:
             raise SystemExit(f"{cmd} needs a run directory")
         ov = _parse_overrides(argv[2:])
         return _chat(argv[1], ov) if cmd == "chat" else _eval(argv[1], ov)
+    if cmd == "export":
+        if len(argv) < 2:
+            raise SystemExit("export needs a run or checkpoint directory")
+        return _export(argv[1], _parse_overrides(argv[2:]))
     trainer = build(cmd, _parse_overrides(argv[1:]))
     trainer.train()
     return 0
@@ -261,6 +266,23 @@ def _eval(run_dir: str, ov: dict) -> int:
     print(f"[eval] report in {saved}")
     if ov.get("out"):
         print(f"[eval] wrote {ev.export(rep, ov['out'])}")
+    return 0
+
+
+def _export(path: str, ov: dict) -> int:
+    """export RUN_DIR [--checkpoint ID] [--format peft] [--out DIR] [--base REPO_OR_DIR]
+
+    Writes <adapter>/peft/ unless --out is given. --base is only needed when
+    the original HF repo can't be read off the model card."""
+    from .export import ExportError, to_peft
+
+    fmt = str(ov.get("format", "peft")).lower()
+    if fmt != "peft":
+        raise SystemExit(f"unknown export format {fmt!r} (peft is the one there is)")
+    try:
+        to_peft(path, ov.get("out"), checkpoint=ov.get("checkpoint"), base=ov.get("base"))
+    except ExportError as e:
+        raise SystemExit(f"[export] {e}")
     return 0
 
 

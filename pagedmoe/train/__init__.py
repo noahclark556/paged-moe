@@ -25,6 +25,7 @@ from .config import (
 from .config import load as load_config
 from .data import Example, Formatter, Pair, Prompt
 from .executor import Batch
+from .export import to_peft
 from .lora import LoRAConfig
 from .objectives import Custom, Objective, StepNorm
 from .stats import Callback
@@ -46,5 +47,5 @@ __all__ = [
     "DPOConfig", "DPOTrainer", "Example", "Formatter", "GRPOConfig", "GRPOTrainer",
     "KTOConfig", "KTOTrainer", "LoRAConfig", "ORPOConfig", "ORPOTrainer", "Objective",
     "Pair", "Prompt", "SFTConfig", "SFTTrainer", "SimPOConfig", "SimPOTrainer",
-    "StepNorm", "TRAINERS", "TrainConfig", "Trainer", "load_config",
+    "StepNorm", "TRAINERS", "TrainConfig", "Trainer", "load_config", "to_peft",
 ]

@@ -199,7 +199,8 @@ streamed, memory, rows per step, micro-batches, expert cache), measures a
 few real steps before it commits, and watches memory pressure while it
 runs. Methods: SFT, CPT, ORPO, DPO, SimPO, CPO, KTO and GRPO, plus custom
 objectives, custom rows and trainable input encoders. Adapters come out in
-mlx-lm format. Everything is in [Fine-tuning](#fine-tuning) below, and
+mlx-lm format, and one command exports them as PEFT for GPU users
+(transformers, vLLM, llama.cpp). Everything is in [Fine-tuning](#fine-tuning) below, and
 [Paged Trainer](https://pagedmoe.com/train) puts all of it in a Mac app.
 
 A lot of the work went into the backward pass, since that's where the time
@@ -471,6 +472,9 @@ paged-moe-train sft --model ~/mlx-models/Qwen3.6-35B-A3B-4bit --data chat.jsonl 
 paged-moe-train resume ~/.paged_moe/train/runs/<run>
 paged-moe-train chat ~/.paged_moe/train/runs/<run>
 paged-moe-train eval ~/.paged_moe/train/runs/<run> --data eval.jsonl --generate
+
+# the adapter in PEFT format, for transformers / vLLM / llama.cpp on a GPU
+paged-moe-train export ~/.paged_moe/train/runs/<run>
 ```
 
 Or from Python:
@@ -519,6 +523,50 @@ model, tok = load("~/mlx-models/Qwen3.6-35B-A3B-4bit", adapter_path="~/.paged_mo
 runs the exact model (no prune, no drafts), and the routers are never
 trained, so the model still picks experts the way the weights on disk
 expect. It's one GPU job at a time, so stop a running server first.
+
+### Using the adapter on a GPU
+
+Train on the Mac, run it on NVIDIA or AMD. `export` writes the adapter in
+Hugging Face PEFT format, which is what transformers, vLLM and SGLang load
+and what llama.cpp converts:
+
+```bash
+paged-moe-train export ~/.paged_moe/train/runs/<run>          # -> <run>/peft/
+paged-moe-train export ~/.paged_moe/train/runs/<run> --checkpoint step-000200
+```
+
+Or add `--export-peft true` (`export_peft: true` in a config) and it's written
+when the run ends. In Paged Trainer it's the **Export for GPU (PEFT)** button
+on a run.
+
+It only converts the adapter, so it takes a few seconds even on the 480B. It
+finds the original model from the checkpoint's model card and checks every
+layer name and shape against that model's safetensors headers on Hugging Face
+(headers only, no weights get downloaded). If something doesn't line up it
+stops instead of writing an adapter that silently does nothing. Then load it
+on the original full precision model:
+
+```python
+from peft import PeftModel
+from transformers import AutoModelForCausalLM
+
+model = AutoModelForCausalLM.from_pretrained("Qwen/Qwen3.6-35B-A3B", torch_dtype="auto", device_map="auto")
+model = PeftModel.from_pretrained(model, "<run>/peft")
+```
+
+```bash
+vllm serve Qwen/Qwen3.6-35B-A3B --enable-lora --lora-modules mine=<run>/peft
+python convert_lora_to_gguf.py <run>/peft --base <original model folder>   # llama.cpp
+```
+
+A few things to know. The adapter was trained against the 4-bit weights, so on
+the full precision model it behaves like a QLoRA adapter: same fine-tune, a
+little numeric drift. LoRA on the routed experts (`lora.target: experts`)
+isn't exported since there's no standard PEFT layout for stacked experts;
+attention, shared experts and dense MLPs all are. I checked the export by
+loading it with PEFT and comparing outputs against MLX on Llama, Qwen3-MoE,
+Qwen3-Next, DeepSeek V3 / Kimi, GLM-4.5 and up, and Mixtral, plus the layer
+names on gpt-oss and the real Qwen3.6-35B and Qwen3-Coder-480B.
 
 The full guide (every method, the config reference, checkpoints, evals,
 custom objectives and encoders) is
